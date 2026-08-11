@@ -855,6 +855,21 @@
                 <input type="text" id="empSearchInput" class="form-control border-0 bg-light fs-7" placeholder="ค้นหาพนักงาน..." oninput="renderEmployeeDirectory()" />
               </div>
 
+              <div class="input-group" style="width: 270px;">
+                <span class="input-group-text bg-light border-0"><i class="bi bi-sort-down text-success"></i></span>
+                <select id="empSortSelect" class="form-select border-0 bg-light fs-7 fw-semibold text-dark" onchange="renderEmployeeDirectory()" title="เลือกการเรียงลำดับรายชื่อ">
+                  <option value="id" selected>เรียงตาม: รหัสพนักงาน (Default)</option>
+                  <option value="name">เรียงตาม: ชื่อ-นามสกุล (ก-ฮ)</option>
+                  <option value="department">เรียงตาม: แผนก</option>
+                </select>
+              </div>
+
+              <!-- Import Excel Button (Admin Only) -->
+              <button class="btn btn-outline-success btn-sm rounded-pill px-3 fw-semibold shadow-sm admin-only-element d-none" onclick="triggerImportEmployeeExcel()" title="นำเข้าข้อมูลพนักงานจากไฟล์ Excel (.xlsx, .xls, .csv)">
+                <i class="bi bi-file-earmark-excel-fill me-1"></i> นำเข้าจาก Excel
+              </button>
+              <input type="file" id="excelEmpFileInput" accept=".xlsx, .xls, .csv" class="d-none" onchange="handleImportEmployeeExcel(event)" />
+
               <button class="btn btn-outline-success btn-sm rounded-pill px-3 fw-semibold shadow-sm" onclick="openPrintEmployeeBadgeModal('ALL')">
                 <i class="bi bi-printer-fill me-1"></i> สั่งพิมพ์บัตร
               </button>
@@ -1823,9 +1838,17 @@
           <form id="addEmployeeForm">
             <input type="hidden" id="editEmpIdHidden" value="" />
 
-            <div class="mb-3">
-              <label class="form-label fw-bold" for="empNameInput">ชื่อ - นามสกุล <span class="text-danger">*</span></label>
-              <input type="text" id="empNameInput" class="form-control" placeholder="เช่น สมชาย สวนงาม" required />
+            <div class="row g-2 mb-3">
+              <div class="col-12 col-md-8">
+                <label class="form-label fw-bold" for="empNameInput">ชื่อ - นามสกุล <span class="text-danger">*</span></label>
+                <input type="text" id="empNameInput" class="form-control" placeholder="เช่น สมชาย สวนงาม" required />
+              </div>
+              <div class="col-12 col-md-4">
+                <label class="form-label fw-bold" for="empNicknameInput">
+                  <i class="bi bi-tag-fill text-success me-1"></i> ชื่อเล่น
+                </label>
+                <input type="text" id="empNicknameInput" class="form-control" placeholder="เช่น ชาย" />
+              </div>
             </div>
 
             <div class="mb-3">
@@ -1939,6 +1962,72 @@
               </button>
             </div>
           </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: IMPORT EMPLOYEES FROM EXCEL ==================== -->
+  <div class="modal fade" id="importEmployeeExcelModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+      <div class="modal-content border-0 shadow-lg rounded-4">
+        <div class="modal-header bg-success text-white p-3 d-flex align-items-center justify-content-between">
+          <h5 class="modal-title fw-bold mb-0">
+            <i class="bi bi-file-earmark-excel-fill me-2 text-warning"></i>นำเข้าข้อมูลพนักงานจากไฟล์ Excel
+          </h5>
+          <button type="button" class="btn btn-danger btn-sm rounded-circle d-inline-flex align-items-center justify-content-center p-0 shadow-sm" style="width: 32px; height: 32px;" data-bs-dismiss="modal" aria-label="ปิดหน้าต่าง">
+            <i class="bi bi-x-lg text-white fs-6"></i>
+          </button>
+        </div>
+        <div class="modal-body p-4 bg-light">
+          <div class="card border-0 shadow-sm rounded-3 p-3 bg-white mb-3">
+            <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 border-bottom pb-2 mb-2">
+              <span class="fw-bold text-dark fs-7">
+                <i class="bi bi-info-circle-fill text-success me-1"></i> รายการข้อมูลพนักงานที่พบในไฟล์ Excel (<span id="excelEmpCountBadge" class="text-success fw-bold">0</span> รายการ)
+                <span id="excelDupNameBadge"></span>
+              </span>
+              <button type="button" class="btn btn-outline-success btn-sm rounded-pill fs-8 fw-semibold" onclick="downloadEmployeeExcelTemplate()">
+                <i class="bi bi-download me-1"></i> ดาวน์โหลดตัวอย่างไฟล์ Excel
+              </button>
+            </div>
+            <p class="text-muted fs-8 mb-2">
+              รองรับหัวตารางทั้งภาษาไทยและอังกฤษ: <strong>รหัสพนักงาน, ชื่อ-นามสกุล, ชื่อเล่น, แผนก, ตำแหน่ง, เบอร์โทร, หมายเหตุ</strong>
+            </p>
+
+            <div class="table-responsive rounded-3 border bg-white" style="max-height: 320px; overflow-y: auto;">
+              <table class="table table-hover align-middle mb-0 fs-8">
+                <thead class="table-light sticky-top">
+                  <tr>
+                    <th class="ps-3">รหัสพนักงาน</th>
+                    <th>ชื่อ-นามสกุล</th>
+                    <th>ชื่อเล่น</th>
+                    <th>แผนก / สวน</th>
+                    <th>ตำแหน่ง</th>
+                    <th>เบอร์โทร</th>
+                    <th class="text-center">สถานะการตรวจจับ</th>
+                  </tr>
+                </thead>
+                <tbody id="excelEmpPreviewTableBody">
+                  <tr>
+                    <td colspan="7" class="text-center text-muted py-4">ยังไม่ได้เลือกไฟล์ Excel</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="checkbox" id="excelEmpOverwriteCheck" checked>
+            <label class="form-check-label fs-8 fw-semibold text-dark" for="excelEmpOverwriteCheck">
+              อัปเดตข้อมูลพนักงานเดิมหากพบ "รหัสพนักงาน" หรือ "ชื่อ-นามสกุล" ตรงกันในระบบ (Overwrite duplicates)
+            </label>
+          </div>
+        </div>
+        <div class="modal-footer bg-white border-0 p-3 d-flex justify-content-between">
+          <button type="button" class="btn btn-light rounded-pill px-4 fw-semibold" data-bs-dismiss="modal">ยกเลิก</button>
+          <button type="button" id="confirmImportExcelBtn" class="btn btn-success rounded-pill px-4 fw-bold shadow-sm" onclick="saveImportedEmployeeExcelData()">
+            <i class="bi bi-check-circle-fill me-1"></i> ยืนยันนำเข้าข้อมูล (<span id="excelConfirmCountText">0</span> รายการ)
+          </button>
         </div>
       </div>
     </div>
@@ -4402,6 +4491,8 @@
   <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
   <!-- JSZip Library for ZIP Backup/Restore Packages -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <!-- SheetJS Library for Excel (.xlsx, .xls, .csv) Import/Export -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
   <!-- Flatpickr JS & Thai Locale -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>

@@ -505,6 +505,14 @@
       showToast(`🟢 ยินดีต้อนรับเข้าสู่ระบบ คุณ${emp ? emp.name : empId} [${targetRole}]`);
     };
 
+    window.formatEmpName = function(emp) {
+      if (!emp) return '';
+      if (typeof emp === 'string') return emp;
+      const name = emp.name || '';
+      const nick = emp.nickname ? ` (${emp.nickname.trim()})` : '';
+      return `${name}${nick}`.trim();
+    };
+
     window.handleGoogleSignInAndClose = async function() {
       try {
         await handleGoogleSignIn();
@@ -1378,6 +1386,7 @@
       document.getElementById('userSearchInput')?.addEventListener('input', renderUsersTable);
       document.getElementById('userRoleFilterSelect')?.addEventListener('change', renderUsersTable);
       document.getElementById('empSearchInput')?.addEventListener('input', renderEmployeeDirectory);
+      document.getElementById('empSortSelect')?.addEventListener('change', renderEmployeeDirectory);
       document.getElementById('historySearchInput')?.addEventListener('input', renderHistoryTable);
       document.getElementById('historyFilterType')?.addEventListener('change', renderHistoryTable);
 
@@ -3038,6 +3047,7 @@
       e.preventDefault();
       const editId = document.getElementById('editEmpIdHidden').value;
       const name = document.getElementById('empNameInput').value.trim();
+      const nickname = document.getElementById('empNicknameInput') ? document.getElementById('empNicknameInput').value.trim() : '';
       const roleElem = document.getElementById('empRoleSelect');
       let role = roleElem ? roleElem.value : 'WORKER';
       if (!roleElem && editId) {
@@ -3129,6 +3139,7 @@
         id: docId,
         code: code,
         name: name,
+        nickname: nickname,
         role: role,
         department: dept,
         position: position,
@@ -4109,24 +4120,92 @@
 
     function renderEmployeeDirectory() {
       const container = document.getElementById('employeeCardsContainer');
-      const query = document.getElementById('empSearchInput').value.toLowerCase().trim();
+      const queryInput = document.getElementById('empSearchInput');
+      const query = queryInput ? queryInput.value.toLowerCase().trim() : '';
+      const sortSelect = document.getElementById('empSortSelect');
+      const sortVal = sortSelect ? sortSelect.value : 'id';
 
       let filtered = employeeList.filter(emp => {
-        return !query || emp.name.toLowerCase().includes(query) || emp.id.toLowerCase().includes(query) || emp.department.toLowerCase().includes(query);
+        const nick = (emp.nickname || '').toLowerCase();
+        const empCode = (emp.code || emp.id || '').toLowerCase();
+        return !query || (emp.name && emp.name.toLowerCase().includes(query)) || nick.includes(query) || empCode.includes(query) || (emp.department && emp.department.toLowerCase().includes(query));
+      });
+
+      function getEmpCodeStr(emp) {
+        if (!emp) return '';
+        return String(emp.code || emp.employeeCode || emp.empCode || emp.id || emp.employeeId || '').trim();
+      }
+      function getEmpNameStr(emp) {
+        if (!emp) return '';
+        return String(emp.name || '').trim();
+      }
+      function getEmpDeptStr(emp) {
+        if (!emp) return '';
+        return String(emp.department || '').trim();
+      }
+
+      function compareCodes(a, b) {
+        const codeA = getEmpCodeStr(a);
+        const codeB = getEmpCodeStr(b);
+        if (!codeA && !codeB) return 0;
+        if (!codeA) return 1;
+        if (!codeB) return -1;
+        return codeA.localeCompare(codeB, undefined, { numeric: true, sensitivity: 'base' });
+      }
+
+      function compareNames(a, b) {
+        const nameA = getEmpNameStr(a);
+        const nameB = getEmpNameStr(b);
+        if (!nameA && !nameB) return 0;
+        if (!nameA) return 1;
+        if (!nameB) return -1;
+        return nameA.localeCompare(nameB, 'th', { sensitivity: 'base' });
+      }
+
+      function compareDepts(a, b) {
+        const deptA = getEmpDeptStr(a);
+        const deptB = getEmpDeptStr(b);
+        if (!deptA && !deptB) return 0;
+        if (!deptA) return 1;
+        if (!deptB) return -1;
+        return deptA.localeCompare(deptB, 'th', { sensitivity: 'base' });
+      }
+
+      filtered.sort((a, b) => {
+        if (sortVal === 'name') {
+          // Sort by Name (Thai ก-ฮ), then Employee Code
+          const comp = compareNames(a, b);
+          if (comp !== 0) return comp;
+          return compareCodes(a, b);
+        } else if (sortVal === 'department') {
+          // Sort by Department, then Employee Code
+          const comp = compareDepts(a, b);
+          if (comp !== 0) return comp;
+          const codeComp = compareCodes(a, b);
+          if (codeComp !== 0) return codeComp;
+          return compareNames(a, b);
+        } else {
+          // Default: Sort by Employee Code (ตัวอักษร-รหัส)
+          const comp = compareCodes(a, b);
+          if (comp !== 0) return comp;
+          return compareNames(a, b);
+        }
       });
 
       let html = '';
       filtered.forEach(emp => {
         const deptName = emp.department ? (emp.department.startsWith('แผนก') ? emp.department : 'แผนก' + emp.department) : 'ไม่ระบุแผนก';
+        const displayName = formatEmpName(emp);
+        const empCodeDisplay = emp.code || emp.id;
 
         html += `
           <div class="col-12 col-md-6 col-lg-4">
             <div class="employee-card p-3 d-flex align-items-center justify-content-between gap-2">
               <div class="d-flex align-items-center gap-3">
-                <img src="${emp.photoUrl}" class="avatar-circle border" alt="${emp.name}" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'" />
+                <img src="${emp.photoUrl}" class="avatar-circle border" alt="${emp.name || ''}" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'" />
                 <div>
-                  <div class="fw-bold text-dark mb-1 fs-6">${emp.name}</div>
-                  <div class="fs-7 text-success fw-bold mb-1"><i class="bi bi-building me-1"></i>[${emp.id}] ${deptName}</div>
+                  <div class="fw-bold text-dark mb-1 fs-6">${displayName}</div>
+                  <div class="fs-7 text-success fw-bold mb-1"><i class="bi bi-building me-1"></i>[${empCodeDisplay}] ${deptName}</div>
                   ${emp.details ? `<div class="fs-8 text-secondary text-truncate" style="max-width: 220px;" title="${emp.details}"><i class="bi bi-card-text me-1"></i> ${emp.details}</div>` : ''}
                   <div class="fs-8 text-muted"><i class="bi bi-telephone me-1"></i> ${emp.phone || '-'}</div>
                 </div>
@@ -5694,7 +5773,7 @@
         sorted.forEach(emp => {
           const opt = document.createElement('option');
           opt.value = emp.id;
-          opt.textContent = `${emp.name} [${emp.id}] - ${emp.department}`;
+          opt.textContent = `${formatEmpName(emp)} [${emp.id}] - ${emp.department}`;
           select3.appendChild(opt);
         });
       }
@@ -5718,6 +5797,7 @@
       const filtered = employeeList.filter(emp => {
         if (!q) return true;
         return (emp.name && emp.name.toLowerCase().includes(q)) ||
+               (emp.nickname && emp.nickname.toLowerCase().includes(q)) ||
                (emp.id && emp.id.toLowerCase().includes(q)) ||
                (emp.department && emp.department.toLowerCase().includes(q)) ||
                (emp.position && emp.position.toLowerCase().includes(q));
@@ -5730,7 +5810,7 @@
         const opt = document.createElement('option');
         opt.value = emp.id;
         const posBadge = emp.position ? ` (${emp.position})` : '';
-        opt.textContent = `👤 ${emp.name} [${emp.id}] - ${emp.department}${posBadge}`;
+        opt.textContent = `👤 ${formatEmpName(emp)} [${emp.id}] - ${emp.department}${posBadge}`;
         if (currentVal && currentVal === emp.id) opt.selected = true;
         select.appendChild(opt);
       });
@@ -5762,6 +5842,7 @@
       const filtered = employeeList.filter(emp => {
         if (!q) return true;
         return (emp.name && emp.name.toLowerCase().includes(q)) ||
+               (emp.nickname && emp.nickname.toLowerCase().includes(q)) ||
                (emp.id && emp.id.toLowerCase().includes(q)) ||
                (emp.department && emp.department.toLowerCase().includes(q)) ||
                (emp.position && emp.position.toLowerCase().includes(q));
@@ -5773,7 +5854,7 @@
         const opt = document.createElement('option');
         opt.value = emp.id;
         const posBadge = emp.position ? ` (${emp.position})` : '';
-        opt.textContent = `👤 ${emp.name} [${emp.id}] - ${emp.department}${posBadge}`;
+        opt.textContent = `👤 ${formatEmpName(emp)} [${emp.id}] - ${emp.department}${posBadge}`;
         if (currentVal && currentVal === emp.id) opt.selected = true;
         select.appendChild(opt);
       });
@@ -5797,7 +5878,7 @@
       employeeList.forEach(emp => {
         const opt = document.createElement('option');
         opt.value = emp.id;
-        opt.textContent = `🪪 [${emp.id}] ${emp.name} (${emp.department || 'ทั่วไป'})`;
+        opt.textContent = `🪪 [${emp.id}] ${formatEmpName(emp)} (${emp.department || 'ทั่วไป'})`;
         select.appendChild(opt);
       });
     };
@@ -9784,7 +9865,7 @@
                 ` : ''}
 
                 <!-- Employee Info -->
-                <h5 class="fw-bold text-dark mb-1 ${nameFs}">${emp.name}</h5>
+                <h5 class="fw-bold text-dark mb-1 ${nameFs}">${formatEmpName(emp)}</h5>
 
                 ${showRole ? `
                   <div class="text-success ${deptFs} mb-1 font-semibold fw-bold">[${emp.id}] ${deptName}</div>
@@ -10010,7 +10091,7 @@
         if (imgElem) imgElem.src = emp.photoUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80';
         
         const nameElem = document.getElementById('scannedEmpName');
-        if (nameElem) nameElem.textContent = emp.name;
+        if (nameElem) nameElem.textContent = formatEmpName(emp);
 
         const roleElem = document.getElementById('scannedEmpRoleBadge');
         if (roleElem) {
@@ -10165,7 +10246,10 @@
 
       document.getElementById('editEmpIdHidden').value = emp.id;
       document.getElementById('empModalTitle').innerHTML = '<i class="bi bi-pencil-square me-2"></i>แก้ไขข้อมูลพนักงาน';
-      document.getElementById('empNameInput').value = emp.name;
+      document.getElementById('empNameInput').value = emp.name || '';
+      if (document.getElementById('empNicknameInput')) {
+        document.getElementById('empNicknameInput').value = emp.nickname || '';
+      }
       document.getElementById('empCodeInput').value = emp.code || emp.id;
       if (document.getElementById('empRoleSelect')) document.getElementById('empRoleSelect').value = emp.role;
       populateDepartmentDropdowns(emp.department);
@@ -11644,6 +11728,7 @@
         items = employeeList.filter(emp => 
           !q || 
           (emp.name && emp.name.toLowerCase().includes(q)) || 
+          (emp.nickname && emp.nickname.toLowerCase().includes(q)) ||
           (emp.id && emp.id.toLowerCase().includes(q)) ||
           (emp.department && emp.department.toLowerCase().includes(q)) ||
           (emp.phone && emp.phone.includes(q))
@@ -11652,7 +11737,7 @@
         headersHtml = `
           <th class="ps-3">รหัสพนักงาน</th>
           <th>รูปถ่าย</th>
-          <th>ชื่อ-นามสกุล</th>
+          <th>ชื่อ-นามสกุล (ชื่อเล่น)</th>
           <th>แผนก / ตำแหน่ง</th>
           <th>สิทธิ์ใช้งาน</th>
           <th>เบอร์โทรศัพท์</th>
@@ -11668,7 +11753,7 @@
               <td class="ps-3 font-monospace fw-bold"><span class="badge bg-dark">${emp.id}</span></td>
               <td><img src="${emp.photoUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80'}" class="rounded-circle border shadow-sm" style="width: 40px; height: 40px; object-fit: cover;" /></td>
               <td>
-                <div class="fw-bold text-dark">${emp.name}</div>
+                <div class="fw-bold text-dark">${formatEmpName(emp)}</div>
                 <div class="fs-8 text-muted">${emp.email || '-'}</div>
               </td>
               <td>
@@ -12559,6 +12644,293 @@
         if (showFeedback) showToast("❌ เกิดข้อผิดพลาดขณะคัดลอกข้อมูล: " + err.message);
         return 0;
       }
+    };
+
+    // ==========================================
+    // EXCEL IMPORT FOR EMPLOYEES (ADMIN ONLY)
+    // ==========================================
+    let parsedExcelEmployeesData = [];
+
+    window.triggerImportEmployeeExcel = function() {
+      const fileInput = document.getElementById('excelEmpFileInput');
+      if (fileInput) {
+        fileInput.value = '';
+        fileInput.click();
+      }
+    };
+
+    window.downloadEmployeeExcelTemplate = function() {
+      if (typeof XLSX === 'undefined') {
+        alert("ระบบกำลังโหลดไลบรารี Excel กรุณาลองใหม่อีกครั้งในสักครู่");
+        return;
+      }
+      const sampleData = [
+        {
+          "รหัสพนักงาน": "EMP-001",
+          "ชื่อ-นามสกุล": "สมชาย สวนงาม",
+          "ชื่อเล่น": "ชาย",
+          "แผนก": "แผนกงานทดลอง",
+          "ตำแหน่ง": "พนักงานเกษตร",
+          "เบอร์โทร": "0812345678",
+          "หมายเหตุ": "ประจำเรือนกระจก A"
+        },
+        {
+          "รหัสพนักงาน": "EMP-002",
+          "ชื่อ-นามสกุล": "วิภาวรรณ สดใส",
+          "ชื่อเล่น": "เปิ้ล",
+          "แผนก": "แผนกทีมกุหลาบ",
+          "ตำแหน่ง": "หัวหน้าชุดดูแลดอกไม้",
+          "เบอร์โทร": "0898765432",
+          "หมายเหตุ": "ผู้เชี่ยวชาญการผสมดิน"
+        }
+      ];
+
+      const ws = XLSX.utils.json_to_sheet(sampleData);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "รายชื่อพนักงาน");
+      XLSX.writeFile(wb, "ตัวอย่างไฟล์นำเข้าพนักงาน_FloraGarden.xlsx");
+      showToast("📥 ดาวน์โหลดไฟล์ตัวอย่างนำเข้าพนักงานเรียบร้อยแล้ว");
+    };
+
+    window.handleImportEmployeeExcel = function(event) {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+
+      if (typeof XLSX === 'undefined') {
+        alert("ยังไม่ได้โหลดไลบรารีอ่านไฟล์ Excel (XLSX) กรุณาตรวจสอบการเชื่อมต่ออินเทอร์เน็ตแล้วลองใหม่");
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        try {
+          const data = new Uint8Array(e.target.result);
+          const workbook = XLSX.read(data, { type: 'array' });
+          const firstSheetName = workbook.SheetNames[0];
+          const worksheet = workbook.Sheets[firstSheetName];
+          const jsonRows = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
+
+          if (!jsonRows || jsonRows.length === 0) {
+            alert("ไม่พบข้อมูลในไฟล์ Excel ที่เลือก กรุณาตรวจสอบไฟล์แล้วลองใหม่อีกครั้ง");
+            return;
+          }
+
+          parsedExcelEmployeesData = [];
+
+          function findVal(row, keyPatterns) {
+            for (const k of Object.keys(row)) {
+              const cleanK = String(k).trim().toLowerCase().replace(/[^a-z0-9ก-๙]/g, '');
+              for (const p of keyPatterns) {
+                if (cleanK.includes(p)) {
+                  return String(row[k]).trim();
+                }
+              }
+            }
+            return '';
+          }
+
+          let autoIdx = 1;
+          jsonRows.forEach((row, i) => {
+            const nameVal = findVal(row, ['ชื่อนามสกุล', 'ชื่อ', 'name', 'fullname', 'empname']);
+            if (!nameVal) return; // Skip empty row without name
+
+            let idVal = findVal(row, ['รหัสพนักงาน', 'รหัส', 'code', 'id', 'empcode', 'empid']);
+            if (!idVal) {
+              const paddedStr = String(employeeList.length + autoIdx).padStart(3, '0');
+              idVal = `EMP-${paddedStr}`;
+              autoIdx++;
+            }
+
+            const nicknameVal = findVal(row, ['ชื่อเล่น', 'nickname', 'nick']);
+            const deptVal = findVal(row, ['แผนก', 'สวน', 'department', 'dept']) || 'ทั่วไป';
+            const positionVal = findVal(row, ['ตำแหน่ง', 'position', 'pos']) || 'พนักงาน';
+            const roleVal = findVal(row, ['สิทธิ์', 'บทบาท', 'role']) || 'WORKER';
+            const phoneVal = findVal(row, ['เบอร์โทร', 'เบอร์', 'โทร', 'phone', 'tel', 'mobile']);
+            const detailsVal = findVal(row, ['รายละเอียด', 'หมายเหตุ', 'details', 'note', 'remark']);
+
+            parsedExcelEmployeesData.push({
+              id: idVal,
+              code: idVal,
+              name: nameVal,
+              nickname: nicknameVal,
+              department: deptVal,
+              position: positionVal,
+              role: roleVal.toUpperCase().includes('ADMIN') ? 'ADMIN' : (roleVal.toUpperCase().includes('STAFF') ? 'STAFF' : 'WORKER'),
+              phone: phoneVal,
+              details: detailsVal,
+              photoUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'
+            });
+          });
+
+          if (parsedExcelEmployeesData.length === 0) {
+            alert("ไม่สามารถอ่านข้อมูลพนักงานจากหัวตารางในไฟล์ Excel ได้\n\nกรุณาใช้คอลัมน์ชื่อ: 'รหัสพนักงาน', 'ชื่อ-นามสกุล', 'ชื่อเล่น', 'แผนก', 'ตำแหน่ง', 'เบอร์โทร'");
+            return;
+          }
+
+          // Duplicate detection pass
+          const excelNameCounts = {};
+          parsedExcelEmployeesData.forEach(emp => {
+            const norm = (emp.name || '').trim().toLowerCase();
+            if (norm) {
+              excelNameCounts[norm] = (excelNameCounts[norm] || 0) + 1;
+            }
+          });
+
+          let dupNameCount = 0;
+          let dupIdCount = 0;
+
+          parsedExcelEmployeesData.forEach(emp => {
+            const normName = (emp.name || '').trim().toLowerCase();
+            const dbMatch = employeeList.find(x => x.name && x.name.trim().toLowerCase() === normName);
+            const dbIdMatch = employeeList.find(x => x.id === emp.id || (x.code && x.code === emp.id));
+            const inExcelDup = excelNameCounts[normName] > 1;
+
+            emp.dbMatch = dbMatch || null;
+            emp.dbIdMatch = dbIdMatch || null;
+            emp.inExcelDup = inExcelDup;
+
+            if (dbMatch || inExcelDup) dupNameCount++;
+            if (dbIdMatch) dupIdCount++;
+          });
+
+          // Render Preview Table
+          const tbody = document.getElementById('excelEmpPreviewTableBody');
+          const countBadge = document.getElementById('excelEmpCountBadge');
+          const dupNameBadge = document.getElementById('excelDupNameBadge');
+          const confirmCountText = document.getElementById('excelConfirmCountText');
+
+          if (countBadge) countBadge.textContent = parsedExcelEmployeesData.length;
+          if (confirmCountText) confirmCountText.textContent = parsedExcelEmployeesData.length;
+
+          if (dupNameBadge) {
+            if (dupNameCount > 0) {
+              dupNameBadge.innerHTML = `<span class="badge bg-warning text-dark ms-2 fw-semibold"><i class="bi bi-exclamation-triangle-fill text-dark me-1"></i>พบชื่อซ้ำ ${dupNameCount} รายการ</span>`;
+            } else {
+              dupNameBadge.innerHTML = `<span class="badge bg-success bg-opacity-15 text-success ms-2 fw-semibold"><i class="bi bi-check-circle-fill me-1"></i>ไม่พบชื่อซ้ำ</span>`;
+            }
+          }
+
+          if (tbody) {
+            tbody.innerHTML = parsedExcelEmployeesData.map(emp => {
+              let statusBadgeHtml = '';
+              if (emp.dbIdMatch) {
+                statusBadgeHtml = `<span class="badge bg-primary bg-opacity-10 text-primary border border-primary-subtle py-1 px-2"><i class="bi bi-arrow-repeat me-1"></i>รหัสซ้ำ (${escapeHtml(emp.dbIdMatch.id)})</span>`;
+              } else if (emp.dbMatch) {
+                statusBadgeHtml = `<span class="badge bg-warning bg-opacity-15 text-dark border border-warning-subtle py-1 px-2" title="ตรงกับ ${escapeHtml(emp.dbMatch.id)}"><i class="bi bi-exclamation-triangle-fill text-warning me-1"></i>ชื่อซ้ำในระบบ (${escapeHtml(emp.dbMatch.id)})</span>`;
+              } else if (emp.inExcelDup) {
+                statusBadgeHtml = `<span class="badge bg-danger bg-opacity-10 text-danger border border-danger-subtle py-1 px-2"><i class="bi bi-files me-1"></i>ชื่อซ้ำในไฟล์</span>`;
+              } else {
+                statusBadgeHtml = `<span class="badge bg-success bg-opacity-10 text-success border border-success-subtle py-1 px-2"><i class="bi bi-plus-circle me-1"></i>ใหม่</span>`;
+              }
+
+              return `
+                <tr>
+                  <td class="ps-3 font-monospace fw-bold"><span class="badge bg-dark">${escapeHtml(emp.id)}</span></td>
+                  <td class="fw-bold text-dark">${escapeHtml(emp.name)}</td>
+                  <td class="text-success fw-bold">${escapeHtml(emp.nickname || '-')}</td>
+                  <td><span class="badge bg-success bg-opacity-10 text-success fw-bold">${escapeHtml(emp.department)}</span></td>
+                  <td class="text-secondary">${escapeHtml(emp.position)}</td>
+                  <td class="text-muted font-monospace">${escapeHtml(emp.phone || '-')}</td>
+                  <td class="text-center">${statusBadgeHtml}</td>
+                </tr>
+              `;
+            }).join('');
+          }
+
+          const modalElem = document.getElementById('importEmployeeExcelModal');
+          if (modalElem) {
+            const modal = new bootstrap.Modal(modalElem);
+            modal.show();
+          }
+        } catch (err) {
+          console.error("handleImportEmployeeExcel error:", err);
+          alert("เกิดข้อผิดพลาดในการอ่านไฟล์ Excel: " + err.message);
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    };
+
+    window.saveImportedEmployeeExcelData = async function() {
+      if (!parsedExcelEmployeesData || parsedExcelEmployeesData.length === 0) {
+        showToast("ไม่พบรายการพนักงานที่จะนำเข้า");
+        return;
+      }
+
+      const overwriteCheck = document.getElementById('excelEmpOverwriteCheck');
+      const shouldOverwrite = overwriteCheck ? overwriteCheck.checked : true;
+
+      const confirmBtn = document.getElementById('confirmImportExcelBtn');
+      if (confirmBtn) {
+        confirmBtn.disabled = true;
+        confirmBtn.innerHTML = `<div class="spinner-border spinner-border-sm me-2"></div>กำลังบันทึกข้อมูล...`;
+      }
+
+      let addedCount = 0;
+      let updatedCount = 0;
+
+      for (const emp of parsedExcelEmployeesData) {
+        const normName = (emp.name || '').trim().toLowerCase();
+
+        // Check if existing employee found by ID or by Name
+        let existingIdx = employeeList.findIndex(x => x.id === emp.id || (x.code && x.code === emp.id));
+        if (existingIdx === -1 && normName) {
+          existingIdx = employeeList.findIndex(x => x.name && x.name.trim().toLowerCase() === normName);
+        }
+
+        if (existingIdx !== -1) {
+          if (shouldOverwrite) {
+            // Use existing employee's ID to preserve primary key consistency
+            const existingEmp = employeeList[existingIdx];
+            if (existingEmp && existingEmp.id) {
+              emp.id = existingEmp.id;
+              emp.code = existingEmp.id;
+            }
+
+            // Keep existing photo if not explicitly provided in excel
+            const existingPhoto = existingEmp.photoUrl;
+            if (existingPhoto && existingPhoto !== 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80') {
+              emp.photoUrl = existingPhoto;
+            }
+            employeeList[existingIdx] = { ...existingEmp, ...emp };
+            updatedCount++;
+          }
+        } else {
+          employeeList.unshift(emp);
+          addedCount++;
+        }
+
+        if (isFirebaseReady && db) {
+          try {
+            await setDoc(doc(db, "employees", emp.id), emp, { merge: true });
+          } catch (fErr) {
+            console.warn("Firestore import employee setDoc error:", fErr);
+          }
+        }
+      }
+
+      saveToLocalStorage();
+
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('บุคลากร', 'นำเข้า Excel', `นำเข้าพนักงานจาก Excel ทั้งหมด ${parsedExcelEmployeesData.length} รายการ (เพิ่มใหม่: ${addedCount}, อัปเดตเดิม: ${updatedCount})`);
+      }
+
+      renderEmployeeDirectory();
+      populateEmployeeDropdowns();
+      updateStats();
+
+      const modalElem = document.getElementById('importEmployeeExcelModal');
+      if (modalElem) {
+        const modalInst = bootstrap.Modal.getInstance(modalElem);
+        if (modalInst) modalInst.hide();
+      }
+
+      if (confirmBtn) {
+        confirmBtn.disabled = false;
+        confirmBtn.innerHTML = `<i class="bi bi-check-circle-fill me-1"></i> ยืนยันนำเข้าข้อมูล (${parsedExcelEmployeesData.length} รายการ)`;
+      }
+
+      showToast(`🟢 นำเข้าพนักงานสำเร็จ! เพิ่มใหม่ ${addedCount} รายการ, อัปเดต ${updatedCount} รายการ`);
+      parsedExcelEmployeesData = [];
     };
 
     window.copyDataFromDefaultToNewDatabase = window.copyDataFromOldDatabases;
