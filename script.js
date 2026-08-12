@@ -680,6 +680,7 @@
         await window.ensureAdminUserInUsersCollection();
 
         onSnapshot(collection(db, "users"), (snapshot) => {
+          if (window.isRestoringDatabase) return;
           allUsersList = [];
           snapshot.forEach(docSnap => {
             allUsersList.push({ id: docSnap.id, ...docSnap.data() });
@@ -12216,6 +12217,7 @@
 
       try {
         onSnapshot(collection(db, "employees"), async (snapshot) => {
+          if (window.isRestoringDatabase) return;
           const deptMap = {
             "เจ้าหน้าที่สำนักงาน (Staff)": "แผนกงานธุรการ",
             "แผนกเรือนกระจกและเพาะชำ": "แผนกงานทดลอง",
@@ -12250,6 +12252,7 @@
         });
 
         onSnapshot(collection(db, "attendance"), async (snapshot) => {
+          if (window.isRestoringDatabase) return;
           if (snapshot.empty) {
             attendanceLogs = [];
           } else {
@@ -12262,6 +12265,7 @@
         });
 
         onSnapshot(collection(db, "categories"), async (snapshot) => {
+          if (window.isRestoringDatabase) return;
           if (snapshot.empty) {
             categoriesList = [...defaultCategoriesList];
           } else {
@@ -12276,6 +12280,7 @@
         });
 
         onSnapshot(collection(db, "equipment"), async (snapshot) => {
+          if (window.isRestoringDatabase) return;
           if (snapshot.empty) {
             equipmentList = [];
           } else {
@@ -12303,6 +12308,7 @@
         });
 
         onSnapshot(collection(db, "transactions"), (snapshot) => {
+          if (window.isRestoringDatabase) return;
           if (!snapshot.empty) {
             const list = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
             list.sort((a, b) => {
@@ -12320,6 +12326,7 @@
         });
 
         onSnapshot(collection(db, "departments"), async (snapshot) => {
+          if (window.isRestoringDatabase) return;
           const legacyDepts = [
             "เจ้าหน้าที่สำนักงาน (Staff)",
             "แผนกเรือนกระจกและเพาะชำ",
@@ -12366,6 +12373,7 @@
         });
 
         onSnapshot(collection(db, "locations"), async (snapshot) => {
+          if (window.isRestoringDatabase) return;
           if (!snapshot.empty) {
             const fsLocs = snapshot.docs
               .map(d => (d.data().name || d.id))
@@ -12391,6 +12399,7 @@
         });
 
         onSnapshot(collection(db, "audit_logs"), (snapshot) => {
+          if (window.isRestoringDatabase) return;
           if (!snapshot.empty) {
             const list = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
             list.sort((a, b) => getRecordTimestampMs(b) - getRecordTimestampMs(a));
@@ -12405,6 +12414,7 @@
         });
 
         onSnapshot(collection(db, "user_login_logs"), (snapshot) => {
+          if (window.isRestoringDatabase) return;
           if (!snapshot.empty) {
             const list = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
             userLoginLogs = list;
@@ -12421,6 +12431,7 @@
         }
 
         onSnapshot(collection(db, "users"), (snapshot) => {
+          if (window.isRestoringDatabase) return;
           allUsersList = [];
           snapshot.forEach(docSnap => {
             allUsersList.push({ id: docSnap.id, ...docSnap.data() });

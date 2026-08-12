@@ -1,5 +1,5 @@
 // ==================== BACKUP & RESTORE MODULE (backup_restore.js) ====================
-import { doc, setDoc } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+import { doc, setDoc, collection, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 import { 
   ref, 
   uploadBytes, 
@@ -461,6 +461,7 @@ window.exportBackupToSelectedFolder = async function() {
       auditLogs: window.auditLogs || [],
       categoriesList: window.categoriesList || [],
       departmentsList: window.departmentsList || [],
+      locationsList: window.locationsList || [],
       imagesBase64Map: imagesBase64Map
     };
 
@@ -544,6 +545,7 @@ window.downloadBackupAsZipPackage = async function() {
     auditLogs: window.auditLogs || [],
     categoriesList: window.categoriesList || [],
     departmentsList: window.departmentsList || [],
+    locationsList: window.locationsList || [],
     imagesBase64Map: {}
   };
 
@@ -605,6 +607,7 @@ window.downloadDatabaseBackup = async function() {
       auditLogs: window.auditLogs || [],
       categoriesList: window.categoriesList || [],
       departmentsList: window.departmentsList || [],
+      locationsList: window.locationsList || [],
       imagesBase64Map: {}
     };
 
@@ -1221,6 +1224,8 @@ window.executeRestoreDatabase = async function() {
 
   if (!confirmed) return;
 
+  window.isRestoringDatabase = true;
+
   try {
     window.updateBackupProgress(10, "กำลังเริ่มฟื้นฟูข้อมูล...", "อ่านและปรับแต่งโครงสร้างข้อมูล (ไม่รวมรูปภาพ)", true, "bg-warning");
 
@@ -1241,6 +1246,7 @@ window.executeRestoreDatabase = async function() {
     let auditLogs = window.auditLogs || [];
     let categoriesList = window.categoriesList || [];
     let departmentsList = window.departmentsList || [];
+    let locationsList = window.locationsList || [];
 
     if (mode === 'REPLACE') {
       equipmentList = (tempParsedRestoreData.equipmentList || []).map(stripImages);
@@ -1250,6 +1256,7 @@ window.executeRestoreDatabase = async function() {
       auditLogs = tempParsedRestoreData.auditLogs || [];
       if (tempParsedRestoreData.categoriesList) categoriesList = tempParsedRestoreData.categoriesList;
       if (tempParsedRestoreData.departmentsList) departmentsList = tempParsedRestoreData.departmentsList;
+      if (tempParsedRestoreData.locationsList) locationsList = tempParsedRestoreData.locationsList;
     } else {
       const newEquip = tempParsedRestoreData.equipmentList || [];
       newEquip.forEach(rawItem => {
@@ -1303,6 +1310,14 @@ window.executeRestoreDatabase = async function() {
           }
         });
       }
+
+      if (Array.isArray(tempParsedRestoreData.locationsList)) {
+        tempParsedRestoreData.locationsList.forEach(l => {
+          if (!locationsList.includes(l)) {
+            locationsList.push(l);
+          }
+        });
+      }
     }
 
     equipmentList.forEach(item => {
@@ -1318,6 +1333,7 @@ window.executeRestoreDatabase = async function() {
     window.auditLogs = auditLogs;
     window.categoriesList = categoriesList;
     window.departmentsList = departmentsList;
+    window.locationsList = locationsList;
 
     window.updateBackupProgress(70, "กำลังบันทึกข้อมูลลงเครื่อง...", "บันทึกใน LocalStorage (เฉพาะข้อมูล)", true, "bg-warning");
     if (typeof window.saveToLocalStorage === 'function') {
@@ -1325,33 +1341,62 @@ window.executeRestoreDatabase = async function() {
     }
 
     if (window.db && window.isFirebaseReady) {
-      window.updateBackupProgress(90, "กำลังซิงค์ข้อมูลไปยัง Firebase Firestore...", "อัปเดต collections ทั้งหมด (เฉพาะข้อมูล)", true, "bg-warning");
+      window.updateBackupProgress(90, "กำลังซิงค์ข้อมูลไปยัง Firebase Firestore...", "อัปเดต collections ทั้งหมด (ล้างเอกสารตกค้างหากเป็นโหมด REPLACE)", true, "bg-warning");
+      
+      async function syncCollectionWithRestore(colName, restoredItems, isReplaceMode) {
+        if (!window.db || !window.isFirebaseReady) return;
+        const itemsArray = Array.isArray(restoredItems) ? restoredItems : [];
+        const validMap = new Map();
+
+        itemsArray.forEach((item, index) => {
+          if (!item) return;
+          let docId = item.id;
+          const prefix = colName === 'locations' ? 'loc_v1_' : 'dept_v3_';
+          if (!docId && typeof item === 'string' && (colName === 'departments' || colName === 'locations')) {
+            docId = prefix + (index + 1);
+            item = { id: docId, name: item };
+          } else if (!docId && item.name && (colName === 'departments' || colName === 'locations')) {
+            docId = item.id || (prefix + (index + 1));
+            item = { id: docId, name: item.name };
+          }
+          if (docId) {
+            validMap.set(String(docId), item);
+          }
+        });
+
+        if (isReplaceMode) {
+          try {
+            const colRef = collection(window.db, colName);
+            const qSnap = await getDocs(colRef);
+            for (const dSnap of qSnap.docs) {
+              if (!validMap.has(dSnap.id)) {
+                await deleteDoc(dSnap.ref);
+              }
+            }
+          } catch (cleanErr) {
+            console.warn(`Clean leftover docs notice for ${colName}:`, cleanErr);
+          }
+        }
+
+        for (const [docId, itemObj] of validMap.entries()) {
+          try {
+            await setDoc(doc(window.db, colName, docId), itemObj);
+          } catch (setErr) {
+            console.warn(`Set document notice for ${colName}/${docId}:`, setErr);
+          }
+        }
+      }
+
       try {
-        for (const eq of equipmentList) {
-          if (eq && eq.id) {
-            await setDoc(doc(window.db, "equipment", eq.id), eq);
-          }
-        }
-        for (const emp of employeeList) {
-          if (emp && emp.id) {
-            await setDoc(doc(window.db, "employees", emp.id), emp);
-          }
-        }
-        for (const tx of transactionHistory) {
-          if (tx && tx.id) {
-            await setDoc(doc(window.db, "transactions", tx.id), tx);
-          }
-        }
-        for (const att of attendanceLogs) {
-          if (att && att.id) {
-            await setDoc(doc(window.db, "attendance", att.id), att);
-          }
-        }
-        for (const cat of (categoriesList || [])) {
-          if (cat && cat.id) {
-            await setDoc(doc(window.db, "categories", cat.id), cat);
-          }
-        }
+        const isReplace = (mode === 'REPLACE');
+        await syncCollectionWithRestore("equipment", equipmentList, isReplace);
+        await syncCollectionWithRestore("employees", employeeList, isReplace);
+        await syncCollectionWithRestore("transactions", transactionHistory, isReplace);
+        await syncCollectionWithRestore("attendance", attendanceLogs, isReplace);
+        await syncCollectionWithRestore("categories", categoriesList, isReplace);
+        await syncCollectionWithRestore("audit_logs", auditLogs, isReplace);
+        await syncCollectionWithRestore("departments", departmentsList, isReplace);
+        await syncCollectionWithRestore("locations", locationsList, isReplace);
       } catch (fsErr) {
         console.warn("Firestore sync during restore notice:", fsErr);
       }
@@ -1361,6 +1406,8 @@ window.executeRestoreDatabase = async function() {
 
     if (typeof window.renderCategoryDropdowns === 'function') window.renderCategoryDropdowns();
     if (typeof window.populateDepartmentDropdowns === 'function') window.populateDepartmentDropdowns();
+    if (typeof window.populateLocationDropdowns === 'function') window.populateLocationDropdowns();
+    if (typeof window.renderLocationsListModal === 'function') window.renderLocationsListModal();
     if (typeof window.populateEmployeeDropdowns === 'function') window.populateEmployeeDropdowns();
     if (typeof window.populateEquipmentDropdown === 'function') window.populateEquipmentDropdown();
     if (typeof window.populateQuickScanDropdown === 'function') window.populateQuickScanDropdown();
@@ -1384,6 +1431,8 @@ window.executeRestoreDatabase = async function() {
     console.error("Restore execution error:", err);
     window.updateBackupProgress(0, "เกิดข้อผิดพลาดในการกู้คืนข้อมูล", err.message, true, "bg-danger");
     alert("เกิดข้อผิดพลาดขณะฟื้นฟูข้อมูล: " + err.message);
+  } finally {
+    window.isRestoringDatabase = false;
   }
 };
 
