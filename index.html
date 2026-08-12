@@ -2784,7 +2784,7 @@
           <div class="d-flex align-items-center gap-2">
             <i class="bi bi-person-badge-fill fs-4 text-warning"></i>
             <div>
-              <h5 class="modal-title fw-bold mb-0">เครื่องมือสั่งพิมพ์บัตรพนักงาน พร้อม QR Code (Employee Badge Print Generator)</h5>
+              <h5 class="modal-title fw-bold mb-0">เครื่องมือสั่งพิมพ์บัตรพนักงาน พร้อม QR Code </h5>
               <small class="text-white-50 fs-8">ออกแบบ พรีวิวสด และสั่งพิมพ์บัตรประจำตัวพนักงานพร้อม QR Code ออกกระดาษ A4 หรือการ์ด PVC</small>
             </div>
           </div>
@@ -2808,9 +2808,9 @@
                 <div class="mb-3">
                   <label class="form-label fw-bold fs-8 text-secondary text-uppercase mb-1"><i class="bi bi-lightning-charge-fill text-warning me-1"></i> ปุ่มลัดตั้งค่าด่วน (Presets):</label>
                   <div class="d-flex flex-wrap gap-1">
-                    <button type="button" class="btn btn-xs btn-outline-success rounded-pill fs-8 fw-semibold py-1 px-2" onclick="applyBadgePrintPreset('a4-4col')">⚡ A4 (4 ใบ/แถว - ขอบ 0.5cm)</button>
+                    <button type="button" class="btn btn-xs btn-outline-success rounded-pill fs-8 fw-semibold py-1 px-2" onclick="applyBadgePrintPreset('a4-4col')">🖼️ A4 แนวนอน (4 ใบ/แถว - 8 บัตร/หน้า)</button>
                     <button type="button" class="btn btn-xs btn-outline-primary rounded-pill fs-8 fw-semibold py-1 px-2" onclick="applyBadgePrintPreset('pvc-single')">💳 บัตร PVC เดี่ยว</button>
-                    <button type="button" class="btn btn-xs btn-outline-dark rounded-pill fs-8 fw-semibold py-1 px-2" onclick="applyBadgePrintPreset('a4-2col')">📄 A4 (2 ใบ/แถว Standard)</button>
+                    <button type="button" class="btn btn-xs btn-outline-dark rounded-pill fs-8 fw-semibold py-1 px-2" onclick="applyBadgePrintPreset('a4-2col')">📄 A4 แนวตั้ง (2 ใบ/แถว Standard)</button>
                   </div>
                 </div>
 
@@ -2831,8 +2831,8 @@
                     <div class="col-6">
                       <label class="form-label fw-bold fs-8 text-dark mb-1" for="badgeOrientationSelect">ทิศทาง A4:</label>
                       <select id="badgeOrientationSelect" class="form-select form-select-sm rounded-3" onchange="renderPrintableEmployeeBadgesPreview()">
-                        <option value="portrait" selected>📄 แนวตั้ง (Portrait)</option>
-                        <option value="landscape">🖼️ แนวนอน (Landscape)</option>
+                        <option value="landscape" selected>🖼️ แนวนอน (Landscape)</option>
+                        <option value="portrait">📄 แนวตั้ง (Portrait)</option>
                       </select>
                     </div>
                     <div class="col-6">
@@ -2841,7 +2841,7 @@
                         <option value="1">1 บัตร/แถว (ใหญ่พิเศษ)</option>
                         <option value="2">2 บัตร/แถว (มาตรฐาน CR80)</option>
                         <option value="3">3 บัตร/แถว (ขนาดกะทัดรัด)</option>
-                        <option value="4" selected>4 บัตร/แถว (พอดี 1 หน้า A4)</option>
+                        <option value="4" selected>4 บัตร/แถว (พอดี 1 หน้า A4 - 8 บัตร/หน้า)</option>
                       </select>
                     </div>
                   </div>

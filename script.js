@@ -4213,7 +4213,7 @@
               
               <div class="d-flex flex-column gap-1">
                 <button class="btn btn-outline-info btn-sm rounded-pill fs-7 fw-semibold" title="ดูประวัติการเบิก-ยืม" onclick="openEmployeeBorrowHistoryModal('${emp.id}')">
-                  <i class="bi bi-clock-history me-1"></i> ประวัติเบิก-ยืม
+                  <i class="bi bi-clock-history me-1"></i> ประวัติฯ
                 </button>
                 <button class="btn btn-outline-primary btn-sm rounded-pill fs-7" title="แก้ไขข้อมูลพนักงาน" onclick="openEditEmployeeModal('${emp.id}')">
                   <i class="bi bi-pencil-square me-1"></i> แก้ไข
@@ -9659,7 +9659,7 @@
       const cutChk = document.getElementById('chkEmpCutLines');
 
       if (presetKey === 'a4-4col') {
-        if (orientationSel) orientationSel.value = 'portrait';
+        if (orientationSel) orientationSel.value = 'landscape';
         if (colsSel) colsSel.value = '4';
         if (copiesInp) copiesInp.value = '1';
         if (themeSel) themeSel.value = 'flora';
@@ -9707,7 +9707,7 @@
       const selectedScope = selectElem ? selectElem.value : 'ALL';
       const cols = parseInt(document.getElementById('badgeColsSelect')?.value) || 4;
       const copiesCount = parseInt(document.getElementById('badgeCopiesInput')?.value) || 1;
-      const orientation = document.getElementById('badgeOrientationSelect')?.value || 'portrait';
+      const orientation = document.getElementById('badgeOrientationSelect')?.value || 'landscape';
       const themeKey = document.getElementById('badgeThemeSelect')?.value || 'flora';
       const marginTopMm = parseInt(document.getElementById('badgeMarginTopInput')?.value) ?? 5;
       const marginSideMm = parseInt(document.getElementById('badgeMarginSideInput')?.value) ?? 6;
@@ -9731,11 +9731,22 @@
       }
       dynamicPrintStyle.textContent = `@media print {
         * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; color-adjust: exact !important; }
-        @page { size: A4 ${orientation}; margin: ${marginTopMm}mm ${marginSideMm}mm 6mm ${marginSideMm}mm; }
-        .printable-area { padding: ${marginTopMm}mm ${marginSideMm}mm 6mm ${marginSideMm}mm !important; }
-        .id-badge-header { background-color: ${theme.bg} !important; color: ${theme.text} !important; margin: 0 0 8px 0 !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+        @page { size: A4 ${orientation}; margin: ${marginTopMm}mm ${marginSideMm}mm 5mm ${marginSideMm}mm; }
+        .printable-area { padding: 0 !important; margin: 0 !important; background: transparent !important; }
+        .a4-badge-page-sheet {
+          page-break-after: always !important;
+          break-after: page !important;
+          page-break-inside: avoid !important;
+          break-inside: avoid !important;
+          padding-top: ${marginTopMm}mm !important;
+        }
+        .a4-badge-page-sheet:last-child {
+          page-break-after: auto !important;
+          break-after: auto !important;
+        }
+        .id-badge-header { background-color: ${theme.bg} !important; color: ${theme.text} !important; margin: 0 0 6px 0 !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
         .badge-title-pill { background-color: #e0f2fe !important; color: #dc3545 !important; border: 1px solid #7dd3fc !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
-        .id-badge-container { border-color: ${theme.border} !important; ${showCutLines ? 'border-style: dashed !important;' : 'border-style: solid !important;'} }
+        .id-badge-container { border-color: ${theme.border} !important; ${showCutLines ? 'border-style: dashed !important;' : 'border-style: solid !important;'} page-break-inside: avoid !important; break-inside: avoid !important; }
       }`;
 
       const showPhoto = document.getElementById('chkEmpShowPhoto')?.checked;
@@ -9767,8 +9778,7 @@
       let gridClass = 'col-3';
       let rowGutter = 'g-2';
       let cardPadding = 'p-2';
-      let photoPx = 75;
-      let qrPx = 70;
+      let qrPx = 55;
       let nameFs = 'fs-7';
       let deptFs = 'fs-8';
       let infoFs = 'fs-8';
@@ -9781,8 +9791,7 @@
         gridClass = 'col-12';
         rowGutter = 'g-3';
         cardPadding = 'p-4';
-        photoPx = 140;
-        qrPx = 130;
+        qrPx = 110;
         nameFs = 'fs-5';
         deptFs = 'fs-7';
         infoFs = 'fs-8';
@@ -9794,8 +9803,7 @@
         gridClass = 'col-6';
         rowGutter = 'g-3';
         cardPadding = 'p-3';
-        photoPx = 120;
-        qrPx = 110;
+        qrPx = 95;
         nameFs = 'fs-5';
         deptFs = 'fs-8';
         infoFs = 'fs-8';
@@ -9807,8 +9815,7 @@
         gridClass = 'col-4';
         rowGutter = 'g-2';
         cardPadding = 'p-2.5';
-        photoPx = 90;
-        qrPx = 80;
+        qrPx = 75;
         nameFs = 'fs-6';
         deptFs = 'fs-8';
         infoFs = 'fs-8';
@@ -9817,24 +9824,25 @@
         subTitleStyle = 'style="font-size: 0.68rem;"';
         cardMaxWidth = '260px';
       } else {
-        // cols === 4
+        // cols === 4 (4 บัตร/แถว = 8 บัตร/หน้า A4 แนวนอน 2 แถว)
         gridClass = 'col-3';
         rowGutter = 'g-2';
-        cardPadding = 'p-2';
-        photoPx = 75;
-        qrPx = 70;
-        nameFs = 'fs-7';
+        cardPadding = 'p-1.5';
+        qrPx = 55;
+        nameFs = 'fs-8';
         deptFs = 'fs-8';
         infoFs = 'fs-8';
         headerPadding = 'p-1';
         headerTitleFs = 'fs-8';
-        subTitleStyle = 'style="font-size: 0.62rem;"';
+        subTitleStyle = 'style="font-size: 0.60rem;"';
         cardMaxWidth = '100%';
       }
 
-      let previewHtml = `<div class="row ${rowGutter}">`;
-      let printHtml = `<div class="row ${rowGutter}">`;
+      // รูปภาพ ใหญ่กว่า QR Code 100% ทุกรูปแบบ
+      const photoPx = Math.round(qrPx * 2.00);
+
       const renderTasks = [];
+      const allBadgeItems = [];
 
       employeesToPrint.forEach((emp, empIdx) => {
         for (let c = 0; c < copiesCount; c++) {
@@ -9843,48 +9851,47 @@
 
           const deptName = emp.department ? (emp.department.startsWith('แผนก') ? emp.department : 'แผนก' + emp.department) : 'ไม่ระบุแผนก';
           const badgeTitleText = getBadgeTitleText(emp);
-
           const cardBorderStyle = showCutLines ? 'border-dashed' : 'border-solid';
 
           const badgeTemplate = (qrId) => `
             <div class="${gridClass}">
               <div class="id-badge-container shadow-sm mx-auto bg-white ${cardPadding} rounded-3 border border-2 position-relative text-center h-100 ${cardBorderStyle}" style="page-break-inside: avoid; break-inside: avoid; max-width: ${cardMaxWidth}; border-color: ${theme.border} !important;">
                 <!-- Header Badge -->
-                <div class="id-badge-header text-white ${headerPadding} rounded-3 mb-2 overflow-hidden" style="background-color: ${theme.bg} !important;">
+                <div class="id-badge-header text-white ${headerPadding} rounded-3 mb-1.5 overflow-hidden" style="background-color: ${theme.bg} !important;">
                   <div class="fw-bold ${headerTitleFs} text-uppercase lh-sm py-0.5"><i class="bi bi-flower1 me-1"></i> ทุ่งสวรรค์ ตะวันฉาย</div>
-                  <div class="mt-1">
+                  <div class="mt-0.5">
                     <span class="badge-title-pill d-inline-block px-2 py-0.5 rounded-pill fw-bold" style="background-color: #e0f2fe !important; color: #dc3545 !important; border: 1px solid #7dd3fc !important; ${subTitleStyle}">${badgeTitleText}</span>
                   </div>
                 </div>
 
-                <!-- Employee Photo -->
+                <!-- Employee Photo (ใหญ่กว่า QR Code 50%) -->
                 ${showPhoto ? `
-                  <div class="my-1.5 d-flex align-items-center justify-content-center mx-auto">
+                  <div class="my-1 d-flex align-items-center justify-content-center mx-auto">
                     <img src="${emp.photoUrl}" class="id-badge-photo rounded-3 border border-2 shadow-sm mb-0" style="width: ${photoPx}px; height: ${photoPx}px; object-fit: cover; object-position: top center; border-color: ${theme.border} !important;" alt="${emp.name}" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'" />
                   </div>
                 ` : ''}
 
                 <!-- Employee Info -->
-                <h5 class="fw-bold text-dark mb-1 ${nameFs}">${formatEmpName(emp)}</h5>
+                <h6 class="fw-bold text-dark mb-0.5 ${nameFs}">${formatEmpName(emp)}</h6>
 
                 ${showRole ? `
-                  <div class="text-success ${deptFs} mb-1 font-semibold fw-bold">[${emp.id}] ${deptName}</div>
+                  <div class="text-success ${deptFs} mb-0.5 font-semibold fw-bold">[${emp.id}] ${deptName}</div>
                 ` : ''}
 
                 ${showDetails && emp.details ? `
-                  <div class="text-secondary ${infoFs} mb-1 fst-italic text-truncate px-1">📝 ${emp.details}</div>
+                  <div class="text-secondary ${infoFs} mb-0.5 fst-italic text-truncate px-1">📝 ${emp.details}</div>
                 ` : ''}
 
                 ${showDetails && emp.phone ? `
-                  <div class="text-muted ${infoFs} mb-2">📞 ${emp.phone}</div>
+                  <div class="text-muted ${infoFs} mb-1">📞 ${emp.phone}</div>
                 ` : ''}
 
                 <!-- QR Code & ID -->
                 ${showQr ? `
-                  <div class="p-1.5 bg-light rounded-3 border d-inline-block shadow-sm my-1 mx-auto">
+                  <div class="p-1 bg-light rounded-3 border d-inline-block shadow-sm my-0.5 mx-auto">
                     <img id="${qrId}-img" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent('EMPLOYEE:' + emp.id)}" style="width: ${qrPx}px; height: ${qrPx}px; object-fit: contain;" alt="Employee QR Code" />
                     <canvas id="${qrId}" class="d-none" style="width: ${qrPx}px; height: ${qrPx}px;"></canvas>
-                    ${showDetails ? `<div class="font-monospace fw-bold fs-8 text-dark mt-0.5" style="font-size: 0.7rem;">ID: ${emp.id}</div>` : ''}
+                    ${showDetails ? `<div class="font-monospace fw-bold text-dark mt-0.5" style="font-size: 0.65rem;">ID: ${emp.id}</div>` : ''}
                   </div>
                 ` : ''}
 
@@ -9895,15 +9902,49 @@
             </div>
           `;
 
-          previewHtml += badgeTemplate(prevQrId);
-          printHtml += badgeTemplate(prQrId);
+          allBadgeItems.push({
+            previewHtml: badgeTemplate(prevQrId),
+            printHtml: badgeTemplate(prQrId)
+          });
 
           renderTasks.push({ emp, prevQrId, prQrId });
         }
       });
 
-      previewHtml += `</div>`;
-      printHtml += `</div>`;
+      // Pagination setup: 4 cards/row × 2 rows = 8 cards per page on A4 Landscape
+      const cardsPerPage = (cols === 4) ? 8 : (cols === 3 ? 12 : (cols === 2 ? 6 : 2));
+      const totalPages = Math.ceil(allBadgeItems.length / cardsPerPage);
+
+      let previewHtml = '';
+      let printHtml = '';
+
+      for (let p = 0; p < allBadgeItems.length; p += cardsPerPage) {
+        const pageItems = allBadgeItems.slice(p, p + cardsPerPage);
+        const pageNum = Math.floor(p / cardsPerPage) + 1;
+        const isLastPage = (p + cardsPerPage >= allBadgeItems.length);
+
+        previewHtml += `
+          <div class="a4-sheet-preview bg-white p-3 mb-4 rounded-3 border shadow-sm">
+            <div class="d-flex align-items-center justify-content-between mb-2 pb-2 border-bottom">
+              <span class="badge bg-success fs-8 fw-bold">📄 ตัวอย่างแผ่นพิมพ์ A4 (${orientation === 'landscape' ? 'แนวนอน' : 'แนวตั้ง'}) - หน้าที่ ${pageNum} / ${totalPages} (${pageItems.length} บัตร)</span>
+              <span class="text-muted fs-8 fw-semibold"><i class="bi bi-aspect-ratio me-1"></i> ${cols} บัตร/แถว (${pageItems.length <= cols ? '1 แถว' : '2 แถว'})</span>
+            </div>
+            <div class="row ${rowGutter}">
+              ${pageItems.map(item => item.previewHtml).join('')}
+            </div>
+          </div>
+        `;
+
+        const pageBreakCss = isLastPage ? '' : 'page-break-after: always !important; break-after: page !important;';
+
+        printHtml += `
+          <div class="a4-badge-page-sheet" style="${pageBreakCss} page-break-inside: avoid; break-inside: avoid;">
+            <div class="row ${rowGutter}">
+              ${pageItems.map(item => item.printHtml).join('')}
+            </div>
+          </div>
+        `;
+      }
 
       if (container) container.innerHTML = previewHtml;
       if (printSheet) printSheet.innerHTML = printHtml;
