@@ -4212,6 +4212,9 @@
               </div>
               
               <div class="d-flex flex-column gap-1">
+                <button class="btn btn-outline-success btn-sm rounded-pill fs-7 fw-semibold" title="สั่งพิมพ์บัตรประจำตัวรายบุคคล" onclick="openPrintEmployeeBadgeModal('${emp.id}')">
+                  <i class="bi bi-person-badge me-1"></i> พิมพ์
+                </button>
                 <button class="btn btn-outline-info btn-sm rounded-pill fs-7 fw-semibold" title="ดูประวัติการเบิก-ยืม" onclick="openEmployeeBorrowHistoryModal('${emp.id}')">
                   <i class="bi bi-clock-history me-1"></i> ประวัติฯ
                 </button>
