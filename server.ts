@@ -435,6 +435,71 @@ app.get('/api/proxy-image', async (req, res) => {
   }
 });
 
+// Endpoint 6: List all files in Firebase Storage with metadata and download URLs
+app.get('/api/list-storage-files', async (req, res) => {
+  try {
+    const bucket = getStorageBucketName();
+    let pageToken: string | undefined = undefined;
+    const allItems: { name: string; size: number; updated: string; downloadUrl: string; contentType?: string }[] = [];
+
+    do {
+      const listUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket}/o` +
+        (pageToken ? `?pageToken=${encodeURIComponent(pageToken)}` : '');
+
+      const listResp = await fetch(listUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!listResp.ok) break;
+      const listData = (await listResp.json()) as any;
+      if (listData.items && Array.isArray(listData.items)) {
+        for (const item of listData.items) {
+          if (!item.name) continue;
+          const encodedName = encodeURIComponent(item.name);
+          const metaUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket}/o/${encodedName}`;
+          let remoteSize = 0;
+          let remoteUpdated = '';
+          let downloadToken = '';
+          let contentType = 'image/jpeg';
+
+          try {
+            const metaResp = await fetch(metaUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            if (metaResp.ok) {
+              const metaJson = (await metaResp.json()) as any;
+              remoteSize = parseInt(metaJson.size || '0', 10);
+              remoteUpdated = metaJson.updated || '';
+              contentType = metaJson.contentType || 'image/jpeg';
+              if (metaJson.downloadTokens) {
+                downloadToken = metaJson.downloadTokens.split(',')[0];
+              }
+            }
+          } catch (e) {}
+
+          const mediaUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket}/o/${encodedName}?alt=media${
+            downloadToken ? '&token=' + downloadToken : ''
+          }`;
+
+          allItems.push({
+            name: item.name,
+            size: remoteSize,
+            updated: remoteUpdated,
+            downloadUrl: mediaUrl,
+            contentType
+          });
+        }
+      }
+      pageToken = listData.nextPageToken;
+    } while (pageToken);
+
+    res.json({
+      success: true,
+      bucket,
+      total: allItems.length,
+      items: allItems
+    });
+  } catch (err: any) {
+    console.error('List storage files error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ----------------------------------------------------
 // VITE / STATIC FILE SERVING
 // ----------------------------------------------------
@@ -442,12 +507,84 @@ async function main() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: 'spa',
+      appType: 'custom',
     });
     app.use(vite.middlewares);
+
+    app.get(['/org_chart', '/org_chart.html'], async (req, res, next) => {
+      try {
+        const filePath = path.resolve(process.cwd(), 'org_chart.html');
+        let html = fs.readFileSync(filePath, 'utf-8');
+        html = await vite.transformIndexHtml(req.originalUrl || req.url, html);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(html);
+      } catch (e) {
+        vite.ssrFixStacktrace(e as Error);
+        next(e);
+      }
+    });
+
+    app.get(['/job_application', '/job_application.html'], async (req, res, next) => {
+      try {
+        const filePath = path.resolve(process.cwd(), 'job_application.html');
+        let html = fs.readFileSync(filePath, 'utf-8');
+        html = await vite.transformIndexHtml(req.originalUrl || req.url, html);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(html);
+      } catch (e) {
+        vite.ssrFixStacktrace(e as Error);
+        next(e);
+      }
+    });
+
+    app.get(['/payroll', '/payroll.html'], async (req, res, next) => {
+      try {
+        const filePath = path.resolve(process.cwd(), 'payroll.html');
+        let html = fs.readFileSync(filePath, 'utf-8');
+        html = await vite.transformIndexHtml(req.originalUrl || req.url, html);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(html);
+      } catch (e) {
+        vite.ssrFixStacktrace(e as Error);
+        next(e);
+      }
+    });
+
+    app.get(['/procurement', '/procurement.html'], async (req, res, next) => {
+      try {
+        const filePath = path.resolve(process.cwd(), 'procurement.html');
+        let html = fs.readFileSync(filePath, 'utf-8');
+        html = await vite.transformIndexHtml(req.originalUrl || req.url, html);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(html);
+      } catch (e) {
+        vite.ssrFixStacktrace(e as Error);
+        next(e);
+      }
+    });
+
+    app.get('*', async (req, res, next) => {
+      try {
+        const filePath = path.resolve(process.cwd(), 'index.html');
+        let html = fs.readFileSync(filePath, 'utf-8');
+        html = await vite.transformIndexHtml(req.originalUrl || req.url, html);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(html);
+      } catch (e) {
+        vite.ssrFixStacktrace(e as Error);
+        next(e);
+      }
+    });
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
+    app.get(['/org_chart.html', '/org_chart'], (req, res) => {
+      res.sendFile(path.join(distPath, 'org_chart.html'));
+    });
+    app.get(['/job_application.html', '/job_application'], (req, res) => {
+      res.sendFile(path.join(distPath, 'job_application.html'));
+    });
+    app.get(['/payroll.html', '/payroll'], (req, res) => {
+      res.sendFile(path.join(distPath, 'payroll.html'));
+    });
+    app.get(['/procurement.html', '/procurement'], (req, res) => {
+      res.sendFile(path.join(distPath, 'procurement.html'));
+    });
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });

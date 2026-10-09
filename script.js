@@ -1,4 +1,4 @@
-    import { initializeApp, getApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+    import { initializeApp, getApp, getApps } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
     import { 
       initializeFirestore,
       getFirestore, 
@@ -10,7 +10,8 @@
       getDoc,
       setDoc,
       updateDoc, 
-      deleteDoc, 
+      deleteDoc,
+      writeBatch,
       serverTimestamp 
     } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 
@@ -36,8 +37,8 @@
       updateProfile
     } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
 
-    // Firebase Config (Project: Project Flora Garden - flora-gaden)
-    const firebaseConfig = {
+    // Firebase Config Loader (Loads dynamically from firebase-applet-config.json)
+    let firebaseConfig = {
       apiKey: "AIzaSyCVFTo7glMah6eeubjCLQa6HtIrnwpmrc4",
       authDomain: "flora-gaden.firebaseapp.com",
       projectId: "flora-gaden",
@@ -47,6 +48,64 @@
       appId: "1:633519077693:web:6267796ae34a8286ff6d54",
       measurementId: "G-CTYBQCMGQG"
     };
+
+    // Attempt sync loading of firebase-applet-config.json before initializing
+    try {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', 'firebase-applet-config.json', false); // Synchronous fetch
+      xhr.send(null);
+      if (xhr.status === 200 || xhr.status === 304) {
+        const loadedCfg = JSON.parse(xhr.responseText);
+        if (loadedCfg && loadedCfg.projectId) {
+          firebaseConfig = { ...firebaseConfig, ...loadedCfg };
+        }
+      }
+    } catch (eConfig) {
+      console.warn("Dynamic firebase-applet-config.json load warning (using fallback config):", eConfig);
+    }
+
+    window.firebaseConfig = firebaseConfig;
+    window.floraFirebaseConfig = firebaseConfig;
+
+    // Scoped LocalStorage Key Generator (Scoped to active Firestore Database ID)
+    function getScopedStorageKey(baseKey) {
+      let dbId = window.firebaseConfig?.firestoreDatabaseId || window.floraFirebaseConfig?.firestoreDatabaseId || "";
+      if (!dbId) {
+        try {
+          const xhr = new XMLHttpRequest();
+          xhr.open('GET', 'firebase-applet-config.json', false);
+          xhr.send(null);
+          if (xhr.status === 200 || xhr.status === 304) {
+            const parsed = JSON.parse(xhr.responseText);
+            if (parsed && (parsed.firestoreDatabaseId || parsed.projectId)) {
+              window.firebaseConfig = { ...window.firebaseConfig, ...parsed };
+              window.floraFirebaseConfig = window.firebaseConfig;
+              dbId = parsed.firestoreDatabaseId || "";
+            }
+          }
+        } catch (e) {}
+      }
+      if (dbId && dbId !== "(default)") {
+        const cleanDbId = String(dbId).replace(/[^a-zA-Z0-9_-]/g, "_");
+        return `${baseKey}_${cleanDbId}`;
+      }
+      return baseKey;
+    }
+    window.getScopedStorageKey = getScopedStorageKey;
+
+    function getScopedLocalStorageItem(baseKey) {
+      const scopedKey = getScopedStorageKey(baseKey);
+      const val = localStorage.getItem(scopedKey);
+      if (val !== null) return val;
+      return localStorage.getItem(baseKey);
+    }
+    window.getScopedLocalStorageItem = getScopedLocalStorageItem;
+
+    function setScopedLocalStorageItem(baseKey, val) {
+      const scopedKey = getScopedStorageKey(baseKey);
+      localStorage.setItem(scopedKey, val);
+    }
+    window.setScopedLocalStorageItem = setScopedLocalStorageItem;
 
     // Global state holding app status
     let currentRole = 'WORKER'; // Default: WORKER
@@ -63,9 +122,11 @@
     let equipmentList = [];
     let transactionHistory = [];
     let employeeList = [];
+    let deletedEmployees = [];
     let attendanceLogs = [];
     let categoriesList = [];
     let departmentsList = [];
+    let positionsList = [];
     let locationsList = [];
     let auditLogs = [];
     let userLoginLogs = [];
@@ -76,6 +137,25 @@
     let lastKnownUserForLogout = null;
     let activeModalEquipId = null;
 
+    // Personnel and organization data are read-only on index.html.
+    // The Interactive Org Chart is the only screen that may add/edit/delete
+    // employees, while the Tree tab is the only screen that may change structure.
+    const MAIN_PERSONNEL_READ_ONLY = true;
+    window.MAIN_PERSONNEL_READ_ONLY = MAIN_PERSONNEL_READ_ONLY;
+    // index.html is the inventory workspace. Attendance and personnel records
+    // are managed only from org_chart.html; the inventory may read employees
+    // solely to identify the borrower / recipient on stock transactions.
+    const MAIN_STOCK_ONLY_MODE = true;
+    window.MAIN_STOCK_ONLY_MODE = MAIN_STOCK_ONLY_MODE;
+
+    function blockMainPersonnelMutation(action = 'แก้ไขข้อมูลบุคลากร') {
+      const message = `หน้าหลักเป็นโหมดดูข้อมูลบุคลากรอย่างเดียว กรุณา${action}ที่ผังโครงสร้างบุคลากร`;
+      if (typeof showToast === 'function') showToast(`ℹ️ ${message}`);
+      else alert(message);
+      return false;
+    }
+    window.blockMainPersonnelMutation = blockMainPersonnelMutation;
+
     // Expose local state variables to window for modules (backup_restore.js)
     Object.defineProperty(window, 'currentRole', { get: () => currentRole, set: (v) => { currentRole = v; }, configurable: true });
     Object.defineProperty(window, 'db', { get: () => db, set: (v) => { db = v; }, configurable: true });
@@ -85,35 +165,96 @@
     Object.defineProperty(window, 'equipmentList', { get: () => equipmentList, set: (v) => { equipmentList = v; }, configurable: true });
     Object.defineProperty(window, 'transactionHistory', { get: () => transactionHistory, set: (v) => { transactionHistory = v; }, configurable: true });
     Object.defineProperty(window, 'employeeList', { get: () => employeeList, set: (v) => { employeeList = v; }, configurable: true });
+    Object.defineProperty(window, 'deletedEmployees', { get: () => deletedEmployees, set: (v) => { deletedEmployees = v; }, configurable: true });
     Object.defineProperty(window, 'attendanceLogs', { get: () => attendanceLogs, set: (v) => { attendanceLogs = v; }, configurable: true });
     Object.defineProperty(window, 'categoriesList', { get: () => categoriesList, set: (v) => { categoriesList = v; }, configurable: true });
     Object.defineProperty(window, 'departmentsList', { get: () => departmentsList, set: (v) => { departmentsList = v; }, configurable: true });
+    Object.defineProperty(window, 'positionsList', { get: () => positionsList, set: (v) => { positionsList = v; }, configurable: true });
     Object.defineProperty(window, 'locationsList', { get: () => locationsList, set: (v) => { locationsList = v; }, configurable: true });
     Object.defineProperty(window, 'auditLogs', { get: () => auditLogs, set: (v) => { auditLogs = v; }, configurable: true });
     Object.defineProperty(window, 'userLoginLogs', { get: () => userLoginLogs, set: (v) => { userLoginLogs = v; }, configurable: true });
 
     const defaultCategoriesList = [
-      { id: 'cat-1', name: 'เครื่องมือตัดแต่ง', prefix: 'CT', icon: '✂️', label: 'เครื่องมือตัดแต่งกิ่งไม้/ดอกไม้' },
-      { id: 'cat-2', name: 'ระบบรดน้ำ', prefix: 'IR', icon: '💧', label: 'ระบบรดน้ำ/สายยาง/สปรินเกอร์' },
-      { id: 'cat-3', name: 'อุปกรณ์เตรียมดิน', prefix: 'SL', icon: '⛏️', label: 'อุปกรณ์เตรียมดิน/จอบ/เสียม/พรวน' },
-      { id: 'cat-4', name: 'สารบำรุงและปุ๋ย', prefix: 'FT', icon: '🧪', label: 'สารบำรุง/ปุ๋ยเคมี/ชีวภาพ' },
-      { id: 'cat-5', name: 'ภาชนะและบรรจุภัณฑ์', prefix: 'PT', icon: '🪴', label: 'กระถาง/ตะกร้า/เข่งใส่ดอกไม้' },
-      { id: 'cat-6', name: 'อุปกรณ์เซฟตี้และทั่วไป', prefix: 'SF', icon: '🧤', label: 'ถุงมือ/ชุดเซฟตี้/อุปกรณ์ทั่วไป' }
+      { id: "CAT-001", code: "CAT-001", name: "น้ำมัน", prefix: "FG", label: "น้ำมันส่วนกลางทั้งหมด", icon: "🛢️" },
+      { id: "CAT-002", code: "CAT-002", name: "งานธุรการ", prefix: "AD", label: "อุปกรณ์ธุรการ", icon: "📝" },
+      { id: "CAT-003", code: "CAT-003", name: "อุปกรณ์ทำความสะอาด", prefix: "CL", label: "อุปกรณ์ทำความสะอาดทั้งหมด", icon: "🧹" },
+      { id: "CAT-004", code: "CAT-004", name: "ฮาร์ดแวร์,เคมีภัณฑ์", prefix: "CH", label: "น้ำยาเคมี/สี/วัสดุอุดรอยต่อ", icon: "🧪" },
+      { id: "CAT-005", code: "CAT-005", name: "เครื่องมือช่าง", prefix: "TL", label: "อุปกรณ์สำหรับทำงานช่าง", icon: "🛠️" },
+      { id: "CAT-006", code: "CAT-006", name: "เมล็ดพันธ์", prefix: "SD", label: "เมล็ดพันธ์ต่างๆ", icon: "🌱" },
+      { id: "CAT-007", code: "CAT-007", name: "วัสดุเกษตรทั่วไป(ใช้แล้วหมดไป)", prefix: "MT", label: "วัสดุเกษตรทั่วไป(ใช้แล้วหมดไป)", icon: "🌾" },
+      { id: "CAT-008", code: "CAT-008", name: "อุปกรณ์เกษตร ประเภทยืมใช้(รถเข็น พั้ว จอบ จก ฯลฯ)", prefix: "AG", label: "อุปกรณ์เกษตร ประเภทยืมใช้(รถเข็น พั้ว จอบ จก ฯลฯ)", icon: "🚜" },
+      { id: "CAT-009", code: "CAT-009", name: "ระบบไฟ", prefix: "EL", label: "ระบบไฟ", icon: "💡" },
+      { id: "CAT-010", code: "CAT-010", name: "ระบบน้ำ", prefix: "IR", label: "ระบบน้ำ", icon: "💧" }
     ];
 
     const defaultDepartmentsList = [
-      "แผนกงานธุรการ",
-      "แผนกงานทดลอง",
-      "แผนกทีมกุหลาบ",
-      "แผนกทีมเจดีย์/แปลง G",
-      "แผนกทีมแปลง A-B",
-      "แผนกทีมแปลง E/P11",
-      "แผนกทีมถนนธรรมชัย/เฟื้องฟ้า/ผสมดิน",
-      "แผนกทีมไม้ดอกหลังวิหารคดคอร์ 13-20(ปอ)"
+      { id: "dept-1-1", code: "1.1", name: "1.1 งานธุรการ / งานบุคคล", cleanName: "งานธุรการ / งานบุคคล", group: "งานส่วนกลาง" },
+      { id: "dept-1-2", code: "1.2", name: "1.2 งานสวัสดิการ", cleanName: "งานสวัสดิการ", group: "งานส่วนกลาง" },
+      { id: "dept-1-3-water", code: "1.3", name: "1.3 งานระบบน้ำ", cleanName: "งานระบบน้ำ", group: "งานส่วนกลาง" },
+      { id: "dept-1-3-grass", code: "1.4", name: "1.4 งานตัดหญ้า", cleanName: "งานตัดหญ้า", group: "งานส่วนกลาง" },
+      { id: "dept-2-1", code: "2.1", name: "2.1 งานทดลอง", cleanName: "งานทดลอง", group: "งานกุหลาบ / งานทดลอง" },
+      { id: "dept-2-2", code: "2.2", name: "2.2 งานกุหลาบ", cleanName: "งานกุหลาบ", group: "งานกุหลาบ / งานทดลอง" },
+      { id: "dept-3-1", code: "3.1", name: "3.1 งานเจดีย์", cleanName: "งานเจดีย์", group: "งานรัตนบุปผา" },
+      { id: "dept-3-2", code: "3.2", name: "3.2 งานวิหารหลวงปู่", cleanName: "งานวิหารหลวงปู่", group: "งานรัตนบุปผา" },
+      { id: "dept-3-3", code: "3.3", name: "3.3 งานถนนธรรมชัย / เฟื่องฟ้า", cleanName: "งานถนนธรรมชัย / เฟื่องฟ้า", group: "งานรัตนบุปผา" },
+      { id: "dept-3-4", code: "3.4", name: "3.4 งานผสมแกลบ / งานโต๊ะกลาง", cleanName: "งานผสมแกลบ / งานโต๊ะกลาง", group: "งานรัตนบุปผา" },
+      { id: "dept-4-1", code: "4.1", name: "4.1 แปลง A / B", cleanName: "แปลง A / B", group: "งานธรรมยาตรา" },
+      { id: "dept-4-2", code: "4.2", name: "4.2 แปลง E / P11", cleanName: "แปลง E / P11", group: "งานธรรมยาตรา" },
+      { id: "dept-4-3", code: "4.3", name: "4.3 งานไม้กระถางหลังวิหารคด 13–20", cleanName: "งานไม้กระถางหลังวิหารคด 13–20", group: "งานธรรมยาตรา" },
+      { id: "academic", code: "4.5", name: "สายวิชาการและเทคนิคการผลิต", cleanName: "สายวิชาการและเทคนิคการผลิต", group: "สายวิชาการและเทคนิคการผลิต" },
+      { id: "executive-admin", code: "", name: "ฝ่ายบริหารและอำนวยการ", cleanName: "ฝ่ายบริหารและอำนวยการ", group: "ฝ่ายบริหารและอำนวยการ" }
+    ];
+
+    const defaultPositionsList = [
+      { id: "pos-1", code: "1", name: "ประธานโครงการ", group: "ระดับบริหารและประสานงาน", category: "executive", order: 1 },
+      { id: "pos-2", code: "2", name: "ที่ปรึกษาโครงการ", group: "ระดับบริหารและประสานงาน", category: "executive", order: 2 },
+      { id: "pos-3", code: "3", name: "ผู้ประสานงานโครงการ", group: "ระดับบริหารและประสานงาน", category: "executive", order: 3 },
+      { id: "pos-4-1", code: "4.1", name: "หัวหน้างานส่วนกลาง", group: "ระดับหัวหน้างานฝ่ายหลัก", category: "section_head", order: 4 },
+      { id: "pos-4-2", code: "4.2", name: "หัวหน้างานกุหลาบ/งานทดลอง", group: "ระดับหัวหน้างานฝ่ายหลัก", category: "section_head", order: 5 },
+      { id: "pos-4-3", code: "4.3", name: "หัวหน้างานรัตนบุปผา", group: "ระดับหัวหน้างานฝ่ายหลัก", category: "section_head", order: 6 },
+      { id: "pos-4-4", code: "4.4", name: "หัวหน้างานธรรมยาตรา", group: "ระดับหัวหน้างานฝ่ายหลัก", category: "section_head", order: 7 },
+      { id: "pos-academic", code: "4.5.1", name: "นักวิชาการ", group: "สายวิชาการและกำกับมาตรฐาน", category: "academic", order: 8 },
+      { id: "pos-5-1", code: "5.1", name: "หัวหน้างานธุรการ / บุคคล", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 9 },
+      { id: "pos-5-2", code: "5.2", name: "หัวหน้างานสวัสดิการ", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 10 },
+      { id: "pos-5-3", code: "5.3", name: "หัวหน้างานระบบน้ำ", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 11 },
+      { id: "pos-5-4", code: "5.4", name: "หัวหน้างานตัดหญ้า", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 12 },
+      { id: "pos-5-5", code: "5.5", name: "หัวหน้างานทดลอง", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 13 },
+      { id: "pos-5-6", code: "5.6", name: "หัวหน้างานกุหลาบ", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 14 },
+      { id: "pos-5-7", code: "5.7", name: "หัวหน้างานเจดีย์", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 15 },
+      { id: "pos-5-8", code: "5.8", name: "หัวหน้างานวิหารหลวงปู่", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 16 },
+      { id: "pos-5-9", code: "5.9", name: "หัวหน้างานถนนธรรมชัย / เฟื่องฟ้า", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 17 },
+      { id: "pos-5-10", code: "5.10", name: "หัวหน้างานผสมแกลบ / โต๊ะกลาง", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 18 },
+      { id: "pos-5-11", code: "5.11", name: "หัวหน้างานแปลง A / B", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 19 },
+      { id: "pos-5-12", code: "5.12", name: "หัวหน้างานแปลง E / P11", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 20 },
+      { id: "pos-5-13", code: "5.13", name: "หัวหน้างานไม้กระถางหลังวิหารคด 13–20", group: "ระดับหัวหน้าแผนก", category: "team_leader", order: 21 },
+      { id: "pos-6-1", code: "6.1", name: "เจ้าหน้าที่ธุรการ", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "staff", order: 22 },
+      { id: "pos-6-2", code: "6.2", name: "พนักงานสวัสดิการ", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 23 },
+      { id: "pos-6-3", code: "6.3", name: "พนักงานดูแลระบบน้ำ", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 24 },
+      { id: "pos-6-4", code: "6.4", name: "พนักงานตัดหญ้า", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 25 },
+      { id: "pos-6-5", code: "6.5", name: "พนักงานงานทดลอง", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 26 },
+      { id: "pos-6-6", code: "6.6", name: "พนักงานดูแลกุหลาบ", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 27 },
+      { id: "pos-6-7", code: "6.7", name: "พนักงานงานเจดีย์", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 28 },
+      { id: "pos-6-8", code: "6.8", name: "พนักงานงานวิหารหลวงปู่", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 29 },
+      { id: "pos-6-9", code: "6.9", name: "พนักงานดูแลถนนธรรมชัย", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 30 },
+      { id: "pos-6-10", code: "6.10", name: "พนักงานผสมแกลบ", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 31 },
+      { id: "pos-6-11", code: "6.11", name: "พนักงานดูแลแปลง A/B", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 32 },
+      { id: "pos-6-12", code: "6.12", name: "พนักงานดูแลแปลง E/P11", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 33 },
+      { id: "pos-6-13", code: "6.13", name: "พนักงานดูแลไม้กระถาง", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 34 },
+      { id: "pos-6-monk", code: "6.14", name: "พระภิกษุ", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "staff", order: 35 },
+      { id: "pos-worker", code: "6.15", name: "พนักงานปฏิบัติการ", group: "เจ้าหน้าที่และพนักงานปฏิบัติการ", category: "worker", order: 36 }
     ];
 
     const defaultLocationsList = [
+      "สโตว์กรงเหล็ก",
+      "โรงเก็บเครื่องมือ A",
+      "ชั้นอุปกรณ์ระบบน้ำ",
+      "โรงน้ำมัน",
+      "พระธรรมศักดิ์ ทดสอบ",
       "โรงเก็บ A - ชั้น 1",
+      "คลังวัสดุเพาะชำ",
+      "เรือนกระจก 1",
+      "คลังปุ๋ยและสารบำรุง",
+      "ตู้เซฟตี้ 1",
       "โรงเก็บ A - ชั้น 2",
       "โรงเก็บ A - ชั้น 3",
       "โรงเก็บ B - ล็อก 1",
@@ -121,21 +262,49 @@
       "อาคารเครื่องจักร 1",
       "อาคารเครื่องจักร 2",
       "คลังอุปกรณ์หนัก",
-      "อาคารเคมีเกษตร",
-      "คลังวัสดุเพาะชำ",
-      "เรือนกระจก 1",
-      "คลังปุ๋ยและสารบำรุง",
-      "ตู้เซฟตี้ 1",
-      "โรงเก็บเครื่องมือ A"
+      "อาคารเคมีเกษตร"
     ];
 
-    // Initialize Firebase & Auth gracefully with long polling for iframe sandbox resilience
+    const defaultInitialEquipmentList = [
+      { id: "FG-001", code: "FG-001", name: "น้ำมันเบนซิน 95", category: "น้ำมัน", location: "โรงน้ำมัน", quantity: 50, minQuantity: 10, borrowedCount: 0, unit: "ลิตร", imageUrl: "", description: "น้ำมันเบนซินสำหรับเครื่องตัดหญ้าและเครื่องพ่นยา", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      { id: "FG-002", code: "FG-002", name: "น้ำมันเครื่อง 2T", category: "น้ำมัน", location: "โรงน้ำมัน", quantity: 24, minQuantity: 5, borrowedCount: 0, unit: "ขวด", imageUrl: "", description: "น้ำมัน 2 จังหวะสำหรับเครื่องตัดหญ้า", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      { id: "AX-001", code: "AX-001", name: "กรรไกรตัดแต่งกิ่งด้ามยาว", category: "เครื่องมือช่าง", location: "โรงเก็บเครื่องมือ A", quantity: 15, minQuantity: 3, borrowedCount: 0, unit: "อัน", imageUrl: "", description: "ใบมีดคมพิเศษสำหรับแต่งทรงพุ่ม", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      { id: "AX-002", code: "AX-002", name: "เครื่องตัดหญ้าสะพายบ่า", category: "เครื่องมือช่าง", location: "โรงเก็บเครื่องมือ A", quantity: 8, minQuantity: 2, borrowedCount: 0, unit: "เครื่อง", imageUrl: "", description: "เครื่องตัดหญ้า 2 จังหวะ พร้อมใบมีด", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      { id: "SL-001", code: "SL-001", name: "รถเข็นปูน 2 ล้อ", category: "อุปกรณ์เกษตร ประเภทยืมใช้(รถเข็น พั้ว จอบ จก ฯลฯ)", location: "สโตว์กรงเหล็ก", quantity: 10, minQuantity: 2, borrowedCount: 0, unit: "คัน", imageUrl: "", description: "สำหรับขนดินและปุ๋ย", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      { id: "SL-002", code: "SL-002", name: "จอบขุดดินด้ามไม้", category: "อุปกรณ์เกษตร ประเภทยืมใช้(รถเข็น พั้ว จอบ จก ฯลฯ)", location: "สโตว์กรงเหล็ก", quantity: 20, minQuantity: 5, borrowedCount: 0, unit: "เล่ม", imageUrl: "", description: "หน้าจอบกว้างสำหรับขุดแปลง", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      { id: "EQ-001", code: "EQ-001", name: "สปริงเกอร์รดน้ำแปลงดอกไม้", category: "ระบบน้ำ", location: "ชั้นอุปกรณ์ระบบน้ำ", quantity: 30, minQuantity: 5, borrowedCount: 0, unit: "ชุด", imageUrl: "", description: "หัวหมุน 360 องศา รัศมี 5 เมตร", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      { id: "SK-001", code: "SK-001", name: "ไม้กวาดทางมะพร้าวด้ามยาว", category: "อุปกรณ์ทำความสะอาด", location: "สโตว์กรงเหล็ก", quantity: 25, minQuantity: 5, borrowedCount: 0, unit: "ด้าม", imageUrl: "", description: "สำหรับกวาดใบไม้แห้งและเศษหญ้า", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+    ];
+
+    const defaultEmployeesSeedList = [
+      { id: "EXEC-01", code: "EXEC-01", name: "ประธานโครงการ", role: "ADMIN", position: "ประธานโครงการ", department: "ฝ่ายบริหารและอำนวยการ", phone: "081-000-0001", status: "ปฏิบัติงาน", photoUrl: "", accessPersonnel: true, accessInventory: true },
+      { id: "EXEC-02", code: "EXEC-02", name: "ที่ปรึกษาโครงการ 1", role: "ADMIN", position: "ที่ปรึกษาโครงการ", department: "ฝ่ายบริหารและอำนวยการ", phone: "081-000-0002", status: "ปฏิบัติงาน", accessPersonnel: true, accessInventory: true },
+      { id: "EXEC-03", code: "EXEC-03", name: "ที่ปรึกษาโครงการ 2", role: "ADMIN", position: "ที่ปรึกษาโครงการ", department: "ฝ่ายบริหารและอำนวยการ", phone: "081-000-0003", status: "ปฏิบัติงาน", accessPersonnel: true, accessInventory: true },
+      { id: "EXEC-04", code: "EXEC-04", name: "ผู้ประสานงานโครงการ", role: "ADMIN", position: "ผู้ประสานงานโครงการ", department: "ฝ่ายบริหารและอำนวยการ", phone: "081-000-0004", status: "ปฏิบัติงาน", accessPersonnel: true, accessInventory: true }
+    ];
+
+    window.isEquipmentBorrowType = function(item) {
+      if (!item) return false;
+      if (item.isBorrowable === true) return true;
+      const cat = (item.category || '').toLowerCase();
+      if (cat.includes('ยืมใช้') || cat.includes('ยืม')) return true;
+      const name = (item.name || '').toLowerCase();
+      if (name.includes('ยืมใช้')) return true;
+      const prefix = (item.prefix || '').toUpperCase();
+      if (prefix === 'AG') return true;
+      const code = (item.code || '').toUpperCase();
+      if (code.startsWith('SL-') || code.startsWith('AG-')) return true;
+      return false;
+    };
+
+    // Initialize Firebase & Auth gracefully with forced long polling for iframe sandbox resilience
     try {
-      const app = initializeApp(firebaseConfig);
+      const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
       
       try {
         const fsSettings = {
-          experimentalAutoDetectLongPolling: true
+          experimentalForceLongPolling: true,
+          useFetchStreams: false
         };
         const customDbId = (firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== "(default)")
           ? firebaseConfig.firestoreDatabaseId
@@ -146,25 +315,55 @@
           : initializeFirestore(app, fsSettings);
       } catch (eFs) {
         console.warn("Firestore init warning:", eFs);
-        try { db = getFirestore(app); } catch(e) {}
+        try {
+          const customDbId = (firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== "(default)")
+            ? firebaseConfig.firestoreDatabaseId
+            : undefined;
+          db = customDbId ? getFirestore(app, customDbId) : getFirestore(app);
+        } catch(e) {
+          console.error("Firestore fallback init failed:", e);
+        }
       }
 
       try {
         auth = getAuth(app);
         googleProvider = new GoogleAuthProvider();
+        googleProvider.addScope('https://www.googleapis.com/auth/drive.file');
         googleProvider.setCustomParameters({ prompt: 'select_account' });
+        window.GoogleAuthProvider = GoogleAuthProvider;
+        window.signInWithPopup = signInWithPopup;
+        window.getAuth = getAuth;
+        window.googleProvider = googleProvider;
       } catch (eAuth) {
         console.warn("Auth init warning:", eAuth);
       }
 
       try {
         storage = getStorage(app);
+        window.storage = storage;
+        window.storageRef = ref;
+        window.uploadBytes = uploadBytes;
+        window.getDownloadURL = getDownloadURL;
+        window.deleteObject = deleteObject;
       } catch (eSt) {
         console.warn("Storage init warning:", eSt);
       }
 
       isFirebaseReady = true;
       console.log("Firebase & Auth initialized successfully with project flora-gaden.");
+      window.db = db;
+      window.floraDb = db;
+      window.floraFirebaseBridge = { 
+        db, doc, setDoc, onSnapshot, getDoc, getDocs, collection, deleteDoc,
+        storage, ref, uploadBytes, getDownloadURL, deleteObject, auth 
+      };
+      if (typeof window.floraLogo?.connectGlobalLogoFirestore === 'function' && db) {
+        window.floraLogo.connectGlobalLogoFirestore(window.floraFirebaseBridge);
+      }
+      if (typeof window.connectOrgTreeFirestore === 'function' && db) {
+        window.connectOrgTreeFirestore(window.floraFirebaseBridge);
+      }
+      window.dispatchEvent(new CustomEvent('flora-firebase-ready'));
     } catch (err) {
       console.warn("Firebase initialization warning:", err);
       isFirebaseReady = false;
@@ -185,21 +384,61 @@
               window.recordUserLoginStatus('Online', user);
             }
           }
+          if (typeof window.trackUserLoginPresence === 'function') {
+            window.trackUserLoginPresence(user);
+          }
+          if (typeof window.subscribeToUserPresence === 'function') {
+            window.subscribeToUserPresence();
+          }
           if (typeof window.hideMandatoryLoginScreen === 'function') {
             window.hideMandatoryLoginScreen();
           }
+
+          // Trigger automatic daily hybrid backup for Admin
+          if (user.email === 'jaru072@gmail.com' || currentRole === 'ADMIN') {
+            setTimeout(() => {
+              if (typeof window.runHybridDailyBackup === 'function') {
+                window.runHybridDailyBackup(false).catch(e => console.warn("[AutoBackup]", e));
+              }
+            }, 3500);
+          }
         } else {
-          console.log("Firebase Auth User logged out.");
+          console.log("Firebase Auth: No active user session detected.");
           if (lastKnownUserForLogout) {
             if (typeof window.recordUserLoginStatus === 'function') {
               window.recordUserLoginStatus('Offline', lastKnownUserForLogout);
             }
             lastKnownUserForLogout = null;
           }
-          currentUserProfile = null;
-          updateAuthUI();
-          if (typeof window.showMandatoryLoginScreen === 'function') {
-            window.showMandatoryLoginScreen();
+          if (typeof window.trackUserLoginPresence === 'function') {
+            window.trackUserLoginPresence(null);
+          }
+
+          // Check if previously logged in user profile exists in localStorage or sessionStorage
+          let cachedAccess = null;
+          try {
+            cachedAccess = JSON.parse(sessionStorage.getItem('flora_personnel_access') || localStorage.getItem('flora_saved_user_profile') || 'null');
+          } catch(e) {}
+
+          if (cachedAccess && (cachedAccess.email || cachedAccess.displayName)) {
+            console.log("Restoring previous user session for:", cachedAccess.email || cachedAccess.displayName);
+            currentUserProfile = cachedAccess;
+            currentRole = cachedAccess.role || 'WORKER';
+            setRole(currentRole);
+            updateAuthUI();
+            if (typeof window.hideMandatoryLoginScreen === 'function') {
+              window.hideMandatoryLoginScreen();
+            }
+          } else {
+            // New user without existing session: enforce Google Login modal
+            currentRole = 'WORKER';
+            currentUserProfile = null;
+            currentAuthUser = null;
+            setRole('WORKER');
+            updateAuthUI();
+            if (typeof window.showMandatoryLoginScreen === 'function') {
+              window.showMandatoryLoginScreen();
+            }
           }
         }
       });
@@ -214,25 +453,94 @@
         const nowIso = new Date().toISOString();
         
         if (userSnap.exists()) {
-          currentUserProfile = { id: user.uid, ...userSnap.data(), isOnline: true, status: 'Online', lastActiveAt: nowIso, lastLoginAt: nowIso };
-          if (user.email === 'jaru072@gmail.com') {
+          const data = userSnap.data();
+          const isOwner = user.email === 'jaru072@gmail.com';
+          currentUserProfile = { 
+            id: user.uid, 
+            ...data, 
+            accessPersonnel: isOwner ? true : (data.accessPersonnel !== undefined ? data.accessPersonnel : false),
+            accessInventory: data.accessInventory !== undefined ? data.accessInventory : true,
+            accessPayroll: isOwner ? true : Boolean(data.accessPayroll),
+            accessProcurement: isOwner ? true : Boolean(data.accessProcurement),
+            linkedEmployeeId: data.linkedEmployeeId || '',
+            linkedEmployeeName: data.linkedEmployeeName || '',
+            linkedEmployeeCode: data.linkedEmployeeCode || '',
+            isOnline: true, 
+            status: 'Online', 
+            lastActiveAt: nowIso, 
+            lastLoginAt: nowIso 
+          };
+          if (isOwner) {
             currentUserProfile.role = 'ADMIN';
+            currentUserProfile.accessPersonnel = true;
+            currentUserProfile.accessInventory = true;
+            currentUserProfile.accessPayroll = true;
+            currentUserProfile.accessProcurement = true;
           }
           await setDoc(userRef, {
             role: currentUserProfile.role || 'WORKER',
+            accessPersonnel: currentUserProfile.accessPersonnel === true,
+            accessInventory: currentUserProfile.accessInventory !== false,
+            accessPayroll: currentUserProfile.accessPayroll === true,
+            accessProcurement: currentUserProfile.accessProcurement === true,
+            linkedEmployeeId: currentUserProfile.linkedEmployeeId || '',
+            linkedEmployeeName: currentUserProfile.linkedEmployeeName || '',
+            linkedEmployeeCode: currentUserProfile.linkedEmployeeCode || '',
+            modules: [
+              ...(currentUserProfile.accessPersonnel === true ? ['personnel'] : []),
+              ...(currentUserProfile.accessInventory !== false ? ['inventory'] : []),
+              ...(currentUserProfile.accessPayroll === true ? ['payroll'] : []),
+              ...(currentUserProfile.accessProcurement === true ? ['procurement'] : [])
+            ],
             isOnline: true,
             status: 'Online',
             lastActiveAt: nowIso,
             lastLoginAt: nowIso
           }, { merge: true });
         } else {
-          const defaultRole = initialRoleChoice || (user.email === 'jaru072@gmail.com' ? 'ADMIN' : 'WORKER');
+          const isOwner = user.email === 'jaru072@gmail.com';
+          const defaultRole = isOwner ? 'ADMIN' : (initialRoleChoice || 'WORKER');
+
+          // Auto-link to employee if email matches
+          let matchedEmpId = '';
+          let matchedEmpName = '';
+          let matchedEmpCode = '';
+          try {
+            if (window.db) {
+              const empSnap = await getDocs(collection(window.db, 'employees'));
+              if (!empSnap.empty) {
+                empSnap.forEach(d => {
+                  const ed = d.data();
+                  if (ed.email && String(ed.email).trim().toLowerCase() === String(user.email).trim().toLowerCase()) {
+                    matchedEmpId = d.id;
+                    matchedEmpName = ed.name || '';
+                    matchedEmpCode = ed.code || '';
+                  }
+                });
+              }
+            }
+          } catch(e) {
+            console.warn("Auto-link check notice:", e);
+          }
+
           currentUserProfile = {
             uid: user.uid,
             email: user.email || '',
             displayName: user.displayName || user.email?.split('@')[0] || 'ผู้ใช้งาน',
             photoURL: user.photoURL || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80',
-            role: user.email === 'jaru072@gmail.com' ? 'ADMIN' : defaultRole,
+            role: isOwner ? 'ADMIN' : defaultRole,
+            accessPersonnel: isOwner,
+            accessInventory: true,
+            accessPayroll: isOwner, // Closed by default for new users!
+            accessProcurement: isOwner, // Blocked management by default for new users!
+            linkedEmployeeId: matchedEmpId,
+            linkedEmployeeName: matchedEmpName,
+            linkedEmployeeCode: matchedEmpCode,
+            modules: [
+              ...(isOwner ? ['personnel'] : []),
+              'inventory',
+              ...(isOwner ? ['payroll', 'procurement'] : [])
+            ],
             isOnline: true,
             status: 'Online',
             lastActiveAt: nowIso,
@@ -240,21 +548,130 @@
             updatedAt: nowIso
           };
           await setDoc(userRef, currentUserProfile);
+
+          if (matchedEmpId && window.db) {
+            try {
+              await updateDoc(doc(window.db, 'employees', matchedEmpId), {
+                linkedUserId: user.uid,
+                linkedUserEmail: user.email,
+                updatedAt: nowIso
+              });
+            } catch(e){}
+          }
         }
 
         if (user.email === 'jaru072@gmail.com') {
           currentUserProfile.role = 'ADMIN';
+          currentUserProfile.accessPersonnel = true;
+          currentUserProfile.accessInventory = true;
+          currentUserProfile.accessPayroll = true;
+          currentUserProfile.accessProcurement = true;
         }
         
+        sessionStorage.setItem('flora_personnel_access', JSON.stringify({
+          uid: currentUserProfile?.uid || user.uid,
+          email: currentUserProfile?.email || user.email || '',
+          displayName: currentUserProfile?.displayName || user.displayName || 'ผู้ใช้งาน',
+          photoURL: currentUserProfile?.photoURL || user.photoURL || '',
+          role: currentUserProfile?.role || 'WORKER',
+          accessPersonnel: currentUserProfile?.accessPersonnel === true,
+          accessInventory: currentUserProfile?.accessInventory !== false,
+          accessPayroll: currentUserProfile?.accessPayroll === true,
+          accessProcurement: currentUserProfile?.accessProcurement === true,
+          linkedEmployeeId: currentUserProfile?.linkedEmployeeId || '',
+          linkedEmployeeName: currentUserProfile?.linkedEmployeeName || '',
+          linkedEmployeeCode: currentUserProfile?.linkedEmployeeCode || '',
+          isAdmin: currentUserProfile?.role === 'ADMIN'
+        }));
+
+        localStorage.setItem('flora_saved_user_profile', JSON.stringify({
+          uid: currentUserProfile?.uid || user.uid,
+          email: currentUserProfile?.email || user.email || '',
+          displayName: currentUserProfile?.displayName || user.displayName || 'ผู้ใช้งาน',
+          photoURL: currentUserProfile?.photoURL || user.photoURL || '',
+          role: currentUserProfile?.role || 'WORKER',
+          accessPersonnel: currentUserProfile?.accessPersonnel === true,
+          accessInventory: currentUserProfile?.accessInventory !== false,
+          accessPayroll: currentUserProfile?.accessPayroll === true,
+          accessProcurement: currentUserProfile?.accessProcurement === true,
+          linkedEmployeeId: currentUserProfile?.linkedEmployeeId || '',
+          linkedEmployeeName: currentUserProfile?.linkedEmployeeName || '',
+          linkedEmployeeCode: currentUserProfile?.linkedEmployeeCode || '',
+          isAdmin: currentUserProfile?.role === 'ADMIN'
+        }));
+
         setRole(currentUserProfile.role || 'WORKER');
         updateAuthUI();
         if (typeof window.hideMandatoryLoginScreen === 'function') {
           window.hideMandatoryLoginScreen();
         }
+        if (typeof window.checkModuleAccess === 'function') {
+          window.checkModuleAccess('inventory');
+        }
       } catch (err) {
         console.warn("Error syncing user profile:", err);
       }
     }
+
+    // Check Module-Level Access Control (Inventory vs. Personnel)
+    window.checkModuleAccess = function(currentModule = 'inventory') {
+      const isSuperAdmin = currentRole === 'ADMIN' || currentAuthUser?.email === 'jaru072@gmail.com' || currentUserProfile?.email === 'jaru072@gmail.com';
+      if (isSuperAdmin) {
+        const modalElem = document.getElementById('moduleAccessDeniedModal');
+        if (modalElem && typeof bootstrap !== 'undefined' && bootstrap.Modal) {
+          const bsModal = bootstrap.Modal.getInstance(modalElem);
+          if (bsModal) bsModal.hide();
+        }
+        return true;
+      }
+
+      if (!currentAuthUser && !currentUserProfile) return true;
+
+      const hasInventory = currentUserProfile?.accessInventory !== false;
+      const hasPersonnel = currentUserProfile?.accessPersonnel !== false;
+
+      // In inventory (index.html), if accessInventory is false:
+      if (currentModule === 'inventory' && !hasInventory) {
+        const modalElem = document.getElementById('moduleAccessDeniedModal');
+        if (modalElem && typeof bootstrap !== 'undefined' && bootstrap.Modal) {
+          const nameElem = document.getElementById('moduleDeniedUserName');
+          const emailElem = document.getElementById('moduleDeniedUserEmail');
+          const switchBtn = document.getElementById('btnSwitchToAllowedPersonnel');
+          if (nameElem) nameElem.textContent = currentAuthUser?.displayName || currentUserProfile?.displayName || 'ผู้ใช้งาน';
+          if (emailElem) emailElem.textContent = currentAuthUser?.email || currentUserProfile?.email || '-';
+          if (switchBtn) {
+            if (hasPersonnel) {
+              switchBtn.classList.remove('d-none');
+            } else {
+              switchBtn.classList.add('d-none');
+            }
+          }
+          const bsModal = bootstrap.Modal.getOrCreateInstance(modalElem);
+          bsModal.show();
+        }
+        return false;
+      } else {
+        const modalElem = document.getElementById('moduleAccessDeniedModal');
+        if (modalElem && typeof bootstrap !== 'undefined' && bootstrap.Modal) {
+          const bsModal = bootstrap.Modal.getInstance(modalElem);
+          if (bsModal) bsModal.hide();
+        }
+      }
+
+      // Also update the header button to personnel:
+      const switcherBtn = document.getElementById('navModuleSwitcherPersonnel');
+      if (switcherBtn) {
+        if (!hasPersonnel && !isSuperAdmin) {
+          switcherBtn.classList.add('opacity-50');
+          switcherBtn.title = 'คุณไม่ได้รับสิทธิ์เข้าใช้งานระบบงานบุคคล';
+        } else {
+          switcherBtn.classList.remove('opacity-50');
+          switcherBtn.title = 'สลับไปยังระบบงานบุคคลและผังองค์กร (HR)';
+        }
+      }
+
+      return true;
+    };
 
     // Update Auth UI Elements
     window.updateAuthUI = function() {
@@ -287,15 +704,41 @@
         const profileUid = document.getElementById('userProfileUid');
         const profileRoleBadge = document.getElementById('userProfileRoleBadge');
 
-        if (profileImg) profileImg.src = currentAuthUser.photoURL || currentUserProfile?.photoURL || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80';
-        if (profileName) profileName.textContent = currentAuthUser.displayName || currentUserProfile?.displayName || 'ผู้ใช้งาน';
-        if (profileEmail) profileEmail.textContent = currentAuthUser.email || currentUserProfile?.email || '-';
+        // Dropdown Header Elements
+        const menuAvatar = document.getElementById('menuUserAvatar');
+        const menuName = document.getElementById('menuUserName');
+        const menuEmail = document.getElementById('menuUserEmail');
+        const menuRoleBadge = document.getElementById('menuUserRoleBadge');
+
+        const userDisplayName = currentAuthUser.displayName || currentUserProfile?.displayName || 'ผู้ใช้งาน';
+        const userEmailVal = currentAuthUser.email || currentUserProfile?.email || '-';
+        const userPhotoVal = currentAuthUser.photoURL || currentUserProfile?.photoURL || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80';
+
+        if (profileImg) profileImg.src = userPhotoVal;
+        if (profileName) profileName.textContent = userDisplayName;
+        if (profileEmail) profileEmail.textContent = userEmailVal;
         if (profileUid) profileUid.textContent = `UID: ${currentAuthUser.uid}`;
         if (profileRoleBadge) {
           profileRoleBadge.textContent = rName;
           if (currentRole === 'ADMIN') profileRoleBadge.className = 'badge bg-danger rounded-pill px-3 py-2';
           else if (currentRole === 'MANAGER') profileRoleBadge.className = 'badge bg-primary rounded-pill px-3 py-2';
           else profileRoleBadge.className = 'badge bg-success rounded-pill px-3 py-2';
+        }
+
+        if (menuAvatar) menuAvatar.src = userPhotoVal;
+        if (menuName) menuName.textContent = userDisplayName;
+        if (menuEmail) menuEmail.textContent = userEmailVal;
+        if (menuRoleBadge) {
+          if (currentRole === 'ADMIN') {
+            menuRoleBadge.textContent = '🔴 ผู้ดูแลระบบ (Admin)';
+            menuRoleBadge.className = 'badge bg-danger rounded-pill px-2 py-0.5 fs-8 fw-semibold';
+          } else if (currentRole === 'MANAGER') {
+            menuRoleBadge.textContent = '🔵 เจ้าหน้าที่/บริหาร (Manager)';
+            menuRoleBadge.className = 'badge bg-primary rounded-pill px-2 py-0.5 fs-8 fw-semibold';
+          } else {
+            menuRoleBadge.textContent = `🟢 ${rName}`;
+            menuRoleBadge.className = 'badge bg-success rounded-pill px-2 py-0.5 fs-8 fw-semibold';
+          }
         }
 
         const editName = document.getElementById('editProfileNameInput');
@@ -322,12 +765,14 @@
         try {
           auth = getAuth();
           googleProvider = new GoogleAuthProvider();
+          googleProvider.addScope('https://www.googleapis.com/auth/drive.file');
         } catch(e) {
           console.warn("Auth re-init failed:", e);
         }
       }
 
       if (googleProvider) {
+        googleProvider.addScope('https://www.googleapis.com/auth/drive.file');
         googleProvider.setCustomParameters({ prompt: 'select_account' });
       }
 
@@ -342,6 +787,24 @@
       try {
         showToast("⏳ กำลังเปิดหน้าต่าง Google Sign-In...");
         const result = await signInWithPopup(auth, googleProvider);
+        try {
+          const credential = GoogleAuthProvider.credentialFromResult(result);
+          if (credential?.accessToken) {
+            window.googleDriveAccessToken = credential.accessToken;
+            localStorage.setItem('google_drive_access_token', credential.accessToken);
+            localStorage.setItem('google_drive_token_expires', String(Date.now() + 3500 * 1000));
+            sessionStorage.setItem('google_drive_access_token', credential.accessToken);
+            
+            // Check if Google Drive daily backup is pending
+            setTimeout(() => {
+              if (typeof window.runHybridDailyBackup === 'function') {
+                window.runHybridDailyBackup(false).catch(e => console.warn("[GoogleSignIn] Hybrid backup trigger notice:", e));
+              }
+            }, 1000);
+          }
+        } catch (credErr) {
+          console.warn("Credential extraction notice:", credErr);
+        }
         showToast(`🟢 เข้าสู่ระบบด้วย Google Account สำเร็จ: ${result.user.displayName || result.user.email}`);
         if (typeof window.hideMandatoryLoginScreen === 'function') {
           window.hideMandatoryLoginScreen();
@@ -363,6 +826,76 @@
         }
         showToast(`🔴 ${errorTitle} (${err.code || err.message})`);
       }
+    };
+
+    // Helper to get Google Drive Access Token (cached with mutex to prevent duplicate popups)
+    let driveAuthPromise = null;
+    let lastAuthAttemptTime = 0;
+
+    window.getGoogleDriveAccessToken = async function(promptIfMissing = true, forceRefresh = false) {
+      if (driveAuthPromise) {
+        return await driveAuthPromise;
+      }
+
+      const now = Date.now();
+      if (!forceRefresh) {
+        if (window.googleDriveAccessToken) {
+          return window.googleDriveAccessToken;
+        }
+        const stored = localStorage.getItem('google_drive_access_token') || sessionStorage.getItem('google_drive_access_token');
+        const expiresAt = parseInt(localStorage.getItem('google_drive_token_expires') || '0', 10);
+        if (stored && (expiresAt === 0 || expiresAt > now + 60000)) {
+          window.googleDriveAccessToken = stored;
+          return stored;
+        }
+      } else {
+        window.googleDriveAccessToken = null;
+        localStorage.removeItem('google_drive_access_token');
+        localStorage.removeItem('google_drive_token_expires');
+        sessionStorage.removeItem('google_drive_access_token');
+      }
+
+      if (!promptIfMissing) return null;
+
+      // Prevent spamming popup within 2 seconds
+      if (now - lastAuthAttemptTime < 2000 && !forceRefresh) {
+        if (window.googleDriveAccessToken) return window.googleDriveAccessToken;
+      }
+      lastAuthAttemptTime = now;
+
+      driveAuthPromise = (async () => {
+        try {
+          if (!auth) auth = getAuth();
+          if (!googleProvider) {
+            googleProvider = new GoogleAuthProvider();
+          }
+          googleProvider.addScope('https://www.googleapis.com/auth/drive.file');
+          googleProvider.setCustomParameters({ prompt: 'select_account' });
+
+          const result = await signInWithPopup(auth, googleProvider);
+          const credential = GoogleAuthProvider.credentialFromResult(result);
+          if (credential?.accessToken) {
+            window.googleDriveAccessToken = credential.accessToken;
+            localStorage.setItem('google_drive_access_token', credential.accessToken);
+            localStorage.setItem('google_drive_token_expires', String(Date.now() + 3500 * 1000));
+            sessionStorage.setItem('google_drive_access_token', credential.accessToken);
+            return credential.accessToken;
+          }
+          throw new Error("ไม่ได้รับสิทธิ์หรือ Access Token จาก Google Drive กรุณาลองใหม่อีกครั้ง");
+        } catch (popupErr) {
+          console.error("Google Drive Token Popup Error:", popupErr);
+          if (popupErr.code === 'auth/popup-closed-by-user') {
+            throw new Error("ยกเลิกการเข้าสู่ระบบ Google Drive (หน้าต่าง Popup ถูกปิด)");
+          } else if (popupErr.code === 'auth/unauthorized-domain') {
+            throw new Error(`โดเมนนี้ยังไม่ได้รับอนุญาตใน Firebase Authentication (${window.location.hostname})`);
+          }
+          throw popupErr;
+        } finally {
+          driveAuthPromise = null;
+        }
+      })();
+
+      return await driveAuthPromise;
     };
 
     // Email Login
@@ -453,34 +986,50 @@
         currentUserProfile = {
           uid: 'admin_jaru072',
           email: 'jaru072@gmail.com',
-          displayName: 'คุณธรรมะ ศรีทอง (Admin)',
+          displayName: 'ผู้ดูแลระบบ (Admin)',
           role: 'ADMIN'
         };
         currentAuthUser = {
           uid: 'admin_jaru072',
           email: 'jaru072@gmail.com',
-          displayName: 'คุณธรรมะ ศรีทอง (Admin)',
+          displayName: 'ผู้ดูแลระบบ (Admin)',
           photoURL: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'
         };
       } else {
         currentRole = role;
         currentUserProfile = {
           uid: 'user_guest',
-          email: targetEmail || 'staff@floragarden.com',
-          displayName: roleTitle || 'เจ้าหน้าที่',
+          email: targetEmail || '',
+          displayName: roleTitle || 'ผู้ใช้งานทั่วไป',
           role: role
         };
         if (!currentAuthUser) {
           currentAuthUser = {
             uid: 'user_guest',
-            email: targetEmail || 'staff@floragarden.com',
-            displayName: roleTitle || 'เจ้าหน้าที่',
+            email: targetEmail || '',
+            displayName: roleTitle || 'ผู้ใช้งานทั่วไป',
             photoURL: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'
           };
         }
       }
 
       setRole(currentRole);
+      sessionStorage.setItem('flora_personnel_access', JSON.stringify({
+        uid: currentUserProfile?.uid || '',
+        email: currentUserProfile?.email || '',
+        displayName: currentUserProfile?.displayName || '',
+        role: currentRole,
+        isAdmin: currentRole === 'ADMIN' && currentUserProfile?.email === 'jaru072@gmail.com'
+      }));
+      if (currentUserProfile?.email) {
+        localStorage.setItem('flora_saved_user_profile', JSON.stringify({
+          uid: currentUserProfile?.uid || '',
+          email: currentUserProfile?.email || '',
+          displayName: currentUserProfile?.displayName || '',
+          role: currentRole,
+          isAdmin: currentRole === 'ADMIN' && currentUserProfile?.email === 'jaru072@gmail.com'
+        }));
+      }
       if (typeof window.ensureAdminUserInUsersCollection === 'function') {
         window.ensureAdminUserInUsersCollection();
       }
@@ -501,6 +1050,7 @@
       const emp = employeeList.find(x => x.id === empId);
       const targetRole = emp ? (emp.role || 'WORKER') : 'WORKER';
       setRole(targetRole);
+      sessionStorage.setItem('flora_personnel_access', JSON.stringify({ uid: emp?.id || empId, email: '', role: targetRole, isAdmin: false }));
       hideMandatoryLoginScreen();
       showToast(`🟢 ยินดีต้อนรับเข้าสู่ระบบ คุณ${emp ? emp.name : empId} [${targetRole}]`);
     };
@@ -508,9 +1058,20 @@
     window.formatEmpName = function(emp) {
       if (!emp) return '';
       if (typeof emp === 'string') return emp;
-      const name = emp.name || '';
-      const nick = emp.nickname ? ` (${emp.nickname.trim()})` : '';
-      return `${name}${nick}`.trim();
+      const name = (emp.name || '').trim();
+      const rawNick = (emp.nickname || '').trim();
+      if (!rawNick) return name;
+
+      // Clean rawNick if it already has parentheses
+      const cleanNick = rawNick.replace(/^\(|\)$/g, '').trim();
+      if (!cleanNick) return name;
+
+      // If name already contains the nickname or already has parentheses with it
+      if (name.includes(`(${cleanNick})`) || name.includes(`（${cleanNick}）`) || name.toLowerCase().includes(`(${cleanNick.toLowerCase()})`)) {
+        return name;
+      }
+
+      return `${name} (${cleanNick})`.trim();
     };
 
     window.handleGoogleSignInAndClose = async function() {
@@ -586,10 +1147,16 @@
       if (currentAuthUser || currentUserProfile || lastKnownUserForLogout) {
         const u = currentAuthUser || currentUserProfile || lastKnownUserForLogout;
         sessionStorage.clear();
+        localStorage.removeItem('flora_saved_user_profile');
         if (typeof window.recordUserLoginStatus === 'function') {
           await window.recordUserLoginStatus('Offline', u);
         }
       }
+      currentRole = 'WORKER';
+      currentUserProfile = null;
+      currentAuthUser = null;
+      setRole('WORKER');
+      updateAuthUI();
       if (auth) {
         try {
           await signOut(auth);
@@ -680,7 +1247,6 @@
         await window.ensureAdminUserInUsersCollection();
 
         onSnapshot(collection(db, "users"), (snapshot) => {
-          if (window.isRestoringDatabase) return;
           allUsersList = [];
           snapshot.forEach(docSnap => {
             allUsersList.push({ id: docSnap.id, ...docSnap.data() });
@@ -798,8 +1364,10 @@
         countBadge.textContent = `แสดง ${filteredList.length} / ${allUsersList.length} รายการ`;
       }
 
+      const empList = Array.isArray(window.employeeList) ? window.employeeList : (typeof employeeList !== 'undefined' && Array.isArray(employeeList) ? employeeList : []);
+
       if (filteredList.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-4"><i class="bi bi-search me-1 text-warning"></i> ไม่พบรายชื่อผู้ใช้งานที่ตรงตามเงื่อนไขการค้นหา/กรอง</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="text-center text-muted py-4"><i class="bi bi-search me-1 text-warning"></i> ไม่พบรายชื่อผู้ใช้งานที่ตรงตามเงื่อนไขการค้นหา/กรอง</td></tr>`;
         return;
       }
 
@@ -809,67 +1377,217 @@
         const { isOnline, timeVal } = getUserOnlineStatusInfo(u);
 
         const onlineBadge = isOnline
-          ? `<span class="badge bg-success bg-opacity-10 text-success rounded-pill px-2.5 py-1.5 fw-bold fs-8 d-inline-flex align-items-center gap-1.5"><i class="bi bi-circle-fill text-success" style="font-size: 7px;"></i> Online</span>`
-          : `<span class="badge bg-danger bg-opacity-10 text-danger rounded-pill px-2.5 py-1.5 fw-bold fs-8 d-inline-flex align-items-center gap-1.5"><i class="bi bi-circle-fill text-danger" style="font-size: 7px;"></i> Offline</span>`;
+          ? `<span class="badge bg-success bg-opacity-10 text-success rounded-pill px-2 py-1 fw-bold fs-8 d-inline-flex align-items-center gap-1"><i class="bi bi-circle-fill text-success" style="font-size: 7px;"></i> Online</span>`
+          : `<span class="badge bg-danger bg-opacity-10 text-danger rounded-pill px-2 py-1 fw-bold fs-8 d-inline-flex align-items-center gap-1"><i class="bi bi-circle-fill text-danger" style="font-size: 7px;"></i> Offline</span>`;
 
         let timeSubtitle = '';
         if (timeVal > 0 && typeof formatThaiBuddhistDateAndTime === 'function') {
           const formatted = formatThaiBuddhistDateAndTime(new Date(timeVal).toISOString());
           if (formatted && formatted.time24 && formatted.time24 !== '-') {
-            timeSubtitle = `<small class="text-muted d-block font-monospace mt-0.5" style="font-size: 0.7rem !important;"><i class="bi bi-clock me-0.5"></i>${formatted.time24}</small>`;
+            timeSubtitle = `<small class="text-muted font-monospace ms-1 fs-9 text-nowrap" title="เวลาใช้งานล่าสุด"><i class="bi bi-clock me-0.5"></i>${formatted.time24}</small>`;
           }
         }
 
         const safeName = typeof escapeHtml === 'function' ? escapeHtml(u.displayName || 'ผู้ใช้') : (u.displayName || 'ผู้ใช้');
         const safeEmail = typeof escapeHtml === 'function' ? escapeHtml(u.email || '-') : (u.email || '-');
+        const hasPersonnel = (u.accessPersonnel !== undefined) ? Boolean(u.accessPersonnel) : (uRole === 'ADMIN' || uRole === 'MANAGER' || uRole === 'STAFF');
+        const hasInventory = (u.accessInventory !== undefined) ? Boolean(u.accessInventory) : true;
+        const hasPayroll = Boolean(u.accessPayroll);
+        const hasProcurement = Boolean(u.accessProcurement);
+
+        // Match linked employee
+        const currentLinkedEmpId = u.linkedEmployeeId || '';
+        const matchedEmpByEmail = !currentLinkedEmpId && u.email ? empList.find(e => e.email && String(e.email).trim().toLowerCase() === String(u.email).trim().toLowerCase()) : null;
+        const targetEmpId = currentLinkedEmpId || (matchedEmpByEmail ? (matchedEmpByEmail.id || matchedEmpByEmail.code) : '');
+
+        const empOptions = [
+          `<option value="">-- ยังไม่ผูกบุคลากร --</option>`,
+          ...empList.map(emp => {
+            const empIdVal = emp.id || emp.code;
+            const isSelected = (empIdVal === targetEmpId || emp.code === targetEmpId) ? 'selected' : '';
+            const empCodeStr = emp.code ? `[${emp.code}] ` : '';
+            const empDeptStr = emp.department ? ` (${emp.department})` : '';
+            return `<option value="${empIdVal}" ${isSelected}>${empCodeStr}${emp.name || 'ไม่มีชื่อ'}${empDeptStr}</option>`;
+          })
+        ].join('');
 
         return `
-          <tr>
-            <td>
-              <div class="d-flex align-items-center gap-2">
-                <img src="${img}" class="rounded-circle" style="width: 32px; height: 32px; object-fit: cover;" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80'" />
-                <div>
-                  <span class="fw-bold text-dark d-block">${safeName}</span>
-                  <small class="text-muted font-monospace fs-8">UID: ${u.id.substring(0, 10)}...</small>
+          <tr class="text-nowrap align-middle">
+            <td class="ps-3 text-nowrap">
+              <div class="d-flex align-items-center gap-2 text-nowrap">
+                <img src="${img}" class="rounded-circle shadow-sm flex-shrink-0" style="width: 28px; height: 28px; object-fit: cover;" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80'" />
+                <span class="fw-bold text-dark text-nowrap">${safeName}</span>
+              </div>
+            </td>
+            <td class="text-muted fs-8 text-nowrap">
+              <span>${safeEmail}</span>
+              ${matchedEmpByEmail && !currentLinkedEmpId ? `<span class="badge bg-info bg-opacity-10 text-info border border-info border-opacity-25 ms-1 fs-9 text-nowrap" title="แนะนำผูกตามอีเมล"><i class="bi bi-link-45deg"></i> แนะนำ</span>` : ''}
+            </td>
+            <td class="text-center text-nowrap">
+              ${onlineBadge} ${timeSubtitle}
+            </td>
+            <td class="text-center text-nowrap">
+              <select id="userRoleSelect_${u.id}" class="form-select form-select-sm fw-semibold" style="min-width: 140px;" onchange="window.onUserRoleSelectChanged('${u.id}')">
+                <option value="ADMIN" ${uRole === 'ADMIN' ? 'selected' : ''}>🔴 ผู้ดูแลระบบ (ADMIN)</option>
+                <option value="MANAGER" ${uRole === 'MANAGER' ? 'selected' : ''}>🔵 ผู้จัดการ/บริหาร (MANAGER)</option>
+                <option value="STAFF" ${uRole === 'STAFF' ? 'selected' : ''}>🟣 เจ้าหน้าที่ (STAFF)</option>
+                <option value="WORKER" ${uRole === 'WORKER' ? 'selected' : ''}>🟢 พนักงาน (WORKER)</option>
+              </select>
+            </td>
+            <td class="text-center text-nowrap">
+              <div class="d-flex align-items-center justify-content-center gap-2 text-nowrap flex-nowrap">
+                <div class="form-check form-switch m-0 d-inline-flex align-items-center gap-1" title="สิทธิ์เข้าระบบงานบุคคล (HR)">
+                  <input class="form-check-input mt-0" type="checkbox" id="userAccPersonnel_${u.id}" ${hasPersonnel ? 'checked' : ''} onchange="window.updateFirestoreUserRole('${u.id}')">
+                  <label class="form-check-label fs-8 fw-semibold text-primary text-nowrap" for="userAccPersonnel_${u.id}">👥 บุคคล</label>
+                </div>
+                <div class="form-check form-switch m-0 d-inline-flex align-items-center gap-1" title="สิทธิ์เข้าระบบพัสดุและอุปกรณ์">
+                  <input class="form-check-input mt-0" type="checkbox" id="userAccInventory_${u.id}" ${hasInventory ? 'checked' : ''} onchange="window.updateFirestoreUserRole('${u.id}')">
+                  <label class="form-check-label fs-8 fw-semibold text-success text-nowrap" for="userAccInventory_${u.id}">📦 พัสดุฯ</label>
+                </div>
+                <div class="form-check form-switch m-0 d-inline-flex align-items-center gap-1" title="สิทธิ์เข้าระบบเงินเดือน (เฉพาะการเงิน/ผู้ดูแลระบบ)">
+                  <input class="form-check-input mt-0" type="checkbox" id="userAccPayroll_${u.id}" ${hasPayroll ? 'checked' : ''} onchange="window.updateFirestoreUserRole('${u.id}')">
+                  <label class="form-check-label fs-8 fw-semibold text-warning text-nowrap" for="userAccPayroll_${u.id}">💰 เงินเดือน</label>
+                </div>
+                <div class="form-check form-switch m-0 d-inline-flex align-items-center gap-1" title="สิทธิ์การจัดการจัดซื้อ (อนุมัติ/ออก PO/ตรวจรับ)">
+                  <input class="form-check-input mt-0" type="checkbox" id="userAccProcurement_${u.id}" ${hasProcurement ? 'checked' : ''} onchange="window.updateFirestoreUserRole('${u.id}')">
+                  <label class="form-check-label fs-8 fw-semibold text-nowrap" style="color: #0f766e;" for="userAccProcurement_${u.id}">🛒 จัดซื้อฯ</label>
                 </div>
               </div>
             </td>
-            <td class="text-muted fs-8">${safeEmail}</td>
-            <td class="text-center">
-              ${onlineBadge}
-              ${timeSubtitle}
-            </td>
-            <td class="text-center">
-              <select id="userRoleSelect_${u.id}" class="form-select form-select-sm fw-semibold">
-                <option value="ADMIN" ${uRole === 'ADMIN' ? 'selected' : ''}>🔴 ผู้ดูแลระบบ</option>
-                <option value="MANAGER" ${uRole === 'MANAGER' ? 'selected' : ''}>🔵 เจ้าหน้าที่</option>
-                <option value="WORKER" ${uRole === 'WORKER' ? 'selected' : ''}>🟢 พนักงาน</option>
+            <td class="text-center text-nowrap">
+              <select id="userLinkedEmp_${u.id}" class="form-select form-select-sm fs-8 border-secondary border-opacity-50 text-truncate" style="min-width: 170px;" onchange="window.updateFirestoreUserRole('${u.id}')">
+                ${empOptions}
               </select>
             </td>
-            <td class="text-end pe-3">
-              <button class="btn btn-sm btn-outline-success rounded-pill px-3 fw-semibold" onclick="updateFirestoreUserRole('${u.id}')">
+            <td class="text-end pe-3 text-nowrap">
+              <button class="btn btn-sm btn-outline-success rounded-pill px-3 fw-semibold text-nowrap" onclick="window.updateFirestoreUserRole('${u.id}')">
                 <i class="bi bi-check-lg me-1"></i> บันทึก
               </button>
             </td>
           </tr>
         `;
       }).join('');
-    }
+    };
 
-    // Update User Role in Firestore
+    // Role Select Change Handler in Main Script
+    window.onUserRoleSelectChanged = function(userId) {
+      const selectElem = document.getElementById(`userRoleSelect_${userId}`);
+      const chkPersonnel = document.getElementById(`userAccPersonnel_${userId}`);
+      const chkInventory = document.getElementById(`userAccInventory_${userId}`);
+      const chkPayroll = document.getElementById(`userAccPayroll_${userId}`);
+      const chkProcurement = document.getElementById(`userAccProcurement_${userId}`);
+      if (!selectElem) return;
+
+      const role = selectElem.value;
+      if (role === 'ADMIN') {
+        if (chkPersonnel) chkPersonnel.checked = true;
+        if (chkInventory) chkInventory.checked = true;
+        if (chkPayroll) chkPayroll.checked = true;
+        if (chkProcurement) chkProcurement.checked = true;
+      } else if (role === 'MANAGER') {
+        if (chkPersonnel) chkPersonnel.checked = true;
+        if (chkInventory) chkInventory.checked = true;
+        if (chkPayroll) chkPayroll.checked = true;
+        if (chkProcurement) chkProcurement.checked = true;
+      } else if (role === 'STAFF') {
+        if (chkPersonnel) chkPersonnel.checked = false;
+        if (chkInventory) chkInventory.checked = true;
+        if (chkPayroll) chkPayroll.checked = false;
+        if (chkProcurement) chkProcurement.checked = false;
+      } else if (role === 'WORKER') {
+        if (chkPersonnel) chkPersonnel.checked = false;
+        if (chkInventory) chkInventory.checked = true;
+        if (chkPayroll) chkPayroll.checked = false;
+        if (chkProcurement) chkProcurement.checked = false;
+      }
+      window.updateFirestoreUserRole(userId);
+    };
+
+    // Update User Role & Module Permissions in Firestore
     window.updateFirestoreUserRole = async function(userId) {
       const selectElem = document.getElementById(`userRoleSelect_${userId}`);
+      const chkPersonnel = document.getElementById(`userAccPersonnel_${userId}`);
+      const chkInventory = document.getElementById(`userAccInventory_${userId}`);
+      const chkPayroll = document.getElementById(`userAccPayroll_${userId}`);
+      const chkProcurement = document.getElementById(`userAccProcurement_${userId}`);
+      const selEmp = document.getElementById(`userLinkedEmp_${userId}`);
       if (!selectElem || !db) return;
       const newRole = selectElem.value;
+      const accessPersonnel = chkPersonnel ? chkPersonnel.checked : (newRole === 'ADMIN' || newRole === 'MANAGER' || newRole === 'STAFF');
+      const accessInventory = chkInventory ? chkInventory.checked : true;
+      const accessPayroll = chkPayroll ? chkPayroll.checked : (newRole === 'ADMIN');
+      const accessProcurement = chkProcurement ? chkProcurement.checked : (newRole === 'ADMIN' || newRole === 'MANAGER');
+
+      const linkedEmpId = selEmp ? selEmp.value : '';
+      const empList = Array.isArray(window.employeeList) ? window.employeeList : (typeof employeeList !== 'undefined' && Array.isArray(employeeList) ? employeeList : []);
+      const matchedEmp = empList.find(e => (e.id === linkedEmpId || e.code === linkedEmpId));
+      const linkedEmpName = matchedEmp ? (matchedEmp.name || '') : '';
+      const linkedEmpCode = matchedEmp ? (matchedEmp.code || '') : '';
+
       try {
         const userRef = doc(db, "users", userId);
         await updateDoc(userRef, {
           role: newRole,
+          accessPersonnel: accessPersonnel,
+          accessInventory: accessInventory,
+          accessPayroll: accessPayroll,
+          accessProcurement: accessProcurement,
+          linkedEmployeeId: linkedEmpId,
+          linkedEmployeeName: linkedEmpName,
+          linkedEmployeeCode: linkedEmpCode,
+          modules: [
+            ...(accessPersonnel ? ['personnel'] : []),
+            ...(accessInventory ? ['inventory'] : []),
+            ...(accessPayroll ? ['payroll'] : []),
+            ...(accessProcurement ? ['procurement'] : [])
+          ],
           updatedAt: new Date().toISOString()
         });
-        showToast(`อัปเดตสิทธิ์ผู้ใช้เป็น ${newRole} เรียบร้อยแล้ว`);
+
+        // Update in-memory user list object
+        if (Array.isArray(allUsersList)) {
+          const targetUser = allUsersList.find(u => u.id === userId);
+          if (targetUser) {
+            targetUser.role = newRole;
+            targetUser.accessPersonnel = accessPersonnel;
+            targetUser.accessInventory = accessInventory;
+            targetUser.accessPayroll = accessPayroll;
+            targetUser.accessProcurement = accessProcurement;
+            targetUser.linkedEmployeeId = linkedEmpId;
+            targetUser.linkedEmployeeName = linkedEmpName;
+            targetUser.linkedEmployeeCode = linkedEmpCode;
+          }
+        }
+
+        // Bi-directional link to employee document if selected
+        if (linkedEmpId) {
+          const uObj = Array.isArray(allUsersList) ? allUsersList.find(u => u.id === userId) : null;
+          const userEmailStr = uObj?.email || '';
+          try {
+            const empRef = doc(db, "employees", linkedEmpId);
+            await updateDoc(empRef, {
+              linkedUserId: userId,
+              linkedUserEmail: userEmailStr,
+              updatedAt: new Date().toISOString()
+            });
+          } catch (empErr) {
+            console.warn("Could not update linked employee document:", empErr);
+          }
+        }
+
+        showToast(`บันทึกสิทธิ์และผูกบัญชีบุคลากรเรียบร้อยแล้ว`);
         if (currentAuthUser && currentAuthUser.uid === userId) {
+          if (currentUserProfile) {
+            currentUserProfile.role = newRole;
+            currentUserProfile.accessPersonnel = accessPersonnel;
+            currentUserProfile.accessInventory = accessInventory;
+            currentUserProfile.accessPayroll = accessPayroll;
+            currentUserProfile.accessProcurement = accessProcurement;
+          }
           setRole(newRole);
+          if (typeof window.checkModuleAccess === 'function') {
+            window.checkModuleAccess('inventory');
+          }
         }
       } catch (err) {
         showToast(`อัปเดตสิทธิ์ไม่สำเร็จ: ${err.message}`);
@@ -877,6 +1595,7 @@
     };
 
     const DEFAULT_EQUIPMENT_IMAGE = "https://images.unsplash.com/photo-1585320806297-9794b3e4eeae?w=600&auto=format&fit=crop&q=80";
+    const DEFAULT_AVATAR_IMAGE = "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80";
 
     // Initial Data Generators
     function generateInitialEmployees() {
@@ -1211,45 +1930,152 @@
       ];
     }
 
-    // LocalStorage Helper Functions - Disabled database entity caching to ensure Cloud Firestore is single source of truth
+    // LocalStorage Helper Functions - Multi-tiered caching for instant 0ms app start
     function saveToLocalStorage() {
       try {
-        localStorage.removeItem('flora_employees');
-        localStorage.removeItem('flora_equipment');
-        localStorage.removeItem('flora_transactions');
-        localStorage.removeItem('flora_attendance');
-        localStorage.removeItem('flora_categories');
+        if (Array.isArray(employeeList) && employeeList.length > 0) {
+          try {
+            setScopedLocalStorageItem('flora_employees', JSON.stringify(employeeList));
+          } catch(eQuota) {
+            // If quota exceeded due to heavy base64, save sanitized version
+            const sanitized = employeeList.map(emp => ({
+              ...emp,
+              photoUrl: (emp.photoUrl && emp.photoUrl.length > 2000) ? 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80' : emp.photoUrl
+            }));
+            try { setScopedLocalStorageItem('flora_employees', JSON.stringify(sanitized)); } catch(e){}
+          }
+        }
+        if (Array.isArray(equipmentList) && equipmentList.length > 0) {
+          try {
+            setScopedLocalStorageItem('flora_equipment', JSON.stringify(equipmentList));
+          } catch(eQuota) {
+            const sanitized = equipmentList.map(eq => ({
+              ...eq,
+              imageUrl: (eq.imageUrl && eq.imageUrl.length > 2000) ? DEFAULT_EQUIPMENT_IMAGE : eq.imageUrl
+            }));
+            try { setScopedLocalStorageItem('flora_equipment', JSON.stringify(sanitized)); } catch(e){}
+          }
+        }
+        if (Array.isArray(transactionHistory) && transactionHistory.length > 0) {
+          try {
+            setScopedLocalStorageItem('flora_transactions', JSON.stringify(transactionHistory));
+          } catch(e){}
+        }
+        if (Array.isArray(attendanceLogs) && attendanceLogs.length > 0) {
+          try {
+            setScopedLocalStorageItem('flora_attendance', JSON.stringify(attendanceLogs));
+          } catch(e){}
+        }
+        if (Array.isArray(categoriesList) && categoriesList.length > 0) {
+          try {
+            setScopedLocalStorageItem('flora_categories', JSON.stringify(categoriesList));
+          } catch(e){}
+        }
         if (departmentsList && Array.isArray(departmentsList) && departmentsList.length > 0) {
-          localStorage.setItem('flora_departments', JSON.stringify(departmentsList));
+          setScopedLocalStorageItem('flora_departments', JSON.stringify(departmentsList));
+        }
+        if (positionsList && Array.isArray(positionsList) && positionsList.length > 0) {
+          setScopedLocalStorageItem('flora_positions', JSON.stringify(positionsList));
         }
         if (locationsList && Array.isArray(locationsList) && locationsList.length > 0) {
-          localStorage.setItem('flora_locations', JSON.stringify(locationsList));
+          setScopedLocalStorageItem('flora_locations', JSON.stringify(locationsList));
         }
       } catch (e) {
-        console.warn("LocalStorage cleanup notice:", e);
+        console.warn("LocalStorage save notice:", e);
       }
     }
 
     function loadFromLocalStorage() {
       try {
-        saveToLocalStorage();
-        employeeList = [];
-        equipmentList = [];
-        transactionHistory = [];
-        attendanceLogs = [];
-        categoriesList = [...defaultCategoriesList];
-        const savedDepts = localStorage.getItem('flora_departments');
-        if (savedDepts) {
+        const savedEquip = getScopedLocalStorageItem('flora_equipment');
+        if (savedEquip) {
           try {
-            departmentsList = JSON.parse(savedDepts);
-          } catch(e) {
-            departmentsList = [...defaultCategoriesList];
-          }
-        } else {
-          departmentsList = [...defaultDepartmentsList];
+            const parsed = JSON.parse(savedEquip);
+            if (Array.isArray(parsed) && parsed.length > 0) equipmentList = parsed;
+          } catch(e){}
         }
 
-        const savedLocs = localStorage.getItem('flora_locations');
+        const savedEmps = getScopedLocalStorageItem('flora_employees');
+        if (savedEmps) {
+          try {
+            const parsed = JSON.parse(savedEmps);
+            if (Array.isArray(parsed) && parsed.length > 0) employeeList = parsed;
+          } catch(e){}
+        }
+
+        const savedTx = getScopedLocalStorageItem('flora_transactions');
+        if (savedTx) {
+          try {
+            const parsed = JSON.parse(savedTx);
+            if (Array.isArray(parsed) && parsed.length > 0) transactionHistory = parsed;
+          } catch(e){}
+        }
+
+        const savedAtt = getScopedLocalStorageItem('flora_attendance');
+        if (savedAtt) {
+          try {
+            const parsed = JSON.parse(savedAtt);
+            if (Array.isArray(parsed) && parsed.length > 0) attendanceLogs = parsed;
+          } catch(e){}
+        }
+
+        const savedCats = getScopedLocalStorageItem('flora_categories');
+        if (savedCats) {
+          try {
+            const parsed = JSON.parse(savedCats);
+            if (Array.isArray(parsed) && parsed.length > 0) categoriesList = parsed;
+            else categoriesList = [...defaultCategoriesList];
+          } catch(e) {
+            categoriesList = [...defaultCategoriesList];
+          }
+        } else {
+          categoriesList = [...defaultCategoriesList];
+        }
+
+        if (typeof window.getFloraOrgDepartments === 'function') {
+          departmentsList = window.getFloraOrgDepartments();
+        } else {
+          const savedDepts = getScopedLocalStorageItem('flora_departments');
+          if (savedDepts) {
+            try {
+              departmentsList = JSON.parse(savedDepts);
+            } catch(e) {
+              departmentsList = [...defaultDepartmentsList];
+            }
+          } else {
+            departmentsList = [...defaultDepartmentsList];
+          }
+        }
+
+        if (window.positionsList && Array.isArray(window.positionsList) && window.positionsList.length > 0) {
+          positionsList = [...window.positionsList];
+        } else {
+          const savedPositions = getScopedLocalStorageItem('flora_positions');
+          if (savedPositions) {
+            try {
+              const parsed = JSON.parse(savedPositions);
+              if (Array.isArray(parsed) && parsed.length > 0) {
+                const posMap = new Map();
+                defaultPositionsList.forEach(p => posMap.set(p.name.toLowerCase(), p));
+                parsed.forEach(p => {
+                  const name = typeof p === 'object' ? (p.name || p.id || '') : String(p);
+                  if (name && name.trim()) {
+                    posMap.set(name.trim().toLowerCase(), typeof p === 'object' ? p : { id: `POS-${String(posMap.size+1).padStart(3, '0')}`, code: `POS-${String(posMap.size+1).padStart(3, '0')}`, name: name.trim(), group: 'ตำแหน่งทั่วไป' });
+                  }
+                });
+                positionsList = Array.from(posMap.values());
+              } else {
+                positionsList = [...defaultPositionsList];
+              }
+            } catch(e) {
+              positionsList = [...defaultPositionsList];
+            }
+          } else {
+            positionsList = [...defaultPositionsList];
+          }
+        }
+
+        const savedLocs = getScopedLocalStorageItem('flora_locations');
         if (savedLocs) {
           try {
             locationsList = JSON.parse(savedLocs);
@@ -1260,27 +2086,48 @@
           locationsList = [...defaultLocationsList];
         }
 
-        const deptMap = {
-          "เจ้าหน้าที่สำนักงาน (Staff)": "แผนกงานธุรการ",
-          "แผนกเรือนกระจกและเพาะชำ": "แผนกงานทดลอง",
-          "แผนกตกแต่งและตัดแต่งกิ่ง": "แผนกทีมเจดีย์/แปลง G",
-          "แผนกระบบน้ำและบำรุงดิน": "แผนกทีมถนนธรรมชัย/เฟื้องฟ้า/ผสมดิน",
-          "สวนกุหลาบและไม้ดอก": "แผนกทีมกุหลาบ",
-          "สวนไม้ผลและไม้ยืนต้น": "แผนกทีมไม้ดอกหลังวิหารคดคอร์ 13-20(ปอ)",
-          "แผนกดูแลไม้ดอก (Rose & Tulip)": "แผนกทีมกุหลาบ",
-          "แผนกไม้ประดับใบ (Indoor Flora)": "แผนกงานทดลอง"
+        const legacyDeptMap = {
+          "แผนกงานธุรการ": "1.1 งานธุรการ / งานบุคคล",
+          "งานธุรการ": "1.1 งานธุรการ / งานบุคคล",
+          "แผนกงานบุคคล": "1.1 งานธุรการ / งานบุคคล",
+          "เจ้าหน้าที่สำนักงาน (Staff)": "1.1 งานธุรการ / งานบุคคล",
+          "แผนกเรือนกระจกและเพาะชำ": "2.1 งานทดลอง",
+          "แผนกงานทดลอง": "2.1 งานทดลอง",
+          "งานทดลอง": "2.1 งานทดลอง",
+          "แผนกทีมกุหลาบ": "2.2 งานกุหลาบ",
+          "ทีมกุหลาบ": "2.2 งานกุหลาบ",
+          "สวนกุหลาบและไม้ดอก": "2.2 งานกุหลาบ",
+          "แผนกดูแลไม้ดอก (Rose & Tulip)": "2.2 งานกุหลาบ",
+          "แผนกไม้ประดับใบ (Indoor Flora)": "2.1 งานทดลอง",
+          "แผนกทีมเจดีย์/แปลง G": "3.1 งานเจดีย์",
+          "แผนกตกแต่งและตัดแต่งกิ่ง": "3.1 งานเจดีย์",
+          "แผนกทีมเจดีย์": "3.1 งานเจดีย์",
+          "งานเจดีย์": "3.1 งานเจดีย์",
+          "ทีมวิหารหลวงปู่": "3.2 งานวิหารหลวงปู่",
+          "งานวิหารหลวงปู่": "3.2 งานวิหารหลวงปู่",
+          "แผนกทีมถนนธรรมชัย/เฟื้องฟ้า/ผสมดิน": "3.3 งานถนนธรรมชัย / เฟื่องฟ้า",
+          "แผนกระบบน้ำและบำรุงดิน": "1.3 งานระบบน้ำ",
+          "แผนกทีมถนนธรรมชัย": "3.3 งานถนนธรรมชัย / เฟื่องฟ้า",
+          "งานถนนธรรมชัย": "3.3 งานถนนธรรมชัย / เฟื่องฟ้า",
+          "ผสมดิน": "3.4 งานผสมแกลบ / งานโต๊ะกลาง",
+          "แผนกทีมแปลง A-B": "4.1 แปลง A / B",
+          "แปลง A-B": "4.1 แปลง A / B",
+          "แผนกทีมแปลง E/P11": "4.2 แปลง E / P11",
+          "แปลง E/P11": "4.2 แปลง E / P11",
+          "สวนไม้ผลและไม้ยืนต้น": "4.3 งานไม้กระถางหลังวิหารคด 13–20",
+          "แผนกทีมไม้ดอกหลังวิหารคดคอร์ 13-20(ปอ)": "4.3 งานไม้กระถางหลังวิหารคด 13–20",
+          "ทีมตัดหญ้า": "1.4 งานตัดหญ้า",
+          "ระบบน้ำ": "1.3 งานระบบน้ำ",
+          "ทั่วไป": "ฝ่ายบริหารและอำนวยการ",
+          "วิชาการ": "สายวิชาการและเทคนิคการผลิต"
         };
 
-        const oldDepts = Object.keys(deptMap);
-        departmentsList = (departmentsList || []).map(d => deptMap[d] || d);
-        departmentsList = Array.from(new Set(departmentsList));
-        if (departmentsList.length === 0 || departmentsList.some(d => oldDepts.includes(d))) {
-          departmentsList = [...defaultDepartmentsList];
-        }
-
         (employeeList || []).forEach(emp => {
-          if (deptMap[emp.department]) {
-            emp.department = deptMap[emp.department];
+          if (emp.department && legacyDeptMap[emp.department]) {
+            emp.department = legacyDeptMap[emp.department];
+          }
+          if (emp.position && typeof emp.position === 'string') {
+            emp.position = emp.position.replace(/\s*\(\d+(?:\.\d+)*\)\s*$/, '').trim();
           }
         });
       } catch (e) {
@@ -1299,6 +2146,7 @@
 
       renderCategoryDropdowns();
       populateDepartmentDropdowns();
+      populatePositionDropdowns();
       populateLocationDropdowns();
       populateEmployeeDropdowns();
       populateEquipmentDropdown();
@@ -1308,22 +2156,197 @@
       renderStaffTable();
       renderHistoryTable();
       if (typeof renderAuditLogsTable === 'function') renderAuditLogsTable();
-      renderEmployeeDirectory();
-      renderAttendanceTable();
+      // Personnel directory and attendance UI live in org_chart.html.
 
       updateStats();
-      setRole('WORKER');
-      if (typeof toggleTransTypeUI === 'function') toggleTransTypeUI();
 
-      if (isFirebaseReady) setupFirestoreListeners();
+      // Check if user session already exists in sessionStorage or localStorage
+      let initialSavedAccess = null;
+      try {
+        initialSavedAccess = JSON.parse(sessionStorage.getItem('flora_personnel_access') || localStorage.getItem('flora_saved_user_profile') || 'null');
+      } catch(e) {}
+
+      if (initialSavedAccess && (initialSavedAccess.email || initialSavedAccess.displayName)) {
+        currentUserProfile = initialSavedAccess;
+        currentRole = initialSavedAccess.role || 'WORKER';
+        setRole(currentRole);
+        if (typeof window.hideMandatoryLoginScreen === 'function') {
+          window.hideMandatoryLoginScreen();
+        }
+      } else {
+        // New user / not logged in yet: display Google Sign-In overlay
+        currentRole = 'WORKER';
+        currentUserProfile = null;
+        currentAuthUser = null;
+        setRole('WORKER');
+        if (typeof window.showMandatoryLoginScreen === 'function') {
+          window.showMandatoryLoginScreen();
+        }
+      }
+
+      if (typeof toggleTransTypeUI === 'function') toggleTransTypeUI();
+      if (typeof updateNavHistoryButtons === 'function') updateNavHistoryButtons();
+
+      if (isFirebaseReady) {
+        setupFirestoreListeners();
+      } else {
+        setTimeout(() => {
+          if (isFirebaseReady) setupFirestoreListeners();
+        }, 500);
+      }
       setupEventListeners();
+      if (typeof initGlobalScannerAutoDetectEngine === 'function') {
+        initGlobalScannerAutoDetectEngine();
+      }
     }
 
     // initApp will be invoked at the end of the script after all functions are loaded
 
+    window.openOrgChartPdfModal = function() {
+      const modalElem = document.getElementById('orgChartPdfModal');
+      if (modalElem) {
+        const bsModal = bootstrap.Modal.getOrCreateInstance(modalElem);
+        const iframe = document.getElementById('orgChartPdfIframe');
+        if (iframe && !iframe.src.includes('org_chart_pdf.html')) {
+          iframe.src = 'org_chart_pdf.html';
+        }
+        bsModal.show();
+      } else {
+        window.open('org_chart_pdf.html', '_blank');
+      }
+    };
+    let navHistoryStack = ['catalog-tab'];
+    let navHistoryIndex = 0;
+    let isNavigatingHistory = false;
+
+    window.updateNavHistoryButtons = function() {
+      const btnBack = document.getElementById('navBtnBack');
+      const btnForward = document.getElementById('navBtnForward');
+
+      const canGoBack = navHistoryIndex > 0;
+      const canGoForward = navHistoryIndex < navHistoryStack.length - 1;
+
+      if (btnBack) {
+        btnBack.disabled = !canGoBack;
+        if (canGoBack) {
+          btnBack.classList.remove('opacity-50');
+          btnBack.style.cursor = 'pointer';
+        } else {
+          btnBack.classList.add('opacity-50');
+          btnBack.style.cursor = 'not-allowed';
+        }
+      }
+
+      if (btnForward) {
+        btnForward.disabled = !canGoForward;
+        if (canGoForward) {
+          btnForward.classList.remove('opacity-50');
+          btnForward.style.cursor = 'pointer';
+        } else {
+          btnForward.classList.add('opacity-50');
+          btnForward.style.cursor = 'not-allowed';
+        }
+      }
+    };
+
+    window.recordTabNavigation = function(tabId) {
+      const validTabs = ['catalog-tab', 'transaction-tab', 'manage-tab', 'history-tab'];
+      if (!validTabs.includes(tabId)) return;
+
+      if (!isNavigatingHistory) {
+        if (navHistoryIndex < navHistoryStack.length - 1) {
+          navHistoryStack = navHistoryStack.slice(0, navHistoryIndex + 1);
+        }
+        if (navHistoryStack[navHistoryIndex] !== tabId) {
+          navHistoryStack.push(tabId);
+          navHistoryIndex = navHistoryStack.length - 1;
+        }
+        window.updateNavHistoryButtons();
+      }
+    };
+
+    window.goNavBack = function() {
+      if (navHistoryIndex > 0) {
+        navHistoryIndex--;
+        const targetTab = navHistoryStack[navHistoryIndex];
+        isNavigatingHistory = true;
+        window.switchNavTab(targetTab);
+        isNavigatingHistory = false;
+        window.updateNavHistoryButtons();
+      }
+    };
+
+    window.goNavForward = function() {
+      if (navHistoryIndex < navHistoryStack.length - 1) {
+        navHistoryIndex++;
+        const targetTab = navHistoryStack[navHistoryIndex];
+        isNavigatingHistory = true;
+        window.switchNavTab(targetTab);
+        isNavigatingHistory = false;
+        window.updateNavHistoryButtons();
+      }
+    };
+
+    window.openTransactionModal = function(equipId) {
+      if (equipId) {
+        window.lastInteractedEquipmentId = equipId;
+        const item = (equipmentList || []).find(x => x.id === equipId);
+
+        // Auto-select "ยืมอุปกรณ์" immediately if the equipment is loanable (อุปกรณ์ประเภทยืมใช้)
+        const isBorrow = item && (typeof window.isEquipmentBorrowType === 'function') && window.isEquipmentBorrowType(item);
+        if (isBorrow) {
+          const borrowRadio = document.getElementById('typeBorrow');
+          if (borrowRadio && (typeof selectedTransItems === 'undefined' || selectedTransItems.length === 0 || currentTransCartType === 'ยืมอุปกรณ์')) {
+            borrowRadio.checked = true;
+            if (typeof window.toggleTransTypeUI === 'function') {
+              window.toggleTransTypeUI();
+            }
+          }
+        } else if (typeof selectedTransItems === 'undefined' || selectedTransItems.length === 0) {
+          // General equipment defaults to issue (เบิกจ่าย) if cart is empty
+          const issueRadio = document.getElementById('typeIssue');
+          const borrowRadio = document.getElementById('typeBorrow');
+          if (issueRadio && borrowRadio && borrowRadio.checked) {
+            issueRadio.checked = true;
+            if (typeof window.toggleTransTypeUI === 'function') {
+              window.toggleTransTypeUI();
+            }
+          }
+        }
+
+        const select = document.getElementById('equipSelect');
+        if (select) {
+          select.value = equipId;
+          select.dispatchEvent(new Event('change'));
+        }
+        const equipSearch = document.getElementById('equipSearchInput');
+        if (equipSearch && item) {
+          equipSearch.value = item.name;
+        }
+        if (typeof updateEquipSelectPreview === 'function') {
+          updateEquipSelectPreview();
+        }
+      }
+      if (typeof renderTransCartList === 'function') {
+        renderTransCartList();
+      }
+      const modalElem = document.getElementById('transactionModal');
+      if (modalElem) {
+        const bsModal = bootstrap.Modal.getOrCreateInstance(modalElem);
+        bsModal.show();
+      }
+    };
 
     window.switchNavTab = function(tabId) {
-      if (currentRole === 'WORKER' && (tabId === 'employees-tab' || tabId === 'manage-tab' || tabId === 'history-tab')) {
+      if (tabId === 'transaction-tab') {
+        window.openTransactionModal();
+        return;
+      }
+      if (MAIN_STOCK_ONLY_MODE && (tabId === 'employees-tab' || tabId === 'attendance-tab')) {
+        showToast("เมนูนี้ย้ายไปอยู่ที่ศูนย์ผังโครงสร้างและจัดการบุคลากรแล้ว");
+        return;
+      }
+      if (currentRole === 'WORKER' && (tabId === 'manage-tab' || tabId === 'history-tab')) {
         showToast("⚠️ พนักงาน (Worker) ไม่มีสิทธิ์เข้าถึงเมนูนี้");
         return;
       }
@@ -1334,12 +2357,95 @@
       }
     };
 
+    window.lastInteractedEquipmentId = null;
+
+    // Return to catalog tab and smoothly highlight/scroll to the target equipment
+    window.returnToCatalogEquipment = function(equipId) {
+      const targetId = equipId ||
+                       document.getElementById('equipSelect')?.value ||
+                       (typeof selectedTransItems !== 'undefined' && selectedTransItems.length > 0 ? selectedTransItems[0].equipmentId : null) ||
+                       window.lastInteractedEquipmentId;
+
+      if (typeof window.switchNavTab === 'function') {
+        window.switchNavTab('catalog-tab');
+      }
+
+      if (targetId) {
+        const equipObj = (equipmentList || []).find(x => String(x.id) === String(targetId) || String(x.code) === String(targetId));
+        const finalId = equipObj ? equipObj.id : targetId;
+
+        // Reset search input and filter if it might hide this equipment
+        const searchInput = document.getElementById('catalogSearchInput');
+        const catSelect = document.getElementById('catalogCategorySelect');
+        const statusSelect = document.getElementById('catalogStatusSelect');
+
+        let needReRender = false;
+        if (searchInput && searchInput.value.trim() !== '') {
+          searchInput.value = '';
+          needReRender = true;
+        }
+        if (catSelect && catSelect.value !== 'ALL' && equipObj && catSelect.value !== equipObj.category) {
+          catSelect.value = 'ALL';
+          needReRender = true;
+        }
+        if (statusSelect && statusSelect.value !== 'ALL') {
+          statusSelect.value = 'ALL';
+          needReRender = true;
+        }
+        if (needReRender && typeof renderCatalogGrid === 'function') {
+          renderCatalogGrid();
+        }
+
+        setTimeout(() => {
+          const cardContainer = document.getElementById('equip-card-' + finalId) ||
+                                document.querySelector(`[data-equip-id="${finalId}"]`);
+          if (cardContainer) {
+            cardContainer.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            const cardInner = cardContainer.querySelector('.equipment-card') || cardContainer;
+            cardInner.classList.remove('highlight-equipment-pulse');
+            void cardInner.offsetWidth; // trigger reflow
+            cardInner.classList.add('highlight-equipment-pulse');
+            setTimeout(() => {
+              cardInner.classList.remove('highlight-equipment-pulse');
+            }, 3200);
+          }
+        }, 220);
+      }
+    };
+
+    window.closeTransactionAndReturnToEquipment = function() {
+      const modalElem = document.getElementById('transactionModal');
+      if (modalElem) {
+        const bsModal = bootstrap.Modal.getInstance(modalElem);
+        if (bsModal) bsModal.hide();
+      }
+      const currentEquipId = document.getElementById('equipSelect')?.value || window.lastInteractedEquipmentId;
+      if (typeof window.clearTransCart === 'function') {
+        window.clearTransCart();
+      } else if (typeof clearTransCart === 'function') {
+        clearTransCart();
+      }
+      if (typeof window.hideTransStockOverPopup === 'function') {
+        window.hideTransStockOverPopup();
+      }
+      const form = document.getElementById('transactionForm');
+      if (form) form.reset();
+      const stockInfo = document.getElementById('equipStockInfo');
+      if (stockInfo) stockInfo.innerHTML = '';
+      const previewBox = document.getElementById('equipSelectPreviewBox');
+      if (previewBox) previewBox.classList.add('d-none');
+      const warningBox = document.getElementById('transQtyStockWarning');
+      if (warningBox) warningBox.classList.add('d-none');
+      if (typeof toggleTransTypeUI === 'function') {
+        toggleTransTypeUI();
+      }
+      window.returnToCatalogEquipment(currentEquipId);
+    };
+
     function updateGearMenuActiveState(activeTabId) {
       const mapping = {
         'catalog-tab': { itemId: 'gear-item-catalog', label: 'คลังอุปกรณ์', icon: 'bi-grid-fill' },
-        'transaction-tab': { itemId: 'gear-item-transaction', label: 'บันทึก เบิก-จ่าย-ยืม-คืน', icon: 'bi-pencil-square' },
-        'attendance-tab': { itemId: 'gear-item-attendance', label: 'ลงเวลาเข้า-ออก/การลา', icon: 'bi-clock-history' },
-        'employees-tab': { itemId: 'gear-item-employees', label: 'รายชื่อบุคลากร', icon: 'bi-person-lines-fill' },
+        'transaction-tab': { itemId: 'gear-item-transaction', label: 'เบิก-รับเข้า-ยืม-คืน', icon: 'bi-pencil-square' },
         'manage-tab': { itemId: 'gear-item-manage', label: 'จัดการคลังอุปกรณ์', icon: 'bi-tools' },
         'history-tab': { itemId: 'gear-item-history', label: 'ประวัติทำรายการ', icon: 'bi-card-checklist' }
       };
@@ -1362,6 +2468,24 @@
       if (iconElem) {
         iconElem.className = `bi ${info.icon}`;
       }
+
+      const btnCatLowStock = document.getElementById('btnFilterLowStockCatalog');
+      if (btnCatLowStock) {
+        if (activeTabId === 'catalog-tab') {
+          if (typeof renderCatalogGrid === 'function') renderCatalogGrid();
+        } else {
+          btnCatLowStock.classList.add('d-none');
+          btnCatLowStock.classList.remove('d-inline-flex');
+        }
+      }
+
+      if (document.body) {
+        if (activeTabId === 'catalog-tab') {
+          document.body.classList.add('is-catalog-active');
+        } else {
+          document.body.classList.remove('is-catalog-active');
+        }
+      }
     }
 
     function setupEventListeners() {
@@ -1369,10 +2493,22 @@
       document.querySelectorAll('button[data-bs-toggle="tab"]').forEach(tabEl => {
         tabEl.addEventListener('shown.bs.tab', (e) => {
           updateGearMenuActiveState(e.target.id);
+          recordTabNavigation(e.target.id);
+          if (e.relatedTarget && e.relatedTarget.id === 'transaction-tab') {
+            if (typeof window.clearTransCart === 'function') {
+              window.clearTransCart();
+            } else if (typeof clearTransCart === 'function') {
+              clearTransCart();
+            }
+          }
           if (e.target.id === 'auth-roles-tab') {
             loadUsersTableFromFirestore();
           } else if (e.target.id === 'history-tab') {
             renderHistoryTable();
+          } else if (e.target.id === 'transaction-tab') {
+            if (typeof renderTransCartList === 'function') {
+              renderTransCartList();
+            }
           }
         });
       });
@@ -1383,7 +2519,6 @@
       document.getElementById('catalogStatusSelect')?.addEventListener('change', renderCatalogGrid);
       document.getElementById('staffSearchInput')?.addEventListener('input', renderStaffTable);
       document.getElementById('staffCategorySelect')?.addEventListener('change', renderStaffTable);
-      document.getElementById('staffStockSelect')?.addEventListener('change', renderStaffTable);
       document.getElementById('userSearchInput')?.addEventListener('input', renderUsersTable);
       document.getElementById('userRoleFilterSelect')?.addEventListener('change', renderUsersTable);
       document.getElementById('empSearchInput')?.addEventListener('input', renderEmployeeDirectory);
@@ -1470,31 +2605,32 @@
       const roleConfig = {
         'ADMIN': {
           badgeClass: "badge bg-danger fs-7 px-3 py-2 rounded-pill shadow-sm",
-          badgeHtml: '<i class="bi bi-shield-lock-fill me-1"></i> ผู้ดูแลระบบ',
-          desc: "(สิทธิ์เต็มรูปแบบ: จัดการอุปกรณ์ พนักงาน หมวดหมู่ และสิทธิ์ผู้ใช้ทั้งหมด)",
-          navText: `ผู้ดูแลระบบ`,
+          badgeHtml: '<i class="bi bi-shield-lock-fill me-1"></i> ผู้ดูแลระบบ (ADMIN)',
+          desc: "(สิทธิ์สูงสุด: จัดการอุปกรณ์ บุคลากร ผังองค์กร และกำหนดสิทธิ์ผู้ใช้ทั้งหมด)",
+          navText: `ADMIN`,
           navIcon: "bi bi-shield-lock-fill me-2 text-danger"
         },
         'MANAGER': {
           badgeClass: "badge bg-primary fs-7 px-3 py-2 rounded-pill shadow-sm",
-          badgeHtml: '<i class="bi bi-briefcase-fill me-1"></i> เจ้าหน้าที่',
-          desc: "(สิทธิ์ระดับบริหาร: จัดการอุปกรณ์ หมวดหมู่ อนุมัติการเบิก-ยืม และดูรายงาน)",
-          navText: `เจ้าหน้าที่`,
+          badgeHtml: '<i class="bi bi-person-workspace me-1"></i> ผู้จัดการ/บริหาร (MANAGER)',
+          desc: "(สิทธิ์ระดับบริหาร: จัดการอุปกรณ์ บุคลากร ผังองค์กร อนุมัติการเบิก-ยืม และรายงาน)",
+          navText: `MANAGER`,
+          navIcon: "bi bi-person-workspace me-2 text-primary"
+        },
+        'STAFF': {
+          badgeClass: "badge fs-7 px-3 py-2 rounded-pill shadow-sm text-white",
+          style: "background-color: #6f42c1;",
+          badgeHtml: '<i class="bi bi-briefcase-fill me-1"></i> เจ้าหน้าที่ (STAFF)',
+          desc: "(สิทธิ์เจ้าหน้าที่: จัดการคลังอุปกรณ์ เบิก-ยืม-คืน-รับเข้า และดูผังบุคลากร)",
+          navText: `STAFF`,
           navIcon: "bi bi-briefcase-fill me-2 text-primary"
         },
         'WORKER': {
           badgeClass: "badge bg-success fs-7 px-3 py-2 rounded-pill shadow-sm",
-          badgeHtml: '<i class="bi bi-person-fill me-1"></i> พนักงานทำเกษตร',
-          desc: "(สิทธิ์เบิก-จ่าย-ยืม-คืน, สแกน QR, ลงเวลาทำงาน และดูคลังอุปกรณ์)",
-          navText: `พนักงาน`,
+          badgeHtml: '<i class="bi bi-person-fill me-1"></i> พนักงาน (WORKER)',
+          desc: "(สิทธิ์ปฏิบัติการ: ยืม-คืน ส่งคำขอ สแกน QR ลงเวลา และดูคลังอุปกรณ์)",
+          navText: `WORKER`,
           navIcon: "bi bi-person-badge me-2 text-success"
-        },
-        'STAFF': {
-          badgeClass: "badge bg-primary fs-7 px-3 py-2 rounded-pill shadow-sm",
-          badgeHtml: '<i class="bi bi-briefcase-fill me-1"></i> เจ้าหน้าที่สำนักงาน',
-          desc: "(สิทธิ์จัดการคลังอุปกรณ์ พนักงาน และดูประวัติทำรายการ)",
-          navText: `เจ้าหน้าที่`,
-          navIcon: "bi bi-briefcase-fill me-2 text-primary"
         }
       };
 
@@ -1539,6 +2675,10 @@
 
       if (typeof window.updateDbEditorMenuVisibility === 'function') {
         window.updateDbEditorMenuVisibility();
+      }
+
+      if (typeof window.applyEquipmentCodeInputRolePermissions === 'function') {
+        window.applyEquipmentCodeInputRolePermissions();
       }
 
       renderCatalogGrid();
@@ -1782,9 +2922,9 @@
 
     // Image Compression Presets & Compressor Utility
     const EQUIPMENT_COMPRESSION_PRESETS = {
-      SMALL: { name: 'เล็ก (600px)', maxWidth: 600, quality: 0.78 },
-      MEDIUM: { name: 'กลาง (800px)', maxWidth: 800, quality: 0.85 },
-      LARGE: { name: 'ใหญ่ (1200px)', maxWidth: 1200, quality: 0.90 }
+      SMALL: { name: 'เล็ก (600px)', maxWidth: 600, quality: 0.72 },
+      MEDIUM: { name: 'กลาง (800px)', maxWidth: 800, quality: 0.78 },
+      LARGE: { name: 'ใหญ่ (1200px)', maxWidth: 1200, quality: 0.85 }
     };
 
     const EMPLOYEE_COMPRESSION_PRESETS = {
@@ -1851,26 +2991,61 @@
             let width = img.width;
             let height = img.height;
 
-            if (width > maxDimension || height > maxDimension) {
-              if (width > height) {
-                height = Math.round((height * maxDimension) / width);
-                width = maxDimension;
-              } else {
-                width = Math.round((width * maxDimension) / height);
-                height = maxDimension;
-              }
-            }
-
             const canvas = document.createElement('canvas');
-            canvas.width = width;
-            canvas.height = height;
             const ctx = canvas.getContext('2d');
             ctx.imageSmoothingEnabled = true;
             ctx.imageSmoothingQuality = 'high';
-            ctx.drawImage(img, 0, 0, width, height);
 
-            let initialQuality = options.quality || settings.quality || config.quality || 0.82;
-            const targetMaxBytes = (settings.maxFileSizeKB || 350) * 1024;
+            const isEquipmentPortrait = (presetType === 'EQUIPMENT' && height > width && !options.skipLandscapeFit);
+
+            if (isEquipmentPortrait) {
+              // Auto-convert vertical/portrait equipment photo to landscape (16:9) to fit the equipment card frame perfectly
+              const targetW = Math.min(maxDimension, 800);
+              const targetH = Math.round(targetW * (9 / 16));
+              canvas.width = targetW;
+              canvas.height = targetH;
+
+              // 1. Ambient blurred background using image colors to fill the 16:9 canvas
+              ctx.save();
+              const bgScale = Math.max(targetW / width, targetH / height);
+              const bgW = width * bgScale;
+              const bgH = height * bgScale;
+              const bgX = (targetW - bgW) / 2;
+              const bgY = (targetH - bgH) / 2;
+              try {
+                if (typeof ctx.filter !== 'undefined') {
+                  ctx.filter = 'blur(14px) brightness(0.88)';
+                }
+              } catch (e) {}
+              ctx.drawImage(img, bgX, bgY, bgW, bgH);
+              ctx.restore();
+
+              // 2. Centered full equipment photo at full height so no part is cut off
+              const fgScale = targetH / height;
+              const fgW = Math.round(width * fgScale);
+              const fgX = Math.round((targetW - fgW) / 2);
+              ctx.drawImage(img, fgX, 0, fgW, targetH);
+
+              width = targetW;
+              height = targetH;
+            } else {
+              if (width > maxDimension || height > maxDimension) {
+                if (width > height) {
+                  height = Math.round((height * maxDimension) / width);
+                  width = maxDimension;
+                } else {
+                  width = Math.round((width * maxDimension) / height);
+                  height = maxDimension;
+                }
+              }
+
+              canvas.width = width;
+              canvas.height = height;
+              ctx.drawImage(img, 0, 0, width, height);
+            }
+
+            let initialQuality = options.quality || settings.quality || config.quality || 0.78;
+            const targetMaxBytes = (presetType === 'EQUIPMENT' ? 180 : (settings.maxFileSizeKB || 350)) * 1024;
 
             const compressWithQuality = (q) => {
               canvas.toBlob((blob) => {
@@ -2012,6 +3187,54 @@
       const input = document.getElementById(inputId);
       if (input && input.files && input.files.length > 0) {
         previewSelectedImage(input, imgElementId, boxElementId, presetRadioName);
+      }
+    };
+
+    window.rotatePreviewImage = async function(inputId, imgElementId, boxElementId, presetRadioName) {
+      const input = document.getElementById(inputId);
+      const img = document.getElementById(imgElementId);
+      if (!img || !img.src) return;
+
+      try {
+        const res = await fetch(img.src);
+        const blob = await res.blob();
+        const bmp = await createImageBitmap(blob);
+        const canvas = document.createElement('canvas');
+        canvas.width = bmp.height;
+        canvas.height = bmp.width;
+        const ctx = canvas.getContext('2d');
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate(90 * Math.PI / 180);
+        ctx.drawImage(bmp, -bmp.width / 2, -bmp.height / 2);
+
+        canvas.toBlob(async (rotatedBlob) => {
+          if (!rotatedBlob) return;
+          const presetType = (presetRadioName === 'empCompressPreset' || inputId.includes('emp')) ? 'EMPLOYEE' : 'EQUIPMENT';
+          let presetKey = 'MEDIUM';
+          if (presetRadioName) {
+            const checkedRadio = document.querySelector(`input[name="${presetRadioName}"]:checked`);
+            if (checkedRadio) presetKey = checkedRadio.value;
+          }
+          const compressed = await compressImageFileOrBlob(rotatedBlob, presetKey, presetType);
+          img.src = compressed.dataUrl;
+          if (input && compressed.file) {
+            const dt = new DataTransfer();
+            dt.items.add(compressed.file);
+            input.files = dt.files;
+          }
+          const box = document.getElementById(boxElementId);
+          if (box) {
+            const infoBadge = box.querySelector('.compress-info-badge');
+            if (infoBadge) {
+              const fmtName = compressed.extension ? compressed.extension.toUpperCase() : 'WEBP';
+              infoBadge.innerHTML = `<i class="bi bi-lightning-charge-fill text-warning me-1"></i> ย่อภาพ (${compressed.presetName} ${fmtName}): ${compressed.compressedSizeFormatted} <span class="badge bg-success bg-opacity-25 text-success ms-1">-${compressed.savedPercent}%</span> [${compressed.width}x${compressed.height}]`;
+              infoBadge.classList.remove('d-none');
+            }
+          }
+          showToast("🔄 หมุนรูปภาพ 90° และจัดสัดส่วนเรียบร้อยแล้ว", { title: "ปรับแต่งรูปภาพ", type: "info" });
+        }, 'image/webp', 0.82);
+      } catch (err) {
+        console.warn("Rotate preview image error:", err);
       }
     };
 
@@ -2265,13 +3488,13 @@
 
         if (item.status === 'VALID') {
           badgeHtml = `<span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 rounded-pill px-2 py-1"><i class="bi bi-check-circle-fill me-1"></i>สมบูรณ์ (Storage)</span>`;
-          thumbHtml = `<img src="${item.imageUrl}" class="rounded-3 border style-object-cover" style="width: 44px; height: 44px;" onerror="this.src='https://via.placeholder.com/44?text=ERR'" />`;
+          thumbHtml = `<img src="${item.imageUrl}" loading="lazy" class="rounded-3 border style-object-cover" style="width: 44px; height: 44px;" onerror="this.src='https://via.placeholder.com/44?text=ERR'" />`;
         } else if (item.status === 'BROKEN') {
           badgeHtml = `<span class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25 rounded-pill px-2 py-1"><i class="bi bi-exclamation-triangle-fill me-1"></i>ลิงก์เสีย / ไม่พบไฟล์</span>`;
           thumbHtml = `<div class="bg-danger bg-opacity-10 text-danger rounded-3 d-flex align-items-center justify-content-center border border-danger border-opacity-25" style="width: 44px; height: 44px;"><i class="bi bi-image-fill fs-5"></i></div>`;
         } else if (item.status === 'BASE64') {
           badgeHtml = `<span class="badge bg-warning bg-opacity-10 text-dark border border-warning border-opacity-25 rounded-pill px-2 py-1"><i class="bi bi-file-earmark-code me-1"></i>Base64 (ยังไม่ได้ซิงก์)</span>`;
-          thumbHtml = `<img src="${item.imageUrl}" class="rounded-3 border style-object-cover" style="width: 44px; height: 44px;" />`;
+          thumbHtml = `<img src="${item.imageUrl}" loading="lazy" class="rounded-3 border style-object-cover" style="width: 44px; height: 44px;" />`;
         } else {
           badgeHtml = `<span class="badge bg-secondary bg-opacity-10 text-secondary border rounded-pill px-2 py-1"><i class="bi bi-dash-circle me-1"></i>ไม่มีรูปภาพ</span>`;
           thumbHtml = `<div class="bg-light text-secondary rounded-3 d-flex align-items-center justify-content-center border" style="width: 44px; height: 44px;"><i class="bi bi-card-image fs-5"></i></div>`;
@@ -2396,7 +3619,13 @@
 
     // Clear broken link
     window.clearBrokenImageLink = async function(id, itemType) {
-      if (!confirm("คุณแน่ใจหรือไม่ว่าต้องการล้างลิงก์รูปภาพที่เสียรายการนี้ออก?")) return;
+      const ok = await window.showConfirmDialog({
+        title: "ล้างลิงก์รูปภาพ",
+        message: "ต้องการล้างลิงก์รูปภาพที่เสียรายการนี้ออกหรือไม่?",
+        type: "warning",
+        confirmText: "ล้างลิงก์"
+      });
+      if (!ok) return;
 
       const list = itemType === 'EQUIPMENT' ? equipmentList : employeeList;
       const item = (list || []).find(x => x && String(x.id) === String(id));
@@ -2422,21 +3651,26 @@
     // Repair all broken images
     window.repairAllBrokenImages = async function() {
       if (!isFirebaseReady || !storage) {
-        alert("⚠️ Firebase Storage ยังไม่พร้อมใช้งาน กรุณาตรวจสอบว่าได้ตั้งค่า Firebase Storage ในโปรเจกต์แล้ว");
+        showToast("⚠️ Firebase Storage ยังไม่พร้อมใช้งาน");
         return;
       }
 
       const brokenAndBase64Items = imageDiagnosticData.items.filter(x => x.status === 'BROKEN' || x.status === 'BASE64');
       if (brokenAndBase64Items.length === 0) {
-        alert("🎉 ไม่พบรูปภาพที่จำเป็นต้องซ่อมแซม รูปภาพทั้งหมดอยู่ในสถานะสมบูรณ์แล้ว");
+        showToast("🎉 รูปภาพทั้งหมดอยู่ในสถานะสมบูรณ์แล้ว");
         return;
       }
 
-      if (!confirm(`คุณต้องการซ่อมแซมและอัปโหลดรูปภาพจำนวน ${brokenAndBase64Items.length} รายการ ขึ้นสู่ Firebase Storage หรือไม่?`)) {
-        return;
-      }
+      const ok = await window.showConfirmDialog({
+        title: "ซ่อมแซมรูปภาพ",
+        message: `ต้องการซ่อมและอัปโหลดรูปภาพ ${brokenAndBase64Items.length} รายการ ขึ้น Firebase Storage หรือไม่?`,
+        type: "primary",
+        icon: "bi-wrench-adjustable-circle",
+        confirmText: "ซ่อมแซมรูป"
+      });
+      if (!ok) return;
 
-      showToast(`🛠️ กำลังเริ่มซ่อมแซมและอัปโหลดรูปภาพ ${brokenAndBase64Items.length} รายการไปยัง Firebase Storage...`);
+      showToast(`🛠️ กำลังซ่อมแซมและอัปโหลดรูปภาพ ${brokenAndBase64Items.length} รายการไปยัง Firebase Storage...`);
       let repairedCount = 0;
 
       for (const diagItem of brokenAndBase64Items) {
@@ -2642,6 +3876,16 @@
         const cleanName = customFileName.replace(/[^a-zA-Z0-9._-]/g, '_');
         const baseName = cleanName.replace(/\.(jpeg|jpg|png|webp)$/i, '');
         fileName = `${baseName}.${ext}`;
+
+        // ลบไฟล์เดิมใน Storage ที่มีชื่อเดียวกันแต่ต่างนามสกุลออกทั้งหมดก่อน ป้องกันไฟล์ซ้ำซ้อน
+        if (typeof window.deleteImageFromFirebaseStorage === 'function') {
+          const candidateExts = ['webp', 'jpeg', 'jpg', 'png'].filter(e => e !== ext);
+          for (const oldExt of candidateExts) {
+            try {
+              await window.deleteImageFromFirebaseStorage(`${folderName}/${baseName}.${oldExt}`);
+            } catch (e) {}
+          }
+        }
       } else {
         const safeName = targetFile.name ? targetFile.name.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.(jpeg|jpg|png|webp)$/i, '') : 'image';
         fileName = `${Date.now()}_${safeName}.${ext}`;
@@ -2674,6 +3918,16 @@
           const cleanName = defaultName ? defaultName.replace(/[^a-zA-Z0-9._-]/g, '_') : 'item';
           const baseName = cleanName.replace(/\.(jpeg|jpg|png|webp)$/i, '');
           const fileName = `${baseName}.${ext}`;
+
+          // ลบไฟล์เดิมใน Storage ที่มีชื่อเดียวกันแต่ต่างนามสกุลออกทั้งหมดก่อน ป้องกันไฟล์ซ้ำซ้อน
+          if (typeof window.deleteImageFromFirebaseStorage === 'function') {
+            const candidateExts = ['webp', 'jpeg', 'jpg', 'png'].filter(e => e !== ext);
+            for (const oldExt of candidateExts) {
+              try {
+                await window.deleteImageFromFirebaseStorage(`${folderName}/${baseName}.${oldExt}`);
+              } catch (e) {}
+            }
+          }
 
           const storageRef = ref(storage, `${folderName}/${fileName}`);
           const snapshot = await uploadBytes(storageRef, targetBlob);
@@ -2736,18 +3990,140 @@
     window.getCategoryPrefix = function(categoryName) {
       if (!categoryName) return 'EQ';
       if (typeof categoriesList !== 'undefined' && Array.isArray(categoriesList)) {
-        const cat = categoriesList.find(c => c.name === categoryName);
-        if (cat && cat.prefix) return cat.prefix.toUpperCase();
+        const cat = categoriesList.find(c => c && c.name === categoryName);
+        if (cat && cat.prefix) return String(cat.prefix).trim().toUpperCase();
       }
       const name = String(categoryName).trim();
       if (name.includes('ตัดแต่ง')) return 'CT';
-      if (name.includes('รดน้ำ') || name.includes('สปรินเกอร์')) return 'IR';
+      if (name.includes('รดน้ำ') || name.includes('สปรินเกอร์') || name.includes('ระบบน้ำ')) return 'IR';
       if (name.includes('เตรียมดิน') || name.includes('จอบ') || name.includes('เสียม') || name.includes('พรวน')) return 'SL';
-      if (name.includes('ปุ๋ย') || name.includes('สารบำรุง') || name.includes('ดูแลพืช') || name.includes('เคมี')) return 'FT';
+      if (name.includes('ปุ๋ย') || name.includes('สารบำรุง') || name.includes('ดูแลพืช') || name.includes('เคมี')) return 'CH';
       if (name.includes('ภาชนะ') || name.includes('บรรจุภัณฑ์') || name.includes('กระถาง')) return 'PT';
-      if (name.includes('เซฟตี้') || name.includes('ทั่วไป')) return 'SF';
+      if (name.includes('เซฟตี้') || name.includes('ทั่วไป')) return 'MT';
       if (name.includes('เครื่องจักร')) return 'MC';
+      if (name.includes('น้ำมัน')) return 'FG';
+      if (name.includes('ธุรการ')) return 'AD';
+      if (name.includes('ทำความสะอาด')) return 'CL';
+      if (name.includes('ช่าง')) return 'TL';
+      if (name.includes('เมล็ด')) return 'SD';
+      if (name.includes('ยืมใช้')) return 'AG';
+      if (name.includes('ไฟ')) return 'EL';
       return 'EQ';
+    };
+
+    // Auto-generate a guaranteed unique 2-4 letter uppercase prefix for categories
+    window.generateUniqueCategoryPrefix = function(categoryName, currentCatId = '') {
+      const existingPrefixes = new Set();
+      (categoriesList || []).forEach(c => {
+        if (!c) return;
+        const cId = c.id || c.code || c.name;
+        if (currentCatId && (cId === currentCatId || c.id === currentCatId || c.code === currentCatId || c.name === currentCatId)) {
+          return;
+        }
+        if (c.prefix) {
+          existingPrefixes.add(String(c.prefix).trim().toUpperCase());
+        }
+      });
+
+      const name = String(categoryName || '').trim();
+      const candidates = [];
+      if (name.includes('ตัดแต่ง')) candidates.push('CT');
+      if (name.includes('รดน้ำ') || name.includes('สปรินเกอร์') || name.includes('ระบบน้ำ')) candidates.push('IR', 'WT');
+      if (name.includes('น้ำมัน') || name.includes('เชื้อเพลิง')) candidates.push('FG', 'OL');
+      if (name.includes('เตรียมดิน') || name.includes('จอบ') || name.includes('เสียม') || name.includes('พรวน')) candidates.push('SL');
+      if (name.includes('ปุ๋ย') || name.includes('สารบำรุง') || name.includes('เคมี')) candidates.push('CH', 'FT');
+      if (name.includes('ภาชนะ') || name.includes('บรรจุภัณฑ์') || name.includes('กระถาง')) candidates.push('PT', 'PK');
+      if (name.includes('เซฟตี้') || name.includes('ความปลอดภัย')) candidates.push('SF', 'ST');
+      if (name.includes('เครื่องจักร') || name.includes('ยนต์')) candidates.push('MC', 'EN');
+      if (name.includes('ช่าง') || name.includes('เครื่องมือ')) candidates.push('TL', 'AX');
+      if (name.includes('เมล็ด')) candidates.push('SD', 'SP');
+      if (name.includes('ธุรการ') || name.includes('สำนักงาน')) candidates.push('AD', 'OF');
+      if (name.includes('ทำความสะอาด')) candidates.push('CL', 'SK');
+      if (name.includes('ไฟ')) candidates.push('EL', 'LT');
+      if (name.includes('ยืม')) candidates.push('AG');
+
+      for (const cand of candidates) {
+        if (!existingPrefixes.has(cand)) {
+          return cand;
+        }
+      }
+
+      // Check English characters in name
+      const enMatches = name.toUpperCase().replace(/[^A-Z]/g, '');
+      if (enMatches.length >= 2) {
+        const p = enMatches.slice(0, 2);
+        if (!existingPrefixes.has(p)) return p;
+      }
+
+      // Generate unique 2-letter uppercase alphabet pair
+      const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+      for (let i = 0; i < alphabet.length; i++) {
+        for (let j = 0; j < alphabet.length; j++) {
+          const combo = alphabet[i] + alphabet[j];
+          if (!existingPrefixes.has(combo)) {
+            return combo;
+          }
+        }
+      }
+      return 'EQ';
+    };
+
+    window.handleCategoryNameInput = function(name) {
+      const prefixInput = document.getElementById('catPrefixInput');
+      if (!prefixInput) return;
+      if (!prefixInput.value || prefixInput.dataset.autoGenerated === 'true') {
+        const editId = document.getElementById('editCatId')?.value || '';
+        const suggested = generateUniqueCategoryPrefix(name, editId);
+        prefixInput.value = suggested;
+        prefixInput.dataset.autoGenerated = 'true';
+      }
+    };
+
+    window.generateAutoCategoryPrefix = function(force = false) {
+      const prefixInput = document.getElementById('catPrefixInput');
+      const nameInput = document.getElementById('catNameInput');
+      if (!prefixInput) return;
+      const name = nameInput ? nameInput.value : '';
+      const editId = document.getElementById('editCatId')?.value || '';
+      const suggested = generateUniqueCategoryPrefix(name, editId);
+      prefixInput.value = suggested;
+      prefixInput.dataset.autoGenerated = 'true';
+      if (force && typeof showToast === 'function') {
+        showToast(`✨ ระบบออกตัวย่ออัตโนมัติ "${suggested}" (ไม่ซ้ำกับหมวดหมู่อื่น) เรียบร้อยแล้ว`);
+      }
+    };
+
+    // Role-based permissions for Equipment Code Input: ONLY Admin can edit equipment code
+    window.applyEquipmentCodeInputRolePermissions = function() {
+      const isAdmin = (typeof currentRole !== 'undefined' && currentRole === 'ADMIN') ||
+                      (typeof currentAuthUser !== 'undefined' && currentAuthUser?.email === 'jaru072@gmail.com') ||
+                      (typeof currentUserProfile !== 'undefined' && currentUserProfile?.email === 'jaru072@gmail.com');
+      const codeInput = document.getElementById('equipCodeInput');
+      const badge = document.getElementById('equipCodeBadge');
+      if (codeInput) {
+        if (isAdmin) {
+          codeInput.readOnly = false;
+          codeInput.classList.remove('bg-light');
+          codeInput.classList.add('bg-white');
+          codeInput.placeholder = 'ระบุรหัสอุปกรณ์ เช่น CT-001';
+          codeInput.title = 'ผู้ดูแลระบบ (Admin) สามารถกำหนดหรือแก้ไขรหัสอุปกรณ์ได้โดยตรง';
+        } else {
+          codeInput.readOnly = true;
+          codeInput.classList.remove('bg-white');
+          codeInput.classList.add('bg-light');
+          codeInput.placeholder = 'เลือกหมวดหมู่เพื่อออกรหัสอัตโนมัติ';
+          codeInput.title = 'ระบบออกรหัสให้อัตโนมัติตามหมวดหมู่ (เฉพาะผู้ดูแลระบบเท่านั้นที่แก้ไขได้)';
+        }
+      }
+      if (badge) {
+        if (isAdmin) {
+          badge.className = 'badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25 fs-8 ms-1';
+          badge.textContent = 'ผู้ดูแลระบบแก้ไขได้';
+        } else {
+          badge.className = 'badge bg-secondary bg-opacity-10 text-secondary fs-8 ms-1';
+          badge.textContent = 'ระบบออกให้อัตโนมัติ';
+        }
+      }
     };
 
     window.fixEquipmentCodesToMatchCategories = async function(silent = false) {
@@ -2757,9 +4133,13 @@
       }
 
       if (!silent) {
-        const isConfirmed = confirm(
-          "⚠️ คำเตือน (อันตราย): การรันปรับแก้ไขรหัสตามหมวดหมู่ อาจทำให้รูปภาพ กับ รหัสที่ปรับแก้ไม่ตรงกัน หรือคลาดเคลื่อนได้!\n\nคุณแน่ใจหรือไม่ว่าต้องการดำเนินการปรับแก้ไขรหัสอุปกรณ์ตามหมวดหมู่?"
-        );
+        const isConfirmed = await window.showConfirmDialog({
+          title: "ปรับรหัสอุปกรณ์ตามหมวดหมู่",
+          message: "การปรับรหัสอาจทำให้รูปภาพคลาดเคลื่อน ต้องการดำเนินการต่อหรือไม่?",
+          type: "warning",
+          icon: "bi-exclamation-triangle-fill",
+          confirmText: "ยืนยันปรับรหัส"
+        });
         if (!isConfirmed) return;
       }
 
@@ -2812,24 +4192,33 @@
           const item = group[i].item;
           const newCode = `${prefix}-${String(i + 1).padStart(3, '0')}`;
           const oldCode = item.code;
+          const oldId = item.id;
 
-          if (oldCode !== newCode) {
+          if (oldCode !== newCode || oldId !== newCode) {
             item.code = newCode;
+            item.id = newCode;
             item.updatedAt = new Date().toISOString();
             updateCount++;
 
             // Update transaction history if it references the old code or item id
             if (Array.isArray(transactionHistory) && oldCode) {
               transactionHistory.forEach(tx => {
-                if (tx && (tx.equipmentCode === oldCode || tx.equipmentId === item.id)) {
+                if (tx && (tx.equipmentCode === oldCode || tx.equipmentId === oldId)) {
                   tx.equipmentCode = newCode;
+                  tx.equipmentId = newCode;
                 }
               });
             }
 
-            if (isFirebaseReady && db && item.id) {
+            if (isFirebaseReady && db) {
               try {
-                await setDoc(doc(db, "equipment", item.id), item, { merge: true });
+                if (oldId && oldId !== newCode) {
+                  await deleteDoc(doc(db, "equipment", oldId));
+                }
+                if (oldCode && oldCode !== newCode && oldCode !== oldId) {
+                  await deleteDoc(doc(db, "equipment", oldCode));
+                }
+                await setDoc(doc(db, "equipment", newCode), item, { merge: true });
               } catch (dbErr) {
                 console.warn("Firestore equipment code fix notice:", dbErr);
               }
@@ -2875,14 +4264,19 @@
 
     window.updateEquipmentCodeForCategory = function() {
       const editId = document.getElementById('editEquipId')?.value;
-      if (!editId) {
+      const isAdmin = (typeof currentRole !== 'undefined' && currentRole === 'ADMIN') ||
+                      (typeof currentAuthUser !== 'undefined' && currentAuthUser?.email === 'jaru072@gmail.com') ||
+                      (typeof currentUserProfile !== 'undefined' && currentUserProfile?.email === 'jaru072@gmail.com');
+
+      // If in edit mode and admin has customized code, don't overwrite unless empty
+      const codeInput = document.getElementById('equipCodeInput');
+      if (editId && isAdmin && codeInput && codeInput.value.trim()) {
+        return;
+      }
+
+      if (!editId || !codeInput?.value.trim()) {
         const catSelect = document.getElementById('equipCategorySelect');
-        let selectedCat = catSelect ? catSelect.value : '';
-        if (!selectedCat && catSelect && catSelect.options.length > 1) {
-          catSelect.selectedIndex = 1;
-          selectedCat = catSelect.value;
-        }
-        const codeInput = document.getElementById('equipCodeInput');
+        const selectedCat = catSelect ? catSelect.value : '';
         if (codeInput) {
           if (selectedCat) {
             codeInput.value = generateNextEquipmentCode(selectedCat);
@@ -2901,10 +4295,32 @@
       const category = document.getElementById('equipCategorySelect').value;
       const editId = document.getElementById('editEquipId').value;
       let code = document.getElementById('equipCodeInput').value.trim();
-      
-      const expectedPrefix = getCategoryPrefix(category);
-      if (!editId || !code || !code.toUpperCase().startsWith(expectedPrefix + '-')) {
-        code = generateNextEquipmentCode(category);
+
+      const isAdmin = (typeof currentRole !== 'undefined' && currentRole === 'ADMIN') ||
+                      (typeof currentAuthUser !== 'undefined' && currentAuthUser?.email === 'jaru072@gmail.com') ||
+                      (typeof currentUserProfile !== 'undefined' && currentUserProfile?.email === 'jaru072@gmail.com');
+
+      if (isAdmin && code) {
+        code = code.toUpperCase();
+        // Check duplicate equipment code
+        const codeConflict = (equipmentList || []).find(item => 
+          item && item.code && item.code.toUpperCase() === code && 
+          item.id !== editId && item.code !== editId
+        );
+        if (codeConflict) {
+          showToast(`⚠️ รหัสอุปกรณ์ "${code}" มีอยู่แล้วในระบบ (ซ้ำกับ "${codeConflict.name}") กรุณาระบุรหัสอื่น`);
+          const codeInputElem = document.getElementById('equipCodeInput');
+          if (codeInputElem) {
+            codeInputElem.focus();
+            codeInputElem.select();
+          }
+          return;
+        }
+      } else {
+        const expectedPrefix = getCategoryPrefix(category);
+        if (!editId || !code || !code.toUpperCase().startsWith(expectedPrefix + '-')) {
+          code = generateNextEquipmentCode(category);
+        }
       }
       const qty = parseInt(document.getElementById('equipQtyInput').value) || 0;
       const minQtyVal = parseInt(document.getElementById('equipMinQtyInput')?.value);
@@ -2928,13 +4344,35 @@
 
       try {
         let finalImageUrl = '';
-        const safeEquipCode = (code || 'equipment').replace(/[^a-zA-Z0-9_-]/g, '_');
-        const equipFileName = `${safeEquipCode}.jpeg`;
+        const existing = editId ? equipmentList.find(x => x.id === editId || x.code === editId) : null;
+        const oldCode = (existing && existing.code) ? existing.code : '';
+        const oldSafeEquipCode = oldCode.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const safeEquipCode = (code || oldCode || 'equipment').replace(/[^a-zA-Z0-9_-]/g, '_');
+        const equipFileName = `${safeEquipCode}.webp`;
 
         if (selectedEquipFile) {
+          // เมื่อถ่ายรูปใหม่หรือเลือกไฟล์ใหม่ ให้ลบไฟล์รูปเดิมและทุกนามสกุลที่ชื่อซ้ำกันของอุปกรณ์นี้ออกจาก Storage ก่อน
+          if (isFirebaseReady && storage) {
+            if (existing && existing.imageUrl && (existing.imageUrl.includes('firebasestorage') || existing.imageUrl.includes('storage.googleapis.com') || existing.imageUrl.startsWith('gs://'))) {
+              try {
+                await window.deleteImageFromFirebaseStorage(existing.imageUrl);
+              } catch (delErr) {}
+            }
+
+            const codesToPurge = new Set([safeEquipCode]);
+            if (oldSafeEquipCode) codesToPurge.add(oldSafeEquipCode);
+            for (const c of codesToPurge) {
+              for (const ext of ['webp', 'jpeg', 'jpg', 'png']) {
+                try {
+                  await window.deleteImageFromFirebaseStorage(`equipment_images/${c}.${ext}`);
+                } catch (e) {}
+              }
+            }
+          }
+
           const presetKey = document.querySelector('input[name="equipCompressPreset"]:checked')?.value || 'MEDIUM';
           if (stepTitle) stepTitle.textContent = "กำลังอัปโหลดและบีบอัดรูปภาพไปยัง Firebase Storage...";
-          if (stepDetail) stepDetail.textContent = `ระบบกำลังบีบอัดไฟล์รูปภาพเป็นขนาด ${presetKey === 'SMALL' ? 'เล็ก' : (presetKey === 'LARGE' ? 'ใหญ่' : 'กลาง')} และจัดเก็บเข้า Storage ในชื่อ ${equipFileName}...`;
+          if (stepDetail) stepDetail.textContent = `ระบบกำลังบีบอัดไฟล์รูปภาพและจัดเก็บเข้า Storage ในชื่อ ${equipFileName}...`;
           try {
             finalImageUrl = await uploadFileToFirebaseStorage(selectedEquipFile, "equipment_images", presetKey, equipFileName);
           } catch (stErr) {
@@ -2944,14 +4382,24 @@
         } else if (manualUrl) {
           if (stepTitle) stepTitle.textContent = "กำลังบันทึกข้อมูลอุปกรณ์...";
           if (stepDetail) stepDetail.textContent = "ระบบกำลังประมวลผลข้อมูลและรูปภาพ...";
+          if (isFirebaseReady && storage && existing && existing.imageUrl && existing.imageUrl !== manualUrl && (existing.imageUrl.includes('firebasestorage') || existing.imageUrl.includes('storage.googleapis.com') || existing.imageUrl.startsWith('gs://'))) {
+            try {
+              await window.deleteImageFromFirebaseStorage(existing.imageUrl);
+            } catch (delErr) {}
+          }
           finalImageUrl = await uploadImageBlobToFirebaseStorage(manualUrl, "equipment_images", equipFileName);
         } else {
           if (editId) {
-            const existing = equipmentList.find(x => x.id === editId);
             finalImageUrl = existing && existing.imageUrl ? existing.imageUrl : DEFAULT_EQUIPMENT_IMAGE;
           } else {
             finalImageUrl = DEFAULT_EQUIPMENT_IMAGE;
           }
+        }
+
+        // Cache busting for Firebase Storage URLs to ensure browser refreshes instantly
+        if (finalImageUrl && finalImageUrl.includes('firebasestorage.googleapis.com')) {
+          const cleanUrl = finalImageUrl.replace(/&t=\d+/, '');
+          finalImageUrl = `${cleanUrl}&t=${Date.now()}`;
         }
 
         // Ensure finalImageUrl is portable and not a device-local blob URL
@@ -2966,12 +4414,16 @@
         }
 
         let borrowed = 0;
+        let createdTime = new Date().toISOString();
         if (editId) {
-          const existing = equipmentList.find(x => x.id === editId);
-          if (existing && existing.borrowedCount !== undefined) borrowed = existing.borrowedCount;
+          const existing = equipmentList.find(x => x.id === editId || x.code === editId);
+          if (existing) {
+            if (existing.borrowedCount !== undefined) borrowed = existing.borrowedCount;
+            if (existing.createdAt) createdTime = existing.createdAt;
+          }
         }
 
-        const docId = editId || ('eq-' + String(Date.now()).slice(-5));
+        const docId = code || editId || ('eq-' + String(Date.now()).slice(-5));
 
         const equipmentItem = {
           id: docId,
@@ -2985,9 +4437,35 @@
           location: location,
           imageUrl: finalImageUrl,
           description: desc,
-          createdAt: new Date().toISOString(),
+          createdAt: createdTime,
           updatedAt: new Date().toISOString()
         };
+
+        // If updating and editId was different from the new docId (e.g. old ID was eq-12345 or code changed), delete old doc from Firestore
+        if (isFirebaseReady && db && editId && editId !== docId) {
+          try {
+            await deleteDoc(doc(db, "equipment", editId));
+            if (existing && existing.code && existing.code !== docId && existing.code !== editId) {
+              await deleteDoc(doc(db, "equipment", existing.code));
+            }
+          } catch(delErr) {
+            console.warn("Delete old equipment doc notice:", delErr);
+          }
+        }
+
+        // Sync old code to new code in transactions if equipment code was renamed
+        if (editId && existing && (existing.code !== code || existing.id !== code)) {
+          const oldCode = existing.code;
+          const oldId = existing.id;
+          if (Array.isArray(transactionHistory) && oldCode) {
+            transactionHistory.forEach(tx => {
+              if (tx && (tx.equipmentCode === oldCode || tx.equipmentId === oldId)) {
+                tx.equipmentCode = code;
+                tx.equipmentId = code;
+              }
+            });
+          }
+        }
 
         // Always save locally first to ensure memory and localStorage contain full inventory
         saveLocalEquipment(equipmentItem, editId);
@@ -3031,12 +4509,16 @@
     }
 
     function saveLocalEquipment(item, editId) {
+      if (item.code) {
+        item.id = item.code;
+      }
       if (editId) {
-        const idx = equipmentList.findIndex(x => x.id === editId);
-        if (idx !== -1) equipmentList[idx] = { ...equipmentList[idx], ...item };
+        const idx = equipmentList.findIndex(x => x.id === editId || x.code === editId || (item.code && x.code === item.code));
+        if (idx !== -1) equipmentList[idx] = { ...equipmentList[idx], ...item, id: item.code || item.id };
+        else equipmentList.unshift(item);
       } else {
-        if (!item.id) item.id = 'eq-' + String(Date.now()).slice(-5);
-        const existingIdx = equipmentList.findIndex(x => x.id === item.id);
+        if (!item.id) item.id = item.code || ('eq-' + String(Date.now()).slice(-5));
+        const existingIdx = equipmentList.findIndex(x => x.id === item.id || (item.code && x.code === item.code));
         if (existingIdx !== -1) equipmentList[existingIdx] = item;
         else equipmentList.unshift(item);
       }
@@ -3046,6 +4528,10 @@
     // Save Employee
     async function handleSaveEmployee(e) {
       e.preventDefault();
+      if (MAIN_PERSONNEL_READ_ONLY) {
+        blockMainPersonnelMutation('เพิ่มหรือแก้ไขข้อมูลบุคลากร');
+        return;
+      }
       const editId = document.getElementById('editEmpIdHidden').value;
       const name = document.getElementById('empNameInput').value.trim();
       const nickname = document.getElementById('empNicknameInput') ? document.getElementById('empNicknameInput').value.trim() : '';
@@ -3194,6 +4680,10 @@
     // Attendance Submission
     function handleAttendanceSubmit(e) {
       e.preventDefault();
+      if (MAIN_STOCK_ONLY_MODE) {
+        showToast("กรุณาบันทึกเวลาในศูนย์ผังโครงสร้างและจัดการบุคลากร");
+        return;
+      }
       const empId = document.getElementById('attEmpSelect')?.value;
       const status = document.querySelector('input[name="attStatus"]:checked')?.value || 'เข้างาน';
       const note = document.getElementById('attNote')?.value.trim() || '';
@@ -3242,46 +4732,121 @@
     // MULTI-ITEM TRANSACTION CART ENGINE
     // ==========================================
     let selectedTransItems = [];
+    let currentTransCartType = null;
 
-    window.addCurrentEquipToCart = function() {
-      const equipSelect = document.getElementById('equipSelect');
-      const equipId = equipSelect ? equipSelect.value : '';
-      const qtyInput = document.getElementById('transQty');
-      const qty = parseInt(qtyInput ? qtyInput.value : '1') || 1;
-
-      if (!equipId) {
-        alert("⚠️ กรุณาเลือกอุปกรณ์การเกษตรที่ต้องการเพิ่มเข้าเอกสารก่อน");
-        return;
+    window.addEquipmentDirectlyToCart = function(itemOrId, requestedQty = 1, options = {}) {
+      if (!itemOrId) return false;
+      const item = typeof itemOrId === 'object' ? itemOrId : (equipmentList || []).find(x => x.id === itemOrId || x.code === itemOrId);
+      if (!item) {
+        alert("❌ ไม่พบข้อมูลอุปกรณ์ในระบบ");
+        return false;
       }
 
+      const qty = parseInt(requestedQty) || 1;
       if (qty <= 0) {
         alert("⚠️ กรุณาระบุจำนวนอย่างน้อย 1 ชิ้น");
-        return;
+        return false;
       }
 
-      const item = equipmentList.find(x => x.id === equipId);
-      if (!item) {
-        alert("❌ ไม่พบข้อมูลอุปกรณ์ที่เลือก");
-        return;
+      // 1. Populate into equipSelect and UI preview
+      const select = document.getElementById('equipSelect');
+      if (select) {
+        select.value = item.id;
+        const equipSearch = document.getElementById('equipSearchInput');
+        if (equipSearch) equipSearch.value = item.name;
+        if (typeof updateEquipSelectPreview === 'function') {
+          updateEquipSelectPreview();
+        }
+      }
+      const qtyInput = document.getElementById('transQty');
+      if (qtyInput) {
+        qtyInput.value = qty;
+      }
+      window.lastInteractedEquipmentId = item.id;
+
+      // 2. Validate transaction type
+      const currentRadio = document.querySelector('input[name="transType"]:checked')?.value || 'เบิกจ่าย';
+      const type = currentTransCartType || currentRadio;
+      const empId = document.getElementById('empSelect')?.value;
+
+      // 2.1 Lock document transaction type (must be ONE type per document, never mixed!)
+      if (selectedTransItems.length > 0 && currentTransCartType && currentTransCartType !== type) {
+        const typeNameMap = {
+          'เบิกจ่าย': 'เบิกตัดสต๊อก',
+          'ยืมอุปกรณ์': 'ยืมอุปกรณ์',
+          'คืนอุปกรณ์': 'คืนอุปกรณ์',
+          'รับเข้าสต๊อก': 'รับเข้าสต๊อก',
+          'รับเข้าสต๊อก (ขาเข้า)': 'รับเข้าสต๊อก'
+        };
+        const curName = typeNameMap[currentTransCartType] || currentTransCartType;
+        const newName = typeNameMap[type] || type;
+        alert(`❌ ไม่สามารถเพิ่มรายการประเภท "${newName}" เข้าเอกสารนี้ได้!\n\nเนื่องจากเอกสารใบนี้ถูกบันทึกเป็น "${curName}" ไว้อยู่แล้ว (${selectedTransItems.length} รายการ)\n\nในเอกสาร 1 ใบต้องเป็นประเภทเดียวกันเท่านั้น ไม่สามารถนำรายการต่างประเภทมาปนกันได้`);
+        return false;
       }
 
-      const type = document.querySelector('input[name="transType"]:checked')?.value || 'เบิกจ่าย';
+      // 2.2 Prevent adding "อุปกรณ์ประเภทยืมใช้" to "เบิกจ่าย" (เบิกตัดสต๊อก)
+      if (type === 'เบิกจ่าย' && typeof window.isEquipmentBorrowType === 'function' && window.isEquipmentBorrowType(item)) {
+        alert(`❌ ไม่สามารถเพิ่ม "${item.name}" เข้าเอกสารเบิกตัดสต๊อกได้!\n\nเนื่องจากอุปกรณ์นี้เป็น "ประเภทยืมใช้" (ไม่ใช่ของใช้แล้วหมดไป)\nจะนำไปปนในเอกสารเบิกจ่ายไม่ได้เด็ดขาด\n\nกรุณาทำรายการผ่านโหมด "ยืมอุปกรณ์" แทน`);
+        return false;
+      }
 
-      // Check current quantity already in cart
-      const existingInCart = selectedTransItems.find(x => x.id === equipId);
-      const currentCartQty = existingInCart ? existingInCart.qty : 0;
+      const existingInCart = selectedTransItems.find(x => x.id === item.id);
+      const currentCartQty = existingInCart ? (existingInCart.qty || 0) : 0;
       const totalRequestedQty = currentCartQty + qty;
 
-      if (type === 'เบิกจ่าย' || type === 'ยืมอุปกรณ์') {
-        if (totalRequestedQty > item.quantity) {
-          alert(`❌ ยอดคงเหลือไม่พอกรณี${type}: "${item.name}" (คงเหลือในสต๊อก: ${item.quantity} ${item.unit || 'ชิ้น'}, ในเอกสารแล้ว: ${currentCartQty} ${item.unit || 'ชิ้น'}, ต้องการเพิ่มอีก: ${qty} ${item.unit || 'ชิ้น'})`);
-          return;
+      // 2.3 Validate Return Mode: Prevent adding/returning items that were not borrowed
+      if (type === 'คืนอุปกรณ์') {
+        const allActive = typeof window.getAllActiveBorrowings === 'function' ? window.getAllActiveBorrowings() : [];
+        const relevantBorrows = empId ? allActive.filter(b => b.employeeId === empId) : allActive;
+        const matchingBorrows = relevantBorrows.filter(b => b.equipmentId === item.id);
+        const totalBorrowedRemaining = matchingBorrows.reduce((sum, b) => sum + b.remainingQty, 0);
+
+        if (totalBorrowedRemaining <= 0) {
+          alert(`❌ ไม่สามารถทำรายการคืนได้: "${item.name}"\nเนื่องจากไม่มีประวัติการยืมอุปกรณ์รายการนี้ค้างอยู่ในระบบ (อุปกรณ์ที่จะคืนได้ต้องมีการยืมไปก่อนเท่านั้น)`);
+          return false;
+        }
+
+        if (totalRequestedQty > totalBorrowedRemaining) {
+          alert(`❌ จำนวนที่ส่งคืนเกินจำนวนที่ยืมไปจริง!\nอุปกรณ์: "${item.name}"\nจำนวนที่ค้างส่งคืน: ${totalBorrowedRemaining} ${item.unit || 'ชิ้น'}\nในเอกสารแล้ว: ${currentCartQty} ${item.unit || 'ชิ้น'}\nต้องการเพิ่มอีก: ${qty} ${item.unit || 'ชิ้น'}`);
+          return false;
         }
       }
 
+      // 2.4 Validate stock for 'เบิกจ่าย' and 'ยืมอุปกรณ์'
+      if (type === 'เบิกจ่าย' || type === 'ยืมอุปกรณ์') {
+        if (totalRequestedQty > item.quantity) {
+          alert(`❌ ยอดคงเหลือไม่พอกรณี${type}: "${item.name}" (คงเหลือในสต๊อก: ${item.quantity} ${item.unit || 'ชิ้น'}, ในเอกสารแล้ว: ${currentCartQty} ${item.unit || 'ชิ้น'}, ต้องการเพิ่มอีก: ${qty} ${item.unit || 'ชิ้น'})`);
+          return false;
+        }
+      }
+
+      currentTransCartType = type;
+
       if (existingInCart) {
+        if (options && options.fromScanner) {
+          // สแกนซ้ำอุปกรณ์เดิม: ไม่เพิ่มจำนวนในเอกสาร
+          window.transDuplicateScanCounts = window.transDuplicateScanCounts || {};
+          const currentScanTimes = (window.transDuplicateScanCounts[item.id] || 1) + 1;
+          window.transDuplicateScanCounts[item.id] = currentScanTimes;
+
+          if (typeof window.playScanDuplicateSound === 'function') {
+            window.playScanDuplicateSound();
+          }
+
+          if (currentScanTimes >= 3) {
+            if (typeof showToast === 'function') {
+              showToast(`⚠️ อุปกรณ์ "${item.name}" [${item.code || item.id}] มีอยู่ในรายการเอกสารแล้ว (สแกนซ้ำครั้งที่ ${currentScanTimes - 1})`, {
+                title: "แจ้งเตือนการสแกนซ้ำ",
+                duration: 3000
+              });
+            }
+          }
+          return false;
+        }
         existingInCart.qty = totalRequestedQty;
       } else {
+        window.transDuplicateScanCounts = window.transDuplicateScanCounts || {};
+        window.transDuplicateScanCounts[item.id] = 1;
         selectedTransItems.push({
           id: item.id,
           name: item.name,
@@ -3295,7 +4860,62 @@
       }
 
       renderTransCartList();
-      showToast(`➕ เพิ่ม "${item.name}" (${qty} ${item.unit || 'ชิ้น'}) เข้าเอกสารเรียบร้อยแล้ว`);
+
+      // Update continuous scan counters in scanner modal if active
+      const contBadge = document.getElementById('continuousScanCartCountBadge');
+      if (contBadge) contBadge.textContent = selectedTransItems.length;
+      const contFooterCount = document.getElementById('continuousScanFooterCount');
+      if (contFooterCount) contFooterCount.textContent = selectedTransItems.length;
+
+      // Ensure transaction modal is shown & scroll to cart table if not keeping scanner open
+      if (!options || !options.keepScannerOpen) {
+        const modalElem = document.getElementById('transactionModal');
+        if (modalElem) {
+          const bsModal = bootstrap.Modal.getOrCreateInstance(modalElem);
+          bsModal.show();
+          document.body.classList.add('modal-open');
+          document.body.style.overflow = 'hidden';
+        }
+
+        setTimeout(() => {
+          const cartBox = document.getElementById('selectedTransCartBox');
+          if (cartBox) {
+            cartBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }
+        }, 100);
+      }
+
+      if (!options || !options.suppressSound) {
+        if (typeof playScanBeep === 'function') {
+          playScanBeep();
+        }
+      }
+
+      if (!options || (!options.silentToast && !options.keepScannerOpen)) {
+        const totalInDoc = existingInCart ? existingInCart.qty : qty;
+        showToast(`➕ เพิ่ม "${item.name}" เข้าเอกสารแล้ว ${qty} ${item.unit || 'ชิ้น'} (รวมในเอกสาร: ${totalInDoc} ${item.unit || 'ชิ้น'})`);
+      }
+      return true;
+    };
+
+    window.addCurrentEquipToCart = function() {
+      const equipSelect = document.getElementById('equipSelect');
+      const equipId = equipSelect ? equipSelect.value : '';
+      const qtyInput = document.getElementById('transQty');
+      const qty = parseInt(qtyInput ? qtyInput.value : '1') || 1;
+
+      if (!equipId) {
+        alert("⚠️ กรุณาเลือกอุปกรณ์การเกษตรที่ต้องการเพิ่มเข้าเอกสารก่อน");
+        return;
+      }
+
+      const item = equipmentList.find(x => x.id === equipId);
+      if (!item) {
+        alert("❌ ไม่พบข้อมูลอุปกรณ์ที่เลือก");
+        return;
+      }
+
+      window.addEquipmentDirectlyToCart(item, qty);
     };
 
     window.updateCartItemQty = function(equipId, delta) {
@@ -3348,23 +4968,41 @@
 
     window.removeCartItem = function(equipId) {
       selectedTransItems = selectedTransItems.filter(x => x.id !== equipId);
+      if (window.transDuplicateScanCounts) {
+        delete window.transDuplicateScanCounts[equipId];
+      }
+      if (selectedTransItems.length === 0) {
+        currentTransCartType = null;
+      }
       renderTransCartList();
       showToast('🗑️ ลบรายการอุปกรณ์ออกจากเอกสารแล้ว');
     };
 
     window.clearTransCart = function() {
       selectedTransItems = [];
+      currentTransCartType = null;
+      window.transDuplicateScanCounts = {};
+      const reqDoc = document.getElementById('transRequireVoucherDoc');
+      if (reqDoc) reqDoc.checked = false;
+      if (typeof window.hideTransStockOverPopup === 'function') {
+        window.hideTransStockOverPopup();
+      }
       renderTransCartList();
     };
 
     window.renderTransCartList = function() {
+      const cartBox = document.getElementById('selectedTransCartBox');
       const container = document.getElementById('selectedTransCartItemsList');
       const badge = document.getElementById('cartCountBadge');
+      const locContainer = document.getElementById('transLocationContainer');
+      const noteContainer = document.getElementById('transNoteContainer');
       if (badge) badge.textContent = `${selectedTransItems.length} รายการ`;
 
-      if (!container) return;
-
       if (selectedTransItems.length === 0) {
+        if (locContainer) locContainer.classList.add('trans-mobile-hide-when-empty');
+        if (noteContainer) noteContainer.classList.add('trans-mobile-hide-when-empty');
+        if (cartBox) cartBox.classList.add('d-none');
+        if (!container) return;
         container.innerHTML = `
           <div class="text-center py-3 px-2 text-muted bg-light rounded-3 border border-dashed fs-8">
             <i class="bi bi-info-circle-fill text-success fs-6 d-block mb-1"></i>
@@ -3375,14 +5013,47 @@
         return;
       }
 
-      const activeType = document.querySelector('input[name="transType"]:checked')?.value || 'เบิกจ่าย';
+      if (locContainer) locContainer.classList.remove('trans-mobile-hide-when-empty');
+      if (noteContainer) noteContainer.classList.remove('trans-mobile-hide-when-empty');
+
+      if (cartBox) {
+        cartBox.classList.remove('d-none');
+      }
+
+      if (!container) return;
+
+      const activeType = currentTransCartType || document.querySelector('input[name="transType"]:checked')?.value || 'เบิกจ่าย';
       let typeBadge = '';
+      let badgeClass = 'bg-danger text-white';
+      let badgeText = 'เอกสารเบิกตัดสต๊อก';
+
       if (activeType === 'ยืมอุปกรณ์') {
         typeBadge = '<span class="badge bg-warning text-dark px-2 py-1"><i class="bi bi-arrow-repeat me-1"></i>ยืมอุปกรณ์</span>';
+        badgeClass = 'bg-warning text-dark';
+        badgeText = 'เอกสารยืมอุปกรณ์';
       } else if (activeType === 'คืนอุปกรณ์') {
-        typeBadge = '<span class="badge bg-info text-dark px-2 py-1"><i class="bi bi-box-arrow-in-down me-1"></i>คืนอุปกรณ์</span>';
+        typeBadge = '<span class="badge fw-bold shadow-sm px-2.5 py-1.5" style="background-color: #0dcaf0 !important; color: #000000 !important;"><i class="bi bi-box-arrow-in-down me-1"></i>คืนอุปกรณ์</span>';
+        badgeClass = 'text-dark';
+        badgeText = 'เอกสารคืนอุปกรณ์';
+      } else if (activeType === 'รับเข้าสต๊อก' || activeType === 'รับเข้าสต๊อก (ขาเข้า)') {
+        typeBadge = '<span class="badge text-white fw-bold shadow-sm px-2.5 py-1.5" style="background-color: #00c853 !important; color: #ffffff !important;"><i class="bi bi-box-arrow-in-down-left me-1"></i>รับเข้าสต๊อก</span>';
+        badgeClass = 'bg-success text-white';
+        badgeText = 'เอกสารรับเข้าสต๊อก';
       } else {
         typeBadge = '<span class="badge bg-danger px-2 py-1"><i class="bi bi-box-arrow-up me-1"></i>เบิกจ่าย</span>';
+        badgeClass = 'bg-danger text-white';
+        badgeText = 'เอกสารเบิกตัดสต๊อก';
+      }
+
+      const cartTypeBadge = document.getElementById('transCartTypeBadge');
+      if (cartTypeBadge) {
+        cartTypeBadge.className = `badge fs-8 ${badgeClass}`;
+        cartTypeBadge.textContent = badgeText;
+      }
+
+      const cartSubHeader = document.getElementById('transCartSubHeader');
+      if (cartSubHeader) {
+        cartSubHeader.textContent = `เอกสารนี้เป็น ${badgeText} (ห้ามนำรายการประเภทอื่นมาปนในใบเดียวกัน)`;
       }
 
       let totalQtySum = 0;
@@ -3453,6 +5124,46 @@
       `;
 
       container.innerHTML = html;
+
+      if (typeof window.updateScannerEquipmentListUI === 'function') {
+        window.updateScannerEquipmentListUI();
+      }
+    };
+
+    window.showTransStockOverPopup = function(detailMsg) {
+      const popup = document.getElementById('transStockOverAlertPopup');
+      if (!popup) return;
+      const detailEl = document.getElementById('transStockOverAlertDetail');
+      if (detailEl) {
+        if (detailMsg) {
+          detailEl.textContent = detailMsg;
+          detailEl.classList.remove('d-none');
+        } else {
+          detailEl.classList.add('d-none');
+        }
+      }
+      popup.classList.remove('d-none');
+
+      const navHeight = document.querySelector('.navbar.sticky-top')?.offsetHeight || 60;
+      const rect = popup.getBoundingClientRect();
+      const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+      const targetY = rect.top + scrollTop - navHeight - 16;
+      window.scrollTo({ top: Math.max(0, targetY), behavior: 'smooth' });
+
+      if (window._transStockOverPopupTimer) {
+        clearTimeout(window._transStockOverPopupTimer);
+      }
+      window._transStockOverPopupTimer = setTimeout(() => {
+        popup.classList.add('d-none');
+      }, 7000);
+    };
+
+    window.hideTransStockOverPopup = function() {
+      const popup = document.getElementById('transStockOverAlertPopup');
+      if (popup) popup.classList.add('d-none');
+      if (window._transStockOverPopupTimer) {
+        clearTimeout(window._transStockOverPopupTimer);
+      }
     };
 
     // Transaction Submit (Supports Multi-Item Documents & Firestore Sync Verification)
@@ -3465,7 +5176,14 @@
       const note = document.getElementById('transNote').value.trim();
 
       if (!empId) {
-        alert("กรุณาเลือกรายชื่อพนักงานผู้ทำรายการ");
+        const empEl = document.getElementById('empSelect');
+        if (empEl) {
+          empEl.setCustomValidity('กรุณาเลือก หรือ พิมพ์รายชื่อผู้ทำรายการก่อน');
+          empEl.reportValidity();
+          empEl.focus();
+        } else {
+          alert("กรุณาเลือก หรือ พิมพ์รายชื่อผู้ทำรายการก่อน");
+        }
         return;
       }
 
@@ -3513,12 +5231,49 @@
         }];
       }
 
-      // Check stock for all items
+      // Check borrowable equipment restriction in "เบิกจ่าย" (เบิกตัดสต๊อก)
+      if (type === 'เบิกจ่าย') {
+        for (const it of itemsToProcess) {
+          const equipObj = equipmentList.find(x => x.id === it.equipmentId);
+          if (equipObj && typeof window.isEquipmentBorrowType === 'function' && window.isEquipmentBorrowType(equipObj)) {
+            alert(`❌ ไม่สามารถบันทึกเบิกตัดสต๊อก "${equipObj.name}" ได้!\n\nเนื่องจากอุปกรณ์นี้เป็น "ประเภทยืมใช้" (ไม่ใช่ของใช้แล้วหมดไป)\nจะนำมาเบิกตัดสต๊อกไม่ได้เด็ดขาด\n\nกรุณาทำรายการผ่านโหมด "ยืมอุปกรณ์" แทน`);
+            return;
+          }
+        }
+      }
+
+      // Check document type consistency: must match cart locked type
+      if (selectedTransItems.length > 0 && currentTransCartType && currentTransCartType !== type) {
+        alert(`❌ ประเภทรายการที่เลือก (${type}) ไม่ตรงกับประเภทเอกสารที่บันทึกไว้ในตะกร้า (${currentTransCartType})`);
+        return;
+      }
+
+      // Check stock & borrow validation for all items
       if (type === 'เบิกจ่าย' || type === 'ยืมอุปกรณ์') {
         for (const it of itemsToProcess) {
           const equipObj = equipmentList.find(x => x.id === it.equipmentId);
-          if (!equipObj || equipObj.quantity < it.quantity) {
-            alert(`❌ ยอดคงเหลือไม่พอสำหรับทำรายการ: "${it.equipmentName}" (คงเหลือปัจจุบัน: ${equipObj ? equipObj.quantity : 0} ${it.unit}, ต้องการ: ${it.quantity} ${it.unit})`);
+          const currentStock = equipObj ? equipObj.quantity : 0;
+          if (!equipObj || currentStock < it.quantity) {
+            const detail = `อุปกรณ์ "${it.equipmentName}" มีคงเหลือในคลังเพียง ${currentStock} ${it.unit} (ระบุในรายการ ${it.quantity} ${it.unit})`;
+            window.showTransStockOverPopup(detail);
+            return;
+          }
+        }
+      } else if (type === 'คืนอุปกรณ์') {
+        const allActive = typeof window.getAllActiveBorrowings === 'function' ? window.getAllActiveBorrowings() : [];
+        const relevantBorrows = allActive.filter(b => b.employeeId === empId);
+
+        for (const it of itemsToProcess) {
+          const matchingBorrows = relevantBorrows.filter(b => b.equipmentId === it.equipmentId);
+          const totalBorrowedRemaining = matchingBorrows.reduce((sum, b) => sum + b.remainingQty, 0);
+
+          if (totalBorrowedRemaining <= 0) {
+            alert(`❌ ไม่สามารถทำรายการคืนได้: "${it.equipmentName}"\nเนื่องจากไม่มีประวัติการยืมอุปกรณ์รายการนี้ของพนักงาน (${emp.name}) ในระบบ`);
+            return;
+          }
+
+          if (it.quantity > totalBorrowedRemaining) {
+            alert(`❌ จำนวนที่ส่งคืนเกินจำนวนที่ยืมจริง!\nอุปกรณ์: "${it.equipmentName}"\nจำนวนที่ค้างส่งคืน: ${totalBorrowedRemaining} ${it.unit}\nจำนวนที่ระบุในรายการ: ${it.quantity} ${it.unit}`);
             return;
           }
         }
@@ -3551,7 +5306,7 @@
       let dueDateVal = null;
       let dueDateStr = null;
       if (type === 'ยืมอุปกรณ์') {
-        if (window.transDueDatePicker && window.transDueDatePicker.selectedDates.length > 0) {
+        if (window.transDueDatePicker && Array.isArray(window.transDueDatePicker.selectedDates) && window.transDueDatePicker.selectedDates.length > 0) {
           const dObj = window.transDueDatePicker.selectedDates[0];
           dueDateVal = dObj.getTime();
           const day = String(dObj.getDate()).padStart(2, '0');
@@ -3639,6 +5394,11 @@
 
       showToast(`✅ บันทึกเอกสาร${type} (${itemsToProcess.length} รายการ) เรียบร้อยแล้ว`);
 
+      // Check if user requested transaction voucher document (Default: false)
+      const requireVoucher = document.getElementById('transRequireVoucherDoc')?.checked || false;
+
+      const primaryEquipId = (itemsToProcess && itemsToProcess.length > 0) ? itemsToProcess[0].equipmentId : (document.getElementById('equipSelect')?.value || window.lastInteractedEquipmentId);
+
       // Reset form & cart
       clearTransCart();
       document.getElementById('transactionForm')?.reset();
@@ -3660,13 +5420,24 @@
         validateFirestoreHistorySync(false);
       }
 
-      // Exit from "บันทึก เบิก-จ่าย-ยืม-คืน" screen immediately
-      if (typeof switchNavTab === 'function') {
+      // Hide transaction modal if open
+      const transModalElem = document.getElementById('transactionModal');
+      if (transModalElem) {
+        const bsModal = bootstrap.Modal.getInstance(transModalElem);
+        if (bsModal) bsModal.hide();
+      }
+
+      // Exit from transaction screen and return to that equipment
+      if (typeof returnToCatalogEquipment === 'function') {
+        returnToCatalogEquipment(primaryEquipId);
+      } else if (typeof switchNavTab === 'function') {
         switchNavTab('catalog-tab');
       }
 
-      // Open transaction voucher print modal
-      openPrintTransactionVoucherModal(newTx.id);
+      // Open transaction voucher print modal ONLY if explicitly checked
+      if (requireVoucher && typeof openPrintTransactionVoucherModal === 'function') {
+        openPrintTransactionVoucherModal(newTx.id);
+      }
     }
 
     // ==================== FIRESTORE DATA VALIDATION FUNCTIONS ====================
@@ -3907,15 +5678,112 @@
       document.getElementById('catalogGrid')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     };
 
+    window.clearCatalogSearch = function() {
+      const input = document.getElementById('catalogSearchInput');
+      if (input) {
+        input.value = '';
+        input.focus();
+        renderCatalogGrid();
+      }
+    };
+
+    window.toggleLowStockFilterCatalog = function() {
+      if (typeof switchNavTab === 'function') {
+        switchNavTab('catalog-tab');
+      }
+      const select = document.getElementById('catalogStatusSelect');
+      if (!select) return;
+      if (select.value === 'LOW_STOCK') {
+        select.value = 'ALL';
+        if (typeof showToast === 'function') showToast('📦 แสดงอุปกรณ์ทุกสถานะคงเหลือ');
+      } else {
+        select.value = 'LOW_STOCK';
+        if (typeof showToast === 'function') showToast('🚨 กรองแสดงเฉพาะรายการอุปกรณ์ที่มีสต๊อกต่ำกว่าขั้นต่ำ');
+      }
+      renderCatalogGrid();
+    };
+
+    window.toggleLowStockFilterStaff = function() {
+      const select = document.getElementById('staffStockSelect');
+      if (!select) return;
+      if (select.value === 'LOW_STOCK') {
+        select.value = 'ALL';
+        if (typeof showToast === 'function') showToast('📦 แสดงอุปกรณ์ทุกระดับสต๊อก');
+      } else {
+        select.value = 'LOW_STOCK';
+        if (typeof showToast === 'function') showToast('🚨 กรองแสดงเฉพาะรายการอุปกรณ์ที่มีสต๊อกต่ำกว่าขั้นต่ำ');
+      }
+      renderStaffTable();
+    };
+
+    function highlightSearchText(text, rawQuery) {
+      if (text === null || text === undefined) return '';
+      const str = String(text);
+      if (!rawQuery || typeof rawQuery !== 'string') {
+        return typeof escapeHtml === 'function' ? escapeHtml(str) : str;
+      }
+
+      const trimmedQuery = rawQuery.trim();
+      if (!trimmedQuery) {
+        return typeof escapeHtml === 'function' ? escapeHtml(str) : str;
+      }
+
+      try {
+        const escapedQuery = trimmedQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`(${escapedQuery})`, 'gi');
+        return str.split(regex).map(part => {
+          if (part.toLowerCase() === trimmedQuery.toLowerCase()) {
+            return `<mark class="bg-warning text-dark rounded-1 px-1 py-0 fw-bold shadow-2xs">${typeof escapeHtml === 'function' ? escapeHtml(part) : part}</mark>`;
+          }
+          return typeof escapeHtml === 'function' ? escapeHtml(part) : part;
+        }).join('');
+      } catch (e) {
+        return typeof escapeHtml === 'function' ? escapeHtml(str) : str;
+      }
+    }
+
     // Render Helpers
-    function renderCatalogGrid() {
+    window.renderCatalogGrid = function renderCatalogGrid() {
       const container = document.getElementById('catalogGrid');
       const emptyState = document.getElementById('catalogEmptyState');
-      const searchQuery = document.getElementById('catalogSearchInput').value.toLowerCase().trim();
-      const selectedCat = document.getElementById('catalogCategorySelect').value;
-      const selectedStatus = document.getElementById('catalogStatusSelect').value;
+      const rawSearchInput = document.getElementById('catalogSearchInput')?.value || '';
+      const searchQuery = rawSearchInput.toLowerCase().trim();
+      const selectedCat = document.getElementById('catalogCategorySelect')?.value || 'ALL';
+      const selectedStatus = document.getElementById('catalogStatusSelect')?.value || 'ALL';
 
-      let filtered = equipmentList.filter(item => {
+      // Update Low Stock Count Badge & Active Button State for Catalog (only show when quantity < minQuantity)
+      const currentEqList = Array.isArray(equipmentList) ? equipmentList : [];
+      const lowStockTotal = currentEqList.filter(item => {
+        const minQty = item.minQuantity !== undefined ? Number(item.minQuantity) : 3;
+        return (Number(item.quantity) || 0) < minQty;
+      }).length;
+      const catBadgeElem = document.getElementById('catalogLowStockBadgeCount');
+      if (catBadgeElem) catBadgeElem.textContent = lowStockTotal;
+      const btnCatLowStock = document.getElementById('btnFilterLowStockCatalog');
+      const btnCatLowStockText = document.getElementById('btnCatalogLowStockText');
+      if (btnCatLowStock) {
+        if (lowStockTotal > 0) {
+          btnCatLowStock.classList.remove('d-none');
+          btnCatLowStock.classList.add('d-inline-flex');
+          if (selectedStatus === 'LOW_STOCK') {
+            btnCatLowStock.classList.add('btn-low-stock-active');
+            if (btnCatLowStockText) btnCatLowStockText.textContent = 'แสดงสต๊อกทั้งหมด';
+          } else {
+            btnCatLowStock.classList.remove('btn-low-stock-active');
+            if (btnCatLowStockText) btnCatLowStockText.textContent = 'แสดงสต๊อกต่ำ';
+          }
+        } else {
+          btnCatLowStock.classList.add('d-none');
+          btnCatLowStock.classList.remove('d-inline-flex', 'btn-low-stock-active');
+          if (btnCatLowStockText) btnCatLowStockText.textContent = 'แสดงสต๊อกต่ำ';
+          if (selectedStatus === 'LOW_STOCK') {
+            const catStatusSelect = document.getElementById('catalogStatusSelect');
+            if (catStatusSelect) catStatusSelect.value = 'ALL';
+          }
+        }
+      }
+
+      let filtered = currentEqList.filter(item => {
         const nameStr = String(item.name || '').toLowerCase();
         const codeStr = String(item.code || '').toLowerCase();
         const catStr = String(item.category || '').toLowerCase();
@@ -3941,7 +5809,10 @@
           const overdueEquipIds = new Set(overdueList.map(o => o.equipmentId || o.equipmentCode || o.equipmentName));
           matchesStatus = overdueEquipIds.has(item.id) || overdueEquipIds.has(item.code) || overdueEquipIds.has(item.name);
         }
-        else if (selectedStatus === 'LOW_STOCK') matchesStatus = item.quantity <= (item.minQuantity !== undefined ? item.minQuantity : 3);
+        else if (selectedStatus === 'LOW_STOCK') {
+          const minQty = item.minQuantity !== undefined ? Number(item.minQuantity) : 3;
+          matchesStatus = (Number(item.quantity) || 0) < minQty;
+        }
 
         return matchesQuery && matchesCategory && matchesStatus;
       });
@@ -3982,57 +5853,68 @@
       let html = '';
       itemsToRender.forEach(item => {
         let statusBadge = '';
-        const minQty = item.minQuantity !== undefined ? item.minQuantity : 3;
-        if (item.quantity <= minQty) {
-          statusBadge = `<span class="badge bg-danger badge-status text-white pulse-danger-badge"><i class="bi bi-bell-fill me-1"></i> เตือน! สต๊อกต่ำกว่าขั้นต่ำ (${item.quantity} / ขั้นต่ำ ${minQty} ${item.unit})</span>`;
-        } else if (item.quantity <= minQty + 2) {
-          statusBadge = `<span class="badge bg-warning bg-opacity-90 badge-status text-dark"><i class="bi bi-exclamation-triangle-fill me-1"></i> สต๊อกใกล้ขั้นต่ำ (${item.quantity} / ขั้นต่ำ ${minQty} ${item.unit})</span>`;
+        const minQty = item.minQuantity !== undefined ? Number(item.minQuantity) : 3;
+        const curQty = Number(item.quantity) || 0;
+        if (curQty < minQty) {
+          statusBadge = `<span class="badge bg-danger badge-status text-white pulse-danger-badge"><i class="bi bi-bell-fill me-1"></i> เตือน! สต๊อกต่ำกว่าขั้นต่ำ (${curQty} / ขั้นต่ำ ${minQty} ${item.unit})</span>`;
+        } else if (curQty === minQty || curQty <= minQty + 2) {
+          statusBadge = `<span class="badge bg-warning bg-opacity-90 badge-status text-dark"><i class="bi bi-exclamation-triangle-fill me-1"></i> สต๊อกใกล้ขั้นต่ำ (${curQty} / ขั้นต่ำ ${minQty} ${item.unit})</span>`;
         } else {
-          statusBadge = `<span class="badge bg-success bg-opacity-90 badge-status text-white"><i class="bi bi-check-circle-fill me-1"></i> พร้อมใช้งาน (${item.quantity} ${item.unit})</span>`;
+          statusBadge = `<span class="badge bg-success bg-opacity-90 badge-status text-white"><i class="bi bi-check-circle-fill me-1"></i> พร้อมใช้งาน (${curQty} ${item.unit})</span>`;
         }
 
         const isWorker = currentRole === 'WORKER';
         const isStaff = currentRole === 'STAFF' || currentRole === 'ADMIN' || currentRole === 'MANAGER';
 
+        const highlightedName = highlightSearchText(item.name, rawSearchInput);
+        const highlightedCode = highlightSearchText(item.code, rawSearchInput);
+
+        const hasDesc = !!(item.description && item.description.trim());
+        const descHtml = hasDesc
+          ? `<p class="text-secondary fs-7 mb-2 text-truncate-2" title="${escapeHtml(item.description)}">${escapeHtml(item.description)}</p>`
+          : `<p class="text-secondary fs-7 mb-2 text-truncate-2 d-none d-md-block text-muted">ไม่มีรายละเอียดสเปกเพิ่มเติม</p>`;
+
         html += `
-          <div class="col-12 col-sm-6 col-lg-4 col-xl-3">
+          <div class="col-12 col-sm-6 col-lg-4 col-xl-3" id="equip-card-${item.id}" data-equip-id="${item.id}">
             <div class="equipment-card">
-              <div class="equipment-img-container ${isStaff ? 'cursor-pointer' : ''} position-relative" ${isStaff ? `onclick="openEquipmentPopupMenu('${item.id}')" title="คลิกรูปภาพเพื่อเปิดเมนู (Popup Menu)"` : ''}>
-                <img src="${item.imageUrl}" loading="lazy" class="equipment-img" alt="${item.name}" onerror="this.src='${DEFAULT_EQUIPMENT_IMAGE}'" />
-                <span class="badge-code">${item.code}</span>
+              <div class="equipment-img-container position-relative" onclick="openEquipmentTransactionHistoryModal('${item.id}')" title="คลิกรูปภาพเพื่อดูประวัติการทำรายการอุปกรณ์ (${escapeHtml(item.name)})">
+                <img src="${item.imageUrl}" loading="lazy" class="equipment-img" alt="${escapeHtml(item.name)}" onerror="this.src='${DEFAULT_EQUIPMENT_IMAGE}'" />
+                <span class="badge-code">${highlightedCode}</span>
                 ${isStaff ? `
-                  <span class="badge bg-dark bg-opacity-75 text-white position-absolute top-0 end-0 m-2 rounded-pill fs-8 shadow-sm">
-                    <i class="bi bi-sliders me-1"></i>เมนู
-                  </span>
+                  <button type="button" class="btn btn-dark bg-opacity-80 text-white position-absolute top-0 end-0 m-2 rounded-pill fs-8 shadow-sm border-0 py-1 px-2.5 d-inline-flex align-items-center gap-1" style="z-index: 5;" onclick="event.stopPropagation(); openEquipmentPopupMenu('${item.id}')" title="คลิกเพื่อเปิดเมนูจัดการ (Popup Menu)">
+                    <i class="bi bi-sliders text-success"></i> เมนู
+                  </button>
                 ` : ''}
+                <div class="equipment-img-overlay-hint">
+                  <span class="badge bg-dark bg-opacity-90 text-white rounded-pill px-3 py-1.5 fs-8 shadow">
+                    <i class="bi bi-clock-history me-1 text-info"></i> ดูประวัติ
+                  </span>
+                </div>
                 ${statusBadge}
               </div>
 
-              <div class="card-body p-3 d-flex flex-column justify-content-between">
+              <div class="card-body p-3 d-flex flex-column">
                 <div>
-                  <div class="text-success fs-7 fw-semibold mb-1">${item.category}</div>
-                  <h6 class="fw-bold text-dark mb-2 text-truncate" title="${item.name}">${item.name}</h6>
-                  <p class="text-secondary fs-7 mb-3 text-truncate-2" style="min-height: 2.4rem;">
-                    ${item.description || 'ไม่มีรายละเอียดสเปกเพิ่มเติม'}
-                  </p>
+                  <h6 class="fw-bold text-dark mb-1 text-truncate" title="${escapeHtml(item.name || '')}">${highlightedName}</h6>
+                  ${descHtml}
                 </div>
 
-                <div>
+                <div class="mt-1 mt-md-auto">
                   <div class="d-flex justify-content-between align-items-center mb-2 bg-light p-2 rounded-3 fs-7">
-                    <div><i class="bi bi-geo-alt-fill text-danger me-1"></i> ${item.location || 'คลังกลาง'}</div>
+                    <div class="text-truncate me-1"><i class="bi bi-geo-alt-fill text-danger me-1"></i> ${escapeHtml(item.location || 'คลังกลาง')}</div>
                     ${(item.borrowedCount || 0) > 0 ? `
-                      <button type="button" class="btn btn-xs btn-outline-warning text-dark fw-bold rounded-pill px-2 py-0.5 shadow-sm d-inline-flex align-items-center gap-1" onclick="showEquipmentBorrowersModal('${item.id}')" title="กดดูรายชื่อผู้ยืมอุปกรณ์นี้">
-                        <i class="bi bi-people-fill text-warning"></i> ถูกยืม: ${item.borrowedCount} ${item.unit} <span class="badge bg-dark text-white rounded-pill ms-0.5" style="font-size: 8px; padding: 2px 4px;">ดูผู้ยืม</span>
+                      <button type="button" class="btn btn-xs btn-outline-warning text-dark fw-bold rounded-pill px-2 py-0.5 shadow-sm flex-shrink-0" onclick="showEquipmentBorrowersModal('${item.id}')" title="กดดูรายชื่อผู้ยืมอุปกรณ์นี้ (${item.borrowedCount} ${escapeHtml(item.unit || '')})">
+                        ยืม ${item.borrowedCount}
                       </button>
                     ` : `
-                      <div class="text-secondary fs-8 fw-semibold">ถูกยืม: 0 ${item.unit}</div>
+                      <div class="text-secondary fs-8 fw-semibold flex-shrink-0">ยืม 0</div>
                     `}
                   </div>
 
                   ${isStaff ? `
                     <div class="d-grid gap-1.5">
                       <button class="btn btn-outline-success btn-sm rounded-pill fw-semibold" onclick="quickSelectTransaction('${item.id}')">
-                        <i class="bi bi-pencil-square me-1"></i> เบิก / ยืม ชิ้นนี้
+                        <i class="bi bi-pencil-square me-1"></i> เบิก-รับเข้า-ยืม-คืน
                       </button>
                     </div>
                   ` : ''}
@@ -4119,8 +6001,96 @@
       navUl.innerHTML = navHtml;
     }
 
+    // Personnel Bulk Selection State
+    let selectedEmpIds = new Set();
+    let empViewMode = 'table'; // 'table' or 'card'
+
+    window.setEmpViewMode = function(mode) {
+      empViewMode = mode;
+      const btnTable = document.getElementById('btnEmpTableView');
+      const btnCard = document.getElementById('btnEmpCardView');
+
+      if (btnTable && btnCard) {
+        if (mode === 'table') {
+          btnTable.classList.add('active', 'btn-light', 'shadow-2xs');
+          btnTable.classList.remove('text-muted');
+          btnCard.classList.remove('active', 'btn-light', 'shadow-2xs');
+          btnCard.classList.add('text-muted');
+        } else {
+          btnCard.classList.add('active', 'btn-light', 'shadow-2xs');
+          btnCard.classList.remove('text-muted');
+          btnTable.classList.remove('active', 'btn-light', 'shadow-2xs');
+          btnTable.classList.add('text-muted');
+        }
+      }
+
+      renderEmployeeDirectory();
+    };
+
+    window.clearEmpSearch = function() {
+      const input = document.getElementById('empSearchInput');
+      if (input) {
+        input.value = '';
+        renderEmployeeDirectory();
+      }
+    };
+
+    window.toggleEmployeeSelection = function(empId, isChecked) {
+      if (isChecked) {
+        selectedEmpIds.add(empId);
+      } else {
+        selectedEmpIds.delete(empId);
+      }
+      updateEmpBulkActionBar();
+      renderEmployeeDirectory();
+    };
+
+    window.toggleSelectAllEmployees = function(isChecked) {
+      const queryInput = document.getElementById('empSearchInput');
+      const query = queryInput ? queryInput.value.toLowerCase().trim() : '';
+
+      let currentFiltered = employeeList.filter(emp => {
+        const nick = (emp.nickname || '').toLowerCase();
+        const empCode = (emp.code || emp.id || '').toLowerCase();
+        return !query || (emp.name && emp.name.toLowerCase().includes(query)) || nick.includes(query) || empCode.includes(query) || (emp.department && emp.department.toLowerCase().includes(query));
+      });
+
+      if (isChecked) {
+        currentFiltered.forEach(emp => selectedEmpIds.add(emp.id));
+      } else {
+        currentFiltered.forEach(emp => selectedEmpIds.delete(emp.id));
+      }
+
+      updateEmpBulkActionBar();
+      renderEmployeeDirectory();
+    };
+
+    window.clearEmployeeSelections = function() {
+      selectedEmpIds.clear();
+      const mainCheck = document.getElementById('selectAllEmpCheckbox');
+      if (mainCheck) mainCheck.checked = false;
+      updateEmpBulkActionBar();
+      renderEmployeeDirectory();
+    };
+
+    window.updateEmpBulkActionBar = function() {
+      const bar = document.getElementById('empBulkActionBar');
+      const countText = document.getElementById('empSelectedCountText');
+
+      if (selectedEmpIds.size > 0) {
+        if (bar) bar.classList.remove('d-none');
+        if (countText) countText.textContent = selectedEmpIds.size;
+      } else {
+        if (bar) bar.classList.add('d-none');
+        const mainCheck = document.getElementById('selectAllEmpCheckbox');
+        if (mainCheck) mainCheck.checked = false;
+      }
+    };
+
     function renderEmployeeDirectory() {
-      const container = document.getElementById('employeeCardsContainer');
+      const cardsContainer = document.getElementById('employeeCardsContainer');
+      const tableContainer = document.getElementById('employeeTableContainer');
+      const tableBody = document.getElementById('employeeTableBody');
       const queryInput = document.getElementById('empSearchInput');
       const query = queryInput ? queryInput.value.toLowerCase().trim() : '';
       const sortSelect = document.getElementById('empSortSelect');
@@ -4129,7 +6099,7 @@
       let filtered = employeeList.filter(emp => {
         const nick = (emp.nickname || '').toLowerCase();
         const empCode = (emp.code || emp.id || '').toLowerCase();
-        return !query || (emp.name && emp.name.toLowerCase().includes(query)) || nick.includes(query) || empCode.includes(query) || (emp.department && emp.department.toLowerCase().includes(query));
+        return !query || (emp.name && emp.name.toLowerCase().includes(query)) || nick.includes(query) || empCode.includes(query) || (emp.department && emp.department.toLowerCase().includes(query)) || (emp.details && emp.details.toLowerCase().includes(query));
       });
 
       function getEmpCodeStr(emp) {
@@ -4174,65 +6144,400 @@
 
       filtered.sort((a, b) => {
         if (sortVal === 'name') {
-          // Sort by Name (Thai ก-ฮ), then Employee Code
           const comp = compareNames(a, b);
           if (comp !== 0) return comp;
           return compareCodes(a, b);
         } else if (sortVal === 'department') {
-          // Sort by Department, then Employee Code
           const comp = compareDepts(a, b);
           if (comp !== 0) return comp;
           const codeComp = compareCodes(a, b);
           if (codeComp !== 0) return codeComp;
           return compareNames(a, b);
         } else {
-          // Default: Sort by Employee Code (ตัวอักษร-รหัส)
           const comp = compareCodes(a, b);
           if (comp !== 0) return comp;
           return compareNames(a, b);
         }
       });
 
-      let html = '';
-      filtered.forEach(emp => {
-        const deptName = emp.department ? (emp.department.startsWith('แผนก') ? emp.department : 'แผนก' + emp.department) : 'ไม่ระบุแผนก';
-        const displayName = formatEmpName(emp);
-        const empCodeDisplay = emp.code || emp.id;
+      // Update Select All checkbox status
+      const selectAllCheck = document.getElementById('selectAllEmpCheckbox');
+      if (selectAllCheck) {
+        if (filtered.length > 0) {
+          const allSelected = filtered.every(e => selectedEmpIds.has(e.id));
+          selectAllCheck.checked = allSelected;
+        } else {
+          selectAllCheck.checked = false;
+        }
+      }
 
-        html += `
-          <div class="col-12 col-md-6 col-lg-4">
-            <div class="employee-card p-3 d-flex align-items-center justify-content-between gap-2">
-              <div class="d-flex align-items-center gap-3">
-                <img src="${emp.photoUrl}" class="avatar-circle border" alt="${emp.name || ''}" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'" />
-                <div>
-                  <div class="fw-bold text-dark mb-1 fs-6">${displayName}</div>
-                  <div class="fs-7 text-success fw-bold mb-1"><i class="bi bi-building me-1"></i>[${empCodeDisplay}] ${deptName}</div>
-                  ${emp.details ? `<div class="fs-8 text-secondary text-truncate" style="max-width: 220px;" title="${emp.details}"><i class="bi bi-card-text me-1"></i> ${emp.details}</div>` : ''}
-                  <div class="fs-8 text-muted"><i class="bi bi-telephone me-1"></i> ${emp.phone || '-'}</div>
+      // Handle View Mode Toggle Visibility
+      if (empViewMode === 'table') {
+        if (tableContainer) tableContainer.classList.remove('d-none');
+        if (cardsContainer) cardsContainer.classList.add('d-none');
+      } else {
+        if (tableContainer) tableContainer.classList.add('d-none');
+        if (cardsContainer) cardsContainer.classList.remove('d-none');
+      }
+
+      // 1. Render Table Rows
+      if (tableBody) {
+        if (filtered.length === 0) {
+          tableBody.innerHTML = `
+            <tr>
+              <td colspan="8" class="text-center py-5 text-muted">
+                <i class="bi bi-people fs-1 text-secondary opacity-50 d-block mb-2"></i>
+                <div>ไม่พบข้อมูลบุคลากรตามคำค้นหาที่ระบุ</div>
+              </td>
+            </tr>
+          `;
+        } else {
+          let tableHtml = '';
+          filtered.forEach(emp => {
+            const isChecked = selectedEmpIds.has(emp.id);
+            const deptName = emp.department ? (emp.department.startsWith('แผนก') ? emp.department : 'แผนก' + emp.department) : 'ไม่ระบุแผนก';
+            const displayName = formatEmpName(emp);
+            const empCodeDisplay = emp.code || emp.id;
+            const posDisplay = emp.details || emp.position || '-';
+
+            tableHtml += `
+              <tr class="${isChecked ? 'table-primary bg-opacity-10' : ''}">
+                <td class="ps-3">
+                  <input type="checkbox" class="form-check-input emp-select-checkbox cursor-pointer" value="${emp.id}" ${isChecked ? 'checked' : ''} onchange="toggleEmployeeSelection('${emp.id}', this.checked)">
+                </td>
+                <td>
+                  <img src="${emp.photoUrl}" loading="lazy" class="avatar-circle border" style="width: 38px; height: 38px; object-fit: cover;" alt="${typeof escapeHtml === 'function' ? escapeHtml(emp.name || '') : (emp.name || '')}" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'" />
+                </td>
+                <td>
+                  <span class="badge bg-dark font-monospace px-2 py-1 fs-8">${typeof escapeHtml === 'function' ? escapeHtml(empCodeDisplay) : empCodeDisplay}</span>
+                </td>
+                <td>
+                  <div class="fw-bold text-dark">${typeof escapeHtml === 'function' ? escapeHtml(displayName) : displayName}</div>
+                </td>
+                <td>
+                  <span class="badge bg-success bg-opacity-10 text-success border border-success-subtle fw-semibold px-2 py-1 fs-8"><i class="bi bi-building me-1"></i>${typeof escapeHtml === 'function' ? escapeHtml(deptName) : deptName}</span>
+                </td>
+                <td>
+                  <span class="text-secondary fs-8">${typeof escapeHtml === 'function' ? escapeHtml(posDisplay) : posDisplay}</span>
+                </td>
+                <td>
+                  <span class="text-muted font-monospace fs-8"><i class="bi bi-telephone me-1 text-secondary"></i>${typeof escapeHtml === 'function' ? escapeHtml(emp.phone || '-') : (emp.phone || '-')}</span>
+                </td>
+                <td class="text-center">
+                  <div class="d-flex align-items-center justify-content-center gap-1">
+                    <button class="btn btn-outline-success btn-xs rounded-pill px-2 py-0.5 fs-8 fw-semibold" title="สั่งพิมพ์บัตรประจำตัว" onclick="openPrintEmployeeBadgeModal('${emp.id}')">
+                      <i class="bi bi-person-badge"></i> พิมพ์
+                    </button>
+                    <button class="btn btn-outline-info btn-xs rounded-pill px-2 py-0.5 fs-8 fw-semibold" title="ดูประวัติการเบิก-ยืม" onclick="openEmployeeBorrowHistoryModal('${emp.id}')">
+                      <i class="bi bi-clock-history"></i> ประวัติ
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            `;
+          });
+          tableBody.innerHTML = tableHtml;
+        }
+      }
+
+      // 2. Render Card View
+      if (cardsContainer) {
+        if (filtered.length === 0) {
+          cardsContainer.innerHTML = `
+            <div class="col-12 text-center py-5 text-muted">
+              <i class="bi bi-people fs-1 text-secondary opacity-50 d-block mb-2"></i>
+              <div>ไม่พบข้อมูลบุคลากรตามคำค้นหาที่ระบุ</div>
+            </div>
+          `;
+        } else {
+          let cardHtml = '';
+          filtered.forEach(emp => {
+            const isChecked = selectedEmpIds.has(emp.id);
+            const deptName = emp.department ? (emp.department.startsWith('แผนก') ? emp.department : 'แผนก' + emp.department) : 'ไม่ระบุแผนก';
+            const displayName = formatEmpName(emp);
+            const empCodeDisplay = emp.code || emp.id;
+
+            cardHtml += `
+              <div class="col-12 col-md-6 col-lg-4">
+                <div class="employee-card p-3 d-flex align-items-center justify-content-between gap-2 border ${isChecked ? 'border-primary bg-primary bg-opacity-10 shadow-sm' : ''}" style="position: relative;">
+                  <div class="position-absolute top-0 start-0 m-2">
+                    <input type="checkbox" class="form-check-input cursor-pointer" value="${emp.id}" ${isChecked ? 'checked' : ''} onchange="toggleEmployeeSelection('${emp.id}', this.checked)" title="เลือกบุคลากร">
+                  </div>
+                  <div class="d-flex align-items-center gap-3 ms-4">
+                    <img src="${emp.photoUrl}" loading="lazy" class="avatar-circle border" alt="${typeof escapeHtml === 'function' ? escapeHtml(emp.name || '') : (emp.name || '')}" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'" />
+                    <div>
+                      <div class="fw-bold text-dark mb-1 fs-6">${typeof escapeHtml === 'function' ? escapeHtml(displayName) : displayName}</div>
+                      <div class="fs-7 text-success fw-bold mb-1"><i class="bi bi-building me-1"></i>[${typeof escapeHtml === 'function' ? escapeHtml(empCodeDisplay) : empCodeDisplay}] ${typeof escapeHtml === 'function' ? escapeHtml(deptName) : deptName}</div>
+                      ${emp.details ? `<div class="fs-8 text-secondary text-truncate" style="max-width: 180px;" title="${typeof escapeHtml === 'function' ? escapeHtml(emp.details) : emp.details}"><i class="bi bi-card-text me-1"></i> ${typeof escapeHtml === 'function' ? escapeHtml(emp.details) : emp.details}</div>` : ''}
+                      <div class="fs-8 text-muted"><i class="bi bi-telephone me-1"></i> ${typeof escapeHtml === 'function' ? escapeHtml(emp.phone || '-') : (emp.phone || '-')}</div>
+                    </div>
+                  </div>
+                  
+                  <div class="d-flex flex-column gap-1">
+                    <button class="btn btn-outline-success btn-sm rounded-pill fs-7 fw-semibold" title="สั่งพิมพ์บัตรประจำตัวรายบุคคล" onclick="openPrintEmployeeBadgeModal('${emp.id}')">
+                      <i class="bi bi-person-badge me-1"></i> พิมพ์
+                    </button>
+                    <button class="btn btn-outline-info btn-sm rounded-pill fs-7 fw-semibold" title="ดูประวัติการเบิก-ยืม" onclick="openEmployeeBorrowHistoryModal('${emp.id}')">
+                      <i class="bi bi-clock-history me-1"></i> ประวัติฯ
+                    </button>
+                  </div>
                 </div>
               </div>
-              
-              <div class="d-flex flex-column gap-1">
-                <button class="btn btn-outline-success btn-sm rounded-pill fs-7 fw-semibold" title="สั่งพิมพ์บัตรประจำตัวรายบุคคล" onclick="openPrintEmployeeBadgeModal('${emp.id}')">
-                  <i class="bi bi-person-badge me-1"></i> พิมพ์
-                </button>
-                <button class="btn btn-outline-info btn-sm rounded-pill fs-7 fw-semibold" title="ดูประวัติการเบิก-ยืม" onclick="openEmployeeBorrowHistoryModal('${emp.id}')">
-                  <i class="bi bi-clock-history me-1"></i> ประวัติฯ
-                </button>
-                <button class="btn btn-outline-primary btn-sm rounded-pill fs-7" title="แก้ไขข้อมูลพนักงาน" onclick="openEditEmployeeModal('${emp.id}')">
-                  <i class="bi bi-pencil-square me-1"></i> แก้ไข
-                </button>
-                <button class="btn btn-outline-danger btn-sm rounded-pill fs-7" title="ลบรายชื่อพนักงาน" onclick="deleteEmployee('${emp.id}')">
-                  <i class="bi bi-trash me-1"></i> ลบ
-                </button>
-              </div>
-            </div>
-          </div>
-        `;
-      });
+            `;
+          });
+          cardsContainer.innerHTML = cardHtml;
+        }
+      }
 
-      container.innerHTML = html;
+      updateEmpBulkActionBar();
     }
+    window.renderEmployeeDirectory = renderEmployeeDirectory;
+
+    // --- BULK UPDATE EMPLOYEES LOGIC ---
+    window.openBulkUpdateEmpModal = function() {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('แก้ไขแผนกหรือตำแหน่งบุคลากร');
+      if (selectedEmpIds.size === 0) {
+        showToast("⚠️ กรุณาเลือกบุคลากรอย่างน้อย 1 รายการเพื่อทำรายการแบบกลุ่ม");
+        return;
+      }
+
+      const countText = document.getElementById('bulkEmpSelectedCountText');
+      if (countText) countText.textContent = selectedEmpIds.size;
+
+      const summaryContainer = document.getElementById('bulkEmpItemsSummary');
+      if (summaryContainer) {
+        let summaryHtml = '';
+        selectedEmpIds.forEach(empId => {
+          const emp = employeeList.find(x => x.id === empId);
+          if (emp) {
+            const name = formatEmpName(emp);
+            const dept = emp.department || 'ไม่ระบุ';
+            const safeName = typeof escapeHtml === 'function' ? escapeHtml(name) : name;
+            const safeDept = typeof escapeHtml === 'function' ? escapeHtml(dept) : dept;
+            summaryHtml += `<span class="badge bg-primary bg-opacity-10 text-primary border border-primary-subtle py-1 px-2.5 rounded-pill fs-8"><i class="bi bi-person-fill me-1"></i>${safeName} <small class="text-muted">(${safeDept})</small></span>`;
+          }
+        });
+        summaryContainer.innerHTML = summaryHtml || '<span class="text-muted fs-8">ไม่มีรายการ</span>';
+      }
+
+      // Populate Department Dropdown in Modal
+      const deptSelect = document.getElementById('bulkEmpDeptSelect');
+      if (deptSelect) {
+        deptSelect.innerHTML = '<option value="">-- เลือกแผนกที่ต้องการเปลี่ยน --</option>';
+        const groups = getDepartmentDropdownGroups(departmentsList);
+        for (const [key, grp] of Object.entries(groups)) {
+          if (grp && Array.isArray(grp.items) && grp.items.length > 0) {
+            const optGroup = document.createElement('optgroup');
+            optGroup.label = grp.label;
+            grp.items.forEach(dept => {
+              const opt = document.createElement('option');
+              opt.value = dept.name;
+              opt.textContent = dept.displayName;
+              optGroup.appendChild(opt);
+            });
+            deptSelect.appendChild(optGroup);
+          }
+        }
+        const customOpt = document.createElement('option');
+        customOpt.value = 'CUSTOM';
+        customOpt.textContent = '➕ กำหนดชื่อแผนกใหม่...';
+        deptSelect.appendChild(customOpt);
+      }
+
+      // Reset form states
+      const chkDept = document.getElementById('chkUpdateEmpDept');
+      const chkPos = document.getElementById('chkUpdateEmpPos');
+      if (chkDept) chkDept.checked = false;
+      if (chkPos) chkPos.checked = false;
+
+      const posSelect = document.getElementById('bulkEmpPosSelect');
+      if (posSelect) posSelect.value = '';
+      const customDeptInput = document.getElementById('bulkEmpCustomDeptInput');
+      if (customDeptInput) customDeptInput.value = '';
+
+      window.toggleBulkEmpDeptField(false);
+      window.toggleBulkEmpPosField(false);
+
+      const modalElem = document.getElementById('bulkUpdateEmpModal');
+      if (modalElem && typeof bootstrap !== 'undefined') {
+        const bsModal = new bootstrap.Modal(modalElem);
+        bsModal.show();
+      }
+    };
+
+    window.toggleBulkEmpDeptField = function(enabled) {
+      const container = document.getElementById('bulkEmpDeptContainer');
+      if (container) {
+        if (enabled) container.classList.remove('d-none');
+        else container.classList.add('d-none');
+      }
+    };
+
+    window.toggleBulkEmpCustomDeptInput = function(val) {
+      const customInput = document.getElementById('bulkEmpCustomDeptInput');
+      if (customInput) {
+        if (val === 'CUSTOM') customInput.classList.remove('d-none');
+        else customInput.classList.add('d-none');
+      }
+    };
+
+    window.toggleBulkEmpPosField = function(enabled) {
+      const container = document.getElementById('bulkEmpPosContainer');
+      if (container) {
+        if (enabled) container.classList.remove('d-none');
+        else container.classList.add('d-none');
+      }
+    };
+
+    window.executeBulkUpdateEmployees = async function() {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('แก้ไขแผนกหรือตำแหน่งบุคลากร');
+      if (selectedEmpIds.size === 0) {
+        showToast("⚠️ กรุณาเลือกบุคลากรอย่างน้อย 1 รายการ");
+        return;
+      }
+
+      const updateDeptChecked = document.getElementById('chkUpdateEmpDept')?.checked;
+      const updatePosChecked = document.getElementById('chkUpdateEmpPos')?.checked;
+
+      if (!updateDeptChecked && !updatePosChecked) {
+        showToast("⚠️ กรุณาเปิดใช้งานอย่างน้อย 1 หัวข้อที่ต้องการอัปเดต (แผนก หรือ ตำแหน่ง)");
+        return;
+      }
+
+      let newDept = null;
+      if (updateDeptChecked) {
+        const deptSelectVal = document.getElementById('bulkEmpDeptSelect')?.value;
+        if (deptSelectVal === 'CUSTOM') {
+          newDept = (document.getElementById('bulkEmpCustomDeptInput')?.value || '').trim();
+        } else {
+          newDept = deptSelectVal;
+        }
+
+        if (!newDept) {
+          showToast("⚠️ กรุณาระบุชื่อแผนกที่ต้องการอัปเดต");
+          return;
+        }
+      }
+
+      let newPos = null;
+      if (updatePosChecked) {
+        newPos = (document.getElementById('bulkEmpPosSelect')?.value || document.getElementById('bulkEmpPosInput')?.value || '').trim();
+        if (!newPos) {
+          showToast("⚠️ กรุณาเลือกตำแหน่งที่ต้องการอัปเดต");
+          return;
+        }
+      }
+
+      let updatedCount = 0;
+      const promises = [];
+
+      for (const empId of selectedEmpIds) {
+        const emp = employeeList.find(x => x.id === empId);
+        if (emp) {
+          const updateData = {};
+          if (updateDeptChecked && newDept) {
+            emp.department = newDept;
+            updateData.department = newDept;
+          }
+          if (updatePosChecked && newPos) {
+            emp.details = newPos;
+            emp.position = newPos;
+            updateData.details = newPos;
+            updateData.position = newPos;
+          }
+
+          updatedCount++;
+
+          if (isFirebaseReady && db) {
+            try {
+              promises.push(updateDoc(doc(db, "employees", emp.id), updateData));
+            } catch (err) {
+              console.warn("Firestore bulk employee update error:", err);
+            }
+          }
+        }
+      }
+
+      if (promises.length > 0) {
+        try {
+          await Promise.all(promises);
+        } catch (err) {
+          console.warn("Bulk update employees promise error:", err);
+        }
+      }
+
+      saveToLocalStorage();
+
+      if (typeof logAuditAction === 'function') {
+        const changesText = [
+          newDept ? `แผนก -> "${newDept}"` : '',
+          newPos ? `ตำแหน่ง -> "${newPos}"` : ''
+        ].filter(Boolean).join(' และ ');
+        logAuditAction('บุคลากร', 'แก้ไขแบบกลุ่ม', `อัปเดตข้อมูลบุคลากร ${updatedCount} คน: ${changesText}`, 'BULK_UPDATE');
+      }
+
+      showToast(`⚡ อัปเดตข้อมูลบุคลากรเรียบร้อยแล้วจำนวน ${updatedCount} คน`);
+
+      // Close Modal
+      const modalElem = document.getElementById('bulkUpdateEmpModal');
+      if (modalElem && typeof bootstrap !== 'undefined') {
+        const bsModal = bootstrap.Modal.getInstance(modalElem);
+        if (bsModal) bsModal.hide();
+      }
+
+      clearEmployeeSelections();
+      populateEmployeeDropdowns();
+      if (typeof populateDepartmentDropdowns === 'function') populateDepartmentDropdowns();
+      renderEmployeeDirectory();
+    };
+
+    window.executeBulkDeleteEmployees = async function() {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('ลบข้อมูลบุคลากร');
+      if (selectedEmpIds.size === 0) return;
+
+      const ok = await window.showConfirmDialog({
+        title: "ลบข้อมูลบุคลากร",
+        message: `ต้องการลบข้อมูลบุคลากรที่เลือกจำนวน ${selectedEmpIds.size} คน ใช่หรือไม่?`,
+        type: "danger",
+        confirmText: `ลบ ${selectedEmpIds.size} คน`
+      });
+      if (!ok) return;
+
+      let deletedCount = 0;
+      const deleteIds = Array.from(selectedEmpIds);
+
+      for (const empId of deleteIds) {
+        const idx = employeeList.findIndex(x => x.id === empId);
+        if (idx !== -1) {
+          employeeList.splice(idx, 1);
+          deletedCount++;
+
+          if (isFirebaseReady && db) {
+            try {
+              await deleteDoc(doc(db, "employees", empId));
+            } catch (err) {
+              console.warn("Firestore bulk employee delete error:", err);
+            }
+          }
+        }
+      }
+
+      saveToLocalStorage();
+
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('บุคลากร', 'ลบแบบกลุ่ม', `ลบข้อมูลบุคลากรจำนวน ${deletedCount} คน`, 'BULK_DELETE');
+      }
+
+      showToast(`🗑️ ลบข้อมูลบุคลากรเรียบร้อยแล้วจำนวน ${deletedCount} คน`);
+      clearEmployeeSelections();
+      populateEmployeeDropdowns();
+      renderEmployeeDirectory();
+    };
+
+    window.executeBulkPrintBadges = function() {
+      if (selectedEmpIds.size === 0) return;
+      openPrintEmployeeBadgeModal('ALL');
+    };
 
     function renderAttendanceTable() {
       const tbody = document.getElementById('attendanceTableBody');
@@ -4275,6 +6580,7 @@
 
     let staffSortField = 'code';
     let staffSortAsc = true;
+    let staffStockFilterMode = 'ALL';
 
     window.toggleStaffSort = function(field) {
       if (staffSortField === field) {
@@ -4293,21 +6599,33 @@
         const staffTabBtn = document.getElementById('manage-tab');
         if (staffTabBtn) staffTabBtn.click();
       }
-      const stockSelect = document.getElementById('staffStockSelect');
-      if (stockSelect) {
-        stockSelect.value = 'LOW_STOCK';
+      if (staffStockFilterMode === 'LOW_STOCK') {
+        staffStockFilterMode = 'ALL';
+        if (typeof showToast === 'function') {
+          showToast('📦 แสดงรายการอุปกรณ์ทุกระดับสต๊อกเรียบร้อยแล้ว');
+        }
+      } else {
+        staffStockFilterMode = 'LOW_STOCK';
+        if (typeof showToast === 'function') {
+          showToast('🚨 กรองแสดงเฉพาะรายการอุปกรณ์ที่มีสต๊อกต่ำกว่าขั้นต่ำเรียบร้อยแล้ว');
+        }
       }
       renderStaffTable();
-      if (typeof showToast === 'function') {
-        showToast('🚨 กรองแสดงเฉพาะรายการอุปกรณ์ที่มีสต๊อกต่ำกว่าขั้นต่ำเรียบร้อยแล้ว');
+    };
+
+    window.toggleLowStockFilterStaff = function() {
+      if (staffStockFilterMode === 'LOW_STOCK') {
+        staffStockFilterMode = 'ALL';
+        if (typeof showToast === 'function') showToast('📦 แสดงอุปกรณ์ทุกระดับสต๊อก');
+      } else {
+        staffStockFilterMode = 'LOW_STOCK';
+        if (typeof showToast === 'function') showToast('🚨 กรองแสดงเฉพาะรายการอุปกรณ์ที่มีสต๊อกต่ำกว่าขั้นต่ำ');
       }
+      renderStaffTable();
     };
 
     window.resetStaffStockFilter = function() {
-      const stockSelect = document.getElementById('staffStockSelect');
-      if (stockSelect) {
-        stockSelect.value = 'ALL';
-      }
+      staffStockFilterMode = 'ALL';
       renderStaffTable();
       if (typeof showToast === 'function') {
         showToast('📦 แสดงรายการอุปกรณ์ทุกระดับสต๊อกเรียบร้อยแล้ว');
@@ -4319,8 +6637,7 @@
       if (input) input.value = '';
       const catSelect = document.getElementById('staffCategorySelect');
       if (catSelect) catSelect.value = 'ALL';
-      const stockSelect = document.getElementById('staffStockSelect');
-      if (stockSelect) stockSelect.value = 'ALL';
+      staffStockFilterMode = 'ALL';
       renderStaffTable();
     };
 
@@ -4352,52 +6669,41 @@
       const navBadge = document.getElementById('manageLowStockBadge');
       if (!tbody) return;
 
-      const lowStockItems = equipmentList.filter(item => item.quantity <= (item.minQuantity !== undefined ? item.minQuantity : 3));
-      const currentStockFilter = document.getElementById('staffStockSelect')?.value || 'ALL';
+      const currentEqList = Array.isArray(equipmentList) ? equipmentList : [];
+      const lowStockItems = currentEqList.filter(item => {
+        const minQty = item.minQuantity !== undefined ? Number(item.minQuantity) : 3;
+        return (Number(item.quantity) || 0) < minQty;
+      });
+      const currentStockFilter = staffStockFilterMode;
 
-      // Render Flashing Red Alert Banner above Staff Inventory Table
-      if (bannerContainer) {
+      // Update Low Stock Count Badge & Active Button State for Staff Table
+      const staffLowStockBadge = document.getElementById('staffLowStockBadgeCount');
+      if (staffLowStockBadge) staffLowStockBadge.textContent = lowStockItems.length;
+      const btnStaffLowStock = document.getElementById('btnFilterLowStockStaff');
+      const btnStaffLowStockText = document.getElementById('btnStaffLowStockText');
+      if (btnStaffLowStock) {
         if (lowStockItems.length > 0) {
-          const isFilteringLowStock = (currentStockFilter === 'LOW_STOCK');
-          bannerContainer.innerHTML = `
-            <div class="card border-0 shadow-sm rounded-4 p-3 bg-danger bg-opacity-10 border-start border-4 border-danger low-stock-alert-banner">
-              <div class="d-flex flex-wrap align-items-center justify-content-between gap-3">
-                <div class="d-flex align-items-center gap-3">
-                  <div class="bg-danger text-white p-3 rounded-circle fs-3 animate-pulse-fast d-flex align-items-center justify-content-center" style="width: 50px; height: 50px; flex-shrink: 0;">
-                    <i class="bi bi-bell-fill"></i>
-                  </div>
-                  <div>
-                    <button type="button" class="btn btn-danger btn-sm rounded-pill px-3 py-2 fw-bold shadow-sm pulse-danger-badge" onclick="filterStaffLowStockOnly()">
-                      <i class="bi bi-funnel-fill me-1"></i> กรองแสดงเฉพาะสต๊อกต่ำ (${lowStockItems.length})
-                    </button>
-                  </div>
-                </div>
-                <div class="d-flex flex-wrap align-items-center gap-2">
-                  ${isFilteringLowStock ? `
-                    <button type="button" class="btn btn-outline-dark btn-sm rounded-pill px-3 py-2 fw-bold shadow-sm" onclick="resetStaffStockFilter()">
-                      <i class="bi bi-eye-fill me-1"></i> แสดงอุปกรณ์ทุกรายการ (${equipmentList.length})
-                    </button>
-                  ` : `
-                  `}
-                </div>
-              </div>
-            </div>
-          `;
+          btnStaffLowStock.classList.remove('d-none');
+          btnStaffLowStock.classList.add('d-inline-flex');
+          if (currentStockFilter === 'LOW_STOCK') {
+            btnStaffLowStock.classList.add('btn-low-stock-active');
+            if (btnStaffLowStockText) btnStaffLowStockText.textContent = 'แสดงสต๊อกทั้งหมด';
+          } else {
+            btnStaffLowStock.classList.remove('btn-low-stock-active');
+            if (btnStaffLowStockText) btnStaffLowStockText.textContent = 'แสดงสต๊อกต่ำ';
+          }
         } else {
-          bannerContainer.innerHTML = `
-            <div class="alert alert-success border-0 shadow-sm rounded-4 mb-0 d-flex align-items-center justify-content-between gap-2 py-2.5">
-              <div class="d-flex align-items-center gap-2">
-                <i class="bi bi-check-circle-fill fs-5 text-success"></i>
-                <span class="fs-7 fw-semibold text-success">สถานะคลังอุปกรณ์ปกติ: ไม่มีรายการใดมีสต๊อกต่ำกว่าขั้นต่ำที่กำหนด</span>
-              </div>
-              ${currentStockFilter === 'LOW_STOCK' ? `
-                <button type="button" class="btn btn-sm btn-outline-success rounded-pill px-3 py-1 fw-bold" onclick="resetStaffStockFilter()">
-                  <i class="bi bi-arrow-counterclockwise me-1"></i> แสดงอุปกรณ์ทุกรายการ
-                </button>
-              ` : ''}
-            </div>
-          `;
+          btnStaffLowStock.classList.add('d-none');
+          btnStaffLowStock.classList.remove('d-inline-flex', 'btn-low-stock-active');
+          if (btnStaffLowStockText) btnStaffLowStockText.textContent = 'แสดงสต๊อกต่ำ';
+          if (currentStockFilter === 'LOW_STOCK') {
+            staffStockFilterMode = 'ALL';
+          }
         }
+      }
+
+      if (bannerContainer) {
+        bannerContainer.innerHTML = '';
       }
 
       // Render Badge on Navigation Tab
@@ -4420,9 +6726,9 @@
       // Filter Logic
       const searchQuery = (document.getElementById('staffSearchInput')?.value || '').toLowerCase().trim();
       const selectedCat = document.getElementById('staffCategorySelect')?.value || 'ALL';
-      const selectedStockStatus = document.getElementById('staffStockSelect')?.value || 'ALL';
+      const selectedStockStatus = staffStockFilterMode;
 
-      let filtered = equipmentList.filter(item => {
+      let filtered = currentEqList.filter(item => {
         const nameStr = String(item.name || '').toLowerCase();
         const codeStr = String(item.code || '').toLowerCase();
         const catStr = String(item.category || '').toLowerCase();
@@ -4442,8 +6748,8 @@
 
         const matchesCategory = selectedCat === 'ALL' || item.category === selectedCat;
 
-        const minQty = item.minQuantity !== undefined ? item.minQuantity : 3;
-        const isLowStock = item.quantity <= minQty;
+        const minQty = item.minQuantity !== undefined ? Number(item.minQuantity) : 3;
+        const isLowStock = (Number(item.quantity) || 0) < minQty;
 
         let matchesStock = true;
         if (selectedStockStatus === 'LOW_STOCK') {
@@ -4519,7 +6825,7 @@
       if (filtered.length === 0) {
         tbody.innerHTML = `
           <tr>
-            <td colspan="8" class="text-center py-5 text-muted">
+            <td colspan="9" class="text-center py-5 text-muted">
               <i class="bi bi-search display-6 text-secondary d-block mb-2"></i>
               <div class="fw-bold">${selectedStockStatus === 'LOW_STOCK' ? '🎉 ไม่มีรายการอุปกรณ์ใดที่สต๊อกต่ำกว่าขั้นต่ำในขณะนี้' : 'ไม่พบรายการอุปกรณ์การเกษตรที่ตรงกับคำค้นหา'}</div>
               <small class="text-secondary">${searchQuery ? `คำค้นหา: "${searchQuery}"` : ''} ${selectedCat !== 'ALL' ? `หมวดหมู่: "${selectedCat}"` : ''} ${selectedStockStatus === 'LOW_STOCK' ? '(กรองเฉพาะสต๊อกต่ำกว่าขั้นต่ำ)' : ''}</small>
@@ -4531,6 +6837,7 @@
             </td>
           </tr>
         `;
+        if (typeof updateStaffBulkActionBar === 'function') updateStaffBulkActionBar();
         return;
       }
 
@@ -4538,24 +6845,29 @@
       const isStaff = currentRole === 'STAFF' || currentRole === 'ADMIN' || currentRole === 'MANAGER';
 
       filtered.forEach(item => {
-        const minQty = item.minQuantity !== undefined ? item.minQuantity : 3;
-        const isLowStock = item.quantity <= minQty;
+        const minQty = item.minQuantity !== undefined ? Number(item.minQuantity) : 3;
+        const curQty = Number(item.quantity) || 0;
+        const isLowStock = curQty < minQty;
         const rowClass = isLowStock ? 'low-stock-row' : '';
+        const isChecked = window.selectedStaffItemIds && window.selectedStaffItemIds.has(item.id);
 
         let stockBadge = '';
         if (isLowStock) {
-          stockBadge = `<span class="badge bg-danger text-white pulse-danger-badge fs-7 px-3 py-1.5"><i class="bi bi-exclamation-triangle-fill me-1"></i> ${item.quantity} ${item.unit} (วิกฤต ≤ ${minQty})</span>`;
-        } else if (item.quantity <= minQty + 2) {
-          stockBadge = `<span class="badge bg-warning text-dark fs-7 px-2.5 py-1.5"><i class="bi bi-exclamation-circle-fill me-1"></i> ${item.quantity} ${item.unit} (ใกล้ขั้นต่ำ ${minQty})</span>`;
+          stockBadge = `<span class="badge bg-danger text-white pulse-danger-badge fs-7 px-3 py-1.5"><i class="bi bi-exclamation-triangle-fill me-1"></i> ${curQty} ${item.unit} (ต่ำกว่าขั้นต่ำ < ${minQty})</span>`;
+        } else if (curQty === minQty || curQty <= minQty + 2) {
+          stockBadge = `<span class="badge bg-warning text-dark fs-7 px-2.5 py-1.5"><i class="bi bi-exclamation-circle-fill me-1"></i> ${curQty} ${item.unit} (ใกล้ขั้นต่ำ ${minQty})</span>`;
         } else {
-          stockBadge = `<span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 fs-7 px-2.5 py-1.5">${item.quantity} ${item.unit} (ขั้นต่ำ ${minQty})</span>`;
+          stockBadge = `<span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 fs-7 px-2.5 py-1.5">${curQty} ${item.unit} (ขั้นต่ำ ${minQty})</span>`;
         }
 
         html += `
           <tr class="${rowClass}">
-            <td class="ps-3" style="width: 70px;">
+            <td class="ps-3 text-center" style="width: 45px;">
+              <input type="checkbox" class="form-check-input staff-item-checkbox cursor-pointer" value="${item.id}" ${isChecked ? 'checked' : ''} onchange="toggleStaffItemSelect('${item.id}', this.checked)" onclick="event.stopPropagation()" />
+            </td>
+            <td class="ps-2" style="width: 70px;">
               <div class="position-relative ${isStaff ? 'cursor-pointer' : ''} d-inline-block" ${isStaff ? `onclick="openEquipmentPopupMenu('${item.id}')" title="คลิกรูปภาพเพื่อเปิดเมนู (Popup Menu)"` : ''}>
-                <img src="${item.imageUrl}" style="width: 48px; height: 48px; object-fit: cover; border-radius: 8px;" onerror="this.src='${DEFAULT_EQUIPMENT_IMAGE}'" />
+                <img src="${item.imageUrl}" loading="lazy" style="width: 48px; height: 48px; object-fit: cover; border-radius: 8px;" onerror="this.src='${DEFAULT_EQUIPMENT_IMAGE}'" />
                 ${isStaff ? `
                   <span class="position-absolute bottom-0 end-0 bg-dark text-white rounded-circle p-1 d-flex align-items-center justify-content-center shadow-sm" style="width: 18px; height: 18px; font-size: 10px;">
                     <i class="bi bi-three-dots"></i>
@@ -4579,11 +6891,11 @@
             </td>
             <td class="text-center">
               ${(item.borrowedCount || 0) > 0 ? `
-                <button type="button" class="btn btn-sm btn-outline-warning text-dark fw-bold rounded-pill px-2.5 py-1 shadow-sm d-inline-flex align-items-center gap-1" onclick="showEquipmentBorrowersModal('${item.id}')" title="กดดูรายชื่อผู้ยืมอุปกรณ์นี้">
-                  <i class="bi bi-people-fill text-warning"></i> ${item.borrowedCount} ${item.unit} <span class="badge bg-dark text-white rounded-pill ms-0.5" style="font-size: 8px;">ดูผู้ยืม</span>
+                <button type="button" class="btn btn-sm btn-outline-warning text-dark fw-bold rounded-pill px-2.5 py-1 shadow-sm" onclick="showEquipmentBorrowersModal('${item.id}')" title="กดดูรายชื่อผู้ยืมอุปกรณ์นี้ (${item.borrowedCount} ${escapeHtml(item.unit || '')})">
+                  ยืม ${item.borrowedCount}
                 </button>
               ` : `
-                <span class="text-muted fs-8">0 ${item.unit}</span>
+                <span class="text-muted fs-8">ยืม 0</span>
               `}
             </td>
             <td class="fs-7 text-secondary"><i class="bi bi-geo-alt me-1 text-danger"></i>${item.location || 'คลังกลาง'}</td>
@@ -4601,7 +6913,416 @@
       });
 
       tbody.innerHTML = html;
+      if (typeof updateStaffBulkActionBar === 'function') updateStaffBulkActionBar();
     }
+
+    // ==========================================
+    // MULTI-SELECT & BULK ACTIONS LOGIC
+    // ==========================================
+    window.selectedStaffItemIds = window.selectedStaffItemIds || new Set();
+
+    window.toggleStaffItemSelect = function(itemId, isChecked) {
+      if (isChecked) {
+        window.selectedStaffItemIds.add(itemId);
+      } else {
+        window.selectedStaffItemIds.delete(itemId);
+      }
+      window.updateStaffBulkActionBar();
+    };
+
+    window.toggleSelectAllStaffItems = function(checkboxElem) {
+      const isChecked = checkboxElem ? checkboxElem.checked : false;
+      const tbody = document.getElementById('staffInventoryTableBody');
+      if (!tbody) return;
+      const rowCheckboxes = tbody.querySelectorAll('.staff-item-checkbox');
+      rowCheckboxes.forEach(cb => {
+        cb.checked = isChecked;
+        if (isChecked) {
+          window.selectedStaffItemIds.add(cb.value);
+        } else {
+          window.selectedStaffItemIds.delete(cb.value);
+        }
+      });
+      window.updateStaffBulkActionBar();
+    };
+
+    window.clearStaffItemSelections = function() {
+      window.selectedStaffItemIds.clear();
+      const selectAll = document.getElementById('selectAllStaffItems');
+      if (selectAll) {
+        selectAll.checked = false;
+        selectAll.indeterminate = false;
+      }
+      const tbody = document.getElementById('staffInventoryTableBody');
+      if (tbody) {
+        tbody.querySelectorAll('.staff-item-checkbox').forEach(cb => cb.checked = false);
+      }
+      window.updateStaffBulkActionBar();
+    };
+
+    window.updateStaffBulkActionBar = function() {
+      const bar = document.getElementById('staffBulkActionBar');
+      const countSpan = document.getElementById('staffSelectedCountText');
+      const selectAllHeader = document.getElementById('selectAllStaffItems');
+      const tbody = document.getElementById('staffInventoryTableBody');
+
+      const selectedCount = window.selectedStaffItemIds ? window.selectedStaffItemIds.size : 0;
+
+      if (countSpan) countSpan.textContent = selectedCount;
+
+      if (bar) {
+        if (selectedCount > 0) {
+          bar.classList.remove('d-none');
+        } else {
+          bar.classList.add('d-none');
+        }
+      }
+
+      if (tbody && selectAllHeader) {
+        const visibleCheckboxes = Array.from(tbody.querySelectorAll('.staff-item-checkbox'));
+        if (visibleCheckboxes.length > 0) {
+          const checkedCount = visibleCheckboxes.filter(cb => cb.checked).length;
+          if (checkedCount === visibleCheckboxes.length) {
+            selectAllHeader.checked = true;
+            selectAllHeader.indeterminate = false;
+          } else if (checkedCount > 0) {
+            selectAllHeader.checked = false;
+            selectAllHeader.indeterminate = true;
+          } else {
+            selectAllHeader.checked = false;
+            selectAllHeader.indeterminate = false;
+          }
+        } else {
+          selectAllHeader.checked = false;
+          selectAllHeader.indeterminate = false;
+        }
+      }
+    };
+
+    // --- BULK UPDATE LOCATION ---
+    window.openBulkUpdateLocationModal = function() {
+      const selectedIds = Array.from(window.selectedStaffItemIds || []);
+      if (selectedIds.length === 0) {
+        showToast('⚠️ กรุณาเลือกรายการอุปกรณ์อย่างน้อย 1 รายการเพื่อดำเนินการ');
+        return;
+      }
+
+      const selectedItems = equipmentList.filter(item => window.selectedStaffItemIds.has(item.id));
+
+      const countElem = document.getElementById('bulkLocSelectedCountText');
+      if (countElem) countElem.textContent = selectedItems.length;
+
+      const summaryContainer = document.getElementById('bulkLocItemsSummary');
+      if (summaryContainer) {
+        summaryContainer.innerHTML = selectedItems.map(item => `
+          <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 rounded-pill fs-8">
+            [${item.code}] ${item.name} <small class="text-muted">(${item.location || 'คลังกลาง'})</small>
+          </span>
+        `).join('');
+      }
+
+      const locSelect = document.getElementById('bulkLocationSelect');
+      if (locSelect) {
+        locSelect.innerHTML = '<option value="">-- เลือกสถานที่เก็บ --</option>';
+        const locations = Array.from(new Set(equipmentList.map(x => x.location).filter(Boolean)));
+        if (!locations.includes('คลังกลาง')) locations.unshift('คลังกลาง');
+        locations.forEach(loc => {
+          const opt = document.createElement('option');
+          opt.value = loc;
+          opt.textContent = `📍 ${loc}`;
+          locSelect.appendChild(opt);
+        });
+        const customOpt = document.createElement('option');
+        customOpt.value = 'CUSTOM';
+        customOpt.textContent = '➕ ระบุสถานที่เก็บใหม่เพิ่มเติม...';
+        locSelect.appendChild(customOpt);
+      }
+
+      const customInput = document.getElementById('bulkLocationCustomInput');
+      if (customInput) {
+        customInput.value = '';
+        customInput.classList.add('d-none');
+      }
+
+      const modalElem = document.getElementById('bulkUpdateLocationModal');
+      if (modalElem) new bootstrap.Modal(modalElem).show();
+    };
+
+    window.toggleBulkCustomLocationInput = function(val) {
+      const customInput = document.getElementById('bulkLocationCustomInput');
+      if (customInput) {
+        if (val === 'CUSTOM') customInput.classList.remove('d-none');
+        else customInput.classList.add('d-none');
+      }
+    };
+
+    window.executeBulkUpdateLocation = async function() {
+      const selectElem = document.getElementById('bulkLocationSelect');
+      let targetLoc = selectElem ? selectElem.value : '';
+      if (targetLoc === 'CUSTOM') {
+        targetLoc = (document.getElementById('bulkLocationCustomInput')?.value || '').trim();
+      }
+
+      if (!targetLoc) {
+        alert('กรุณาระบุสถานที่เก็บที่ต้องการอัปเดต');
+        return;
+      }
+
+      const selectedIds = Array.from(window.selectedStaffItemIds || []);
+      let updatedCount = 0;
+
+      for (const id of selectedIds) {
+        const item = equipmentList.find(x => x.id === id);
+        if (item) {
+          item.location = targetLoc;
+          updatedCount++;
+          if (isFirebaseReady && db) {
+            try {
+              await setDoc(doc(db, "equipment", id), item, { merge: true });
+            } catch (e) {
+              console.error("Error updating location in Firestore:", e);
+            }
+          }
+        }
+      }
+
+      saveToLocalStorage();
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('BULK_UPDATE_LOCATION', currentUser ? currentUser.displayName || currentUser.email : 'Staff', `อัปเดตสถานที่เก็บ ${updatedCount} รายการ เป็น "${targetLoc}"`);
+      }
+
+      const modalElem = document.getElementById('bulkUpdateLocationModal');
+      const modalInst = bootstrap.Modal.getInstance(modalElem);
+      if (modalInst) modalInst.hide();
+
+      renderStaffTable();
+      showToast(`📍 อัปเดตสถานที่เก็บ ${updatedCount} รายการ เป็น "${targetLoc}" เรียบร้อยแล้ว!`);
+    };
+
+    // --- BULK ADD TO PRINT QUEUE / PRINT LABELS ---
+    window.openBulkAddToPrintQueueModal = function() {
+      const selectedIds = Array.from(window.selectedStaffItemIds || []);
+      if (selectedIds.length === 0) {
+        showToast('⚠️ กรุณาเลือกรายการอุปกรณ์อย่างน้อย 1 รายการเพื่อพิมพ์ฉลาก');
+        return;
+      }
+
+      openPrintLabelModal('SELECTED');
+      showToast(`🖨️ เพิ่มอุปกรณ์ ${selectedIds.length} รายการ ลงในคิวพิมพ์ฉลาก QR/Barcode เรียบร้อยแล้ว`);
+    };
+
+    // --- BULK UPDATE CATEGORY ---
+    window.openBulkUpdateCategoryModal = function() {
+      const selectedIds = Array.from(window.selectedStaffItemIds || []);
+      if (selectedIds.length === 0) {
+        showToast('⚠️ กรุณาเลือกรายการอุปกรณ์อย่างน้อย 1 รายการ');
+        return;
+      }
+
+      const selectedItems = equipmentList.filter(item => window.selectedStaffItemIds.has(item.id));
+
+      const countElem = document.getElementById('bulkCatSelectedCountText');
+      if (countElem) countElem.textContent = selectedItems.length;
+
+      const summaryContainer = document.getElementById('bulkCatItemsSummary');
+      if (summaryContainer) {
+        summaryContainer.innerHTML = selectedItems.map(item => `
+          <span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 rounded-pill fs-8">
+            [${item.code}] ${item.name} <small class="text-muted">(${item.category})</small>
+          </span>
+        `).join('');
+      }
+
+      const catSelect = document.getElementById('bulkCategorySelect');
+      if (catSelect) {
+        catSelect.innerHTML = '<option value="">-- เลือกหมวดหมู่ --</option>';
+        const categories = window.categoriesList || Array.from(new Set(equipmentList.map(x => x.category).filter(Boolean)));
+        categories.forEach(cat => {
+          const opt = document.createElement('option');
+          opt.value = cat;
+          opt.textContent = `📂 ${cat}`;
+          catSelect.appendChild(opt);
+        });
+      }
+
+      const modalElem = document.getElementById('bulkUpdateCategoryModal');
+      if (modalElem) new bootstrap.Modal(modalElem).show();
+    };
+
+    window.executeBulkUpdateCategory = async function() {
+      const catSelect = document.getElementById('bulkCategorySelect');
+      const targetCategory = catSelect ? catSelect.value : '';
+
+      if (!targetCategory) {
+        alert('กรุณาเลือกหมวดหมู่ใหม่ที่ต้องการอัปเดต');
+        return;
+      }
+
+      const selectedIds = Array.from(window.selectedStaffItemIds || []);
+      let updatedCount = 0;
+
+      for (const id of selectedIds) {
+        const item = equipmentList.find(x => x.id === id);
+        if (item) {
+          item.category = targetCategory;
+          updatedCount++;
+          if (isFirebaseReady && db) {
+            try {
+              await setDoc(doc(db, "equipment", id), item, { merge: true });
+            } catch (e) {
+              console.error("Error updating category in Firestore:", e);
+            }
+          }
+        }
+      }
+
+      saveToLocalStorage();
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('BULK_UPDATE_CATEGORY', currentUser ? currentUser.displayName || currentUser.email : 'Staff', `เปลี่ยนหมวดหมู่อุปกรณ์ ${updatedCount} รายการ เป็น "${targetCategory}"`);
+      }
+
+      const modalElem = document.getElementById('bulkUpdateCategoryModal');
+      const modalInst = bootstrap.Modal.getInstance(modalElem);
+      if (modalInst) modalInst.hide();
+
+      renderStaffTable();
+      showToast(`📂 เปลี่ยนหมวดหมู่อุปกรณ์ ${updatedCount} รายการ เป็น "${targetCategory}" เรียบร้อยแล้ว!`);
+    };
+
+    // --- BULK RESTOCK ---
+    window.openBulkRestockModal = function() {
+      const selectedIds = Array.from(window.selectedStaffItemIds || []);
+      if (selectedIds.length === 0) {
+        showToast('⚠️ กรุณาเลือกรายการอุปกรณ์อย่างน้อย 1 รายการ');
+        return;
+      }
+
+      const selectedItems = equipmentList.filter(item => window.selectedStaffItemIds.has(item.id));
+
+      const countElem = document.getElementById('bulkRestockSelectedCountText');
+      if (countElem) countElem.textContent = selectedItems.length;
+
+      const summaryContainer = document.getElementById('bulkRestockItemsSummary');
+      if (summaryContainer) {
+        summaryContainer.innerHTML = selectedItems.map(item => `
+          <span class="badge bg-warning bg-opacity-10 text-dark border border-warning rounded-pill fs-8">
+            [${item.code}] ${item.name} <small class="fw-bold">(${item.quantity} ${item.unit})</small>
+          </span>
+        `).join('');
+      }
+
+      const qtyInput = document.getElementById('bulkRestockQtyInput');
+      if (qtyInput) qtyInput.value = 5;
+
+      const modalElem = document.getElementById('bulkRestockModal');
+      if (modalElem) new bootstrap.Modal(modalElem).show();
+    };
+
+    window.executeBulkRestock = async function() {
+      const qtyInput = document.getElementById('bulkRestockQtyInput');
+      const addQty = parseInt(qtyInput ? qtyInput.value : 0) || 0;
+      const noteInput = document.getElementById('bulkRestockNoteInput');
+      const restockNote = (noteInput ? noteInput.value : '').trim() || 'เติมสต๊อกแบบกลุ่ม (Bulk Restock)';
+
+      if (addQty <= 0) {
+        alert('กรุณาระบุจำนวนสต๊อกที่ต้องการเพิ่มมากกว่า 0');
+        return;
+      }
+
+      const selectedIds = Array.from(window.selectedStaffItemIds || []);
+      let updatedCount = 0;
+
+      for (const id of selectedIds) {
+        const item = equipmentList.find(x => x.id === id);
+        if (item) {
+          item.quantity = (Number(item.quantity) || 0) + addQty;
+          updatedCount++;
+
+          // Log transaction
+          const newTx = {
+            id: 'tx-' + String(Date.now()).slice(-6) + '-' + Math.floor(Math.random()*100),
+            type: 'เติมสต๊อก',
+            employeeId: currentUser ? currentUser.uid : 'STAFF',
+            employeeName: currentUser ? (currentUser.displayName || currentUser.email) : 'พนักงานคลัง',
+            equipmentId: item.id,
+            equipmentName: `${item.name} [${item.code}]`,
+            quantity: addQty,
+            unit: item.unit || 'ชิ้น',
+            location: item.location || 'คลังกลาง',
+            note: restockNote,
+            rawTimestamp: Date.now(),
+            timestamp: new Date().toLocaleString('th-TH')
+          };
+          transactionHistory.unshift(newTx);
+
+          if (isFirebaseReady && db) {
+            try {
+              await setDoc(doc(db, "equipment", id), item, { merge: true });
+              await addDoc(collection(db, "transactions"), newTx);
+            } catch (e) {
+              console.error("Error restocking in Firestore:", e);
+            }
+          }
+        }
+      }
+
+      saveToLocalStorage();
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('BULK_RESTOCK', currentUser ? currentUser.displayName || currentUser.email : 'Staff', `เติมสต๊อกอุปกรณ์ ${updatedCount} รายการ รายการละ +${addQty}`);
+      }
+
+      const modalElem = document.getElementById('bulkRestockModal');
+      const modalInst = bootstrap.Modal.getInstance(modalElem);
+      if (modalInst) modalInst.hide();
+
+      renderStaffTable();
+      if (typeof renderHistoryTable === 'function') renderHistoryTable();
+      showToast(`⚡ เติมสต๊อกอุปกรณ์ ${updatedCount} รายการ รายการละ +${addQty} เรียบร้อยแล้ว!`);
+    };
+
+    // --- BULK DELETE ---
+    window.executeBulkDeleteItems = async function() {
+      const selectedIds = Array.from(window.selectedStaffItemIds || []);
+      if (selectedIds.length === 0) {
+        showToast('⚠️ กรุณาเลือกรายการอุปกรณ์อย่างน้อย 1 รายการ');
+        return;
+      }
+
+      const confirmed = await window.showConfirmDialog({
+        title: "ลบอุปกรณ์ที่เลือก",
+        message: `ต้องการลบอุปกรณ์ที่เลือกทั้งหมด ${selectedIds.length} รายการ ใช่หรือไม่?`,
+        type: "danger",
+        confirmText: `ลบ ${selectedIds.length} รายการ`
+      });
+      if (!confirmed) return;
+
+      let deletedCount = 0;
+      for (const id of selectedIds) {
+        const idx = equipmentList.findIndex(x => x.id === id);
+        if (idx >= 0) {
+          const item = equipmentList[idx];
+          equipmentList.splice(idx, 1);
+          deletedCount++;
+
+          if (isFirebaseReady && db) {
+            try {
+              await deleteDoc(doc(db, "equipment", id));
+            } catch (e) {
+              console.error("Error deleting item in Firestore:", e);
+            }
+          }
+        }
+      }
+
+      window.selectedStaffItemIds.clear();
+      saveToLocalStorage();
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('BULK_DELETE', currentUser ? currentUser.displayName || currentUser.email : 'Staff', `ลบอุปกรณ์คลังแบบกลุ่ม ${deletedCount} รายการ`);
+      }
+
+      renderStaffTable();
+      showToast(`🗑️ ลบรายการอุปกรณ์ที่เลือก ${deletedCount} รายการ เรียบร้อยแล้ว`);
+    };
 
     window.clearAllHistoryLog = async function() {
       if (currentRole !== 'ADMIN') {
@@ -4616,9 +7337,13 @@
 
       const totalCount = transactionHistory.length;
 
-      if (!confirm(`⚠️ คุณแน่ใจหรือไม่ว่าต้องการลบ "ประวัติการทำรายการทั้งหมด" (${totalCount} รายการ)?\n\nการดำเนินการนี้ไม่สามารถย้อนกลับได้!`)) {
-        return;
-      }
+      const ok = await window.showConfirmDialog({
+        title: "ลบประวัติทั้งหมด",
+        message: `ต้องการลบประวัติการทำรายการทั้งหมด (${totalCount} รายการ) ใช่หรือไม่?`,
+        type: "danger",
+        confirmText: "ลบประวัติทั้งหมด"
+      });
+      if (!ok) return;
 
       // Delete from Firestore if database is ready
       if (isFirebaseReady && db) {
@@ -4752,10 +7477,116 @@
       renderHistoryTable();
     };
 
+    window.updateDailyTransactionSummary = function updateDailyTransactionSummary() {
+      const container = document.getElementById('dailyTransactionSummaryContainer');
+      if (!container) return;
+
+      const now = new Date();
+      const todayYear = now.getFullYear();
+      const todayMonth = now.getMonth();
+      const todayDate = now.getDate();
+
+      let issueCount = 0;
+      let borrowCount = 0;
+      let returnCount = 0;
+      let receiveCount = 0;
+      let totalToday = 0;
+
+      const txs = Array.isArray(window.transactionHistory) ? window.transactionHistory : [];
+
+      txs.forEach(tx => {
+        if (!tx) return;
+        const ms = typeof window.getRecordTimestampMs === 'function' ? window.getRecordTimestampMs(tx) : 0;
+        if (ms <= 0) return;
+
+        const txDate = new Date(ms);
+        if (isNaN(txDate.getTime())) return;
+
+        if (txDate.getFullYear() === todayYear &&
+            txDate.getMonth() === todayMonth &&
+            txDate.getDate() === todayDate) {
+
+          totalToday++;
+          const type = (tx.type || '').trim();
+
+          if (type === 'เบิกจ่าย' || type === 'เบิก' || type.toLowerCase().includes('issue')) {
+            issueCount++;
+          } else if (type === 'ยืมอุปกรณ์' || type === 'ยืม' || type.toLowerCase().includes('borrow')) {
+            borrowCount++;
+          } else if (type === 'คืนอุปกรณ์' || type === 'คืน' || type.toLowerCase().includes('return')) {
+            returnCount++;
+          } else if (type.includes('รับเข้า') || type.includes('เติม') || type.toLowerCase().includes('receive')) {
+            receiveCount++;
+          } else {
+            if (type.includes('เบิก')) issueCount++;
+            else if (type.includes('ยืม')) borrowCount++;
+            else if (type.includes('คืน')) returnCount++;
+            else receiveCount++;
+          }
+        }
+      });
+
+      const thaiDateStr = now.toLocaleDateString('th-TH', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric'
+      });
+
+      container.innerHTML = `
+        <div class="card border-0 shadow-sm rounded-4 p-3 mb-3 bg-white border-start border-4 border-primary">
+          <div class="d-flex flex-wrap align-items-center justify-content-between gap-3">
+            <div class="d-flex align-items-center gap-2.5">
+              <div class="bg-primary-subtle text-primary p-2 rounded-3 d-flex align-items-center justify-content-center shadow-sm" style="width: 42px; height: 42px;">
+                <i class="bi bi-calendar2-check-fill fs-5"></i>
+              </div>
+              <div>
+                <h6 class="fw-bold mb-0 text-dark">สรุปรายการวันนี้</h6>
+                <span class="text-muted fs-8"><i class="bi bi-clock-history me-1"></i>ประจำวันที่ ${thaiDateStr}</span>
+              </div>
+            </div>
+
+            <div class="d-flex flex-wrap align-items-center gap-2 ms-auto">
+              <div class="bg-danger-subtle text-danger border border-danger-subtle rounded-3 px-3 py-1.5 text-center shadow-2xs" style="min-width: 100px;">
+                <div class="fs-9 text-uppercase fw-bold text-muted mb-0"><i class="bi bi-arrow-up-right-circle me-1 text-danger"></i>เบิก</div>
+                <div class="fs-5 fw-extrabold text-danger mb-0">${issueCount} <span class="fs-9 text-muted font-normal">รายการ</span></div>
+              </div>
+
+              <div class="bg-warning-subtle text-warning-emphasis border border-warning-subtle rounded-3 px-3 py-1.5 text-center shadow-2xs" style="min-width: 100px;">
+                <div class="fs-9 text-uppercase fw-bold text-muted mb-0"><i class="bi bi-box-arrow-up-right me-1 text-warning-emphasis"></i>ยืม</div>
+                <div class="fs-5 fw-extrabold text-dark mb-0">${borrowCount} <span class="fs-9 text-muted font-normal">รายการ</span></div>
+              </div>
+
+              <div class="bg-info-subtle text-info-emphasis border border-info-subtle rounded-3 px-3 py-1.5 text-center shadow-2xs" style="min-width: 100px;">
+                <div class="fs-9 text-uppercase fw-bold text-muted mb-0"><i class="bi bi-box-arrow-in-down-left me-1 text-info-emphasis"></i>คืน</div>
+                <div class="fs-5 fw-extrabold text-primary mb-0">${returnCount} <span class="fs-9 text-muted font-normal">รายการ</span></div>
+              </div>
+
+              <div class="bg-success-subtle text-success border border-success-subtle rounded-3 px-3 py-1.5 text-center shadow-2xs" style="min-width: 100px;">
+                <div class="fs-9 text-uppercase fw-bold text-muted mb-0"><i class="bi bi-plus-circle me-1 text-success"></i>รับเข้า</div>
+                <div class="fs-5 fw-extrabold text-success mb-0">${receiveCount} <span class="fs-9 text-muted font-normal">รายการ</span></div>
+              </div>
+
+              <div class="bg-primary text-white rounded-3 px-3 py-1.5 text-center shadow-sm" style="min-width: 105px;">
+                <div class="fs-9 text-uppercase fw-bold text-white-70 mb-0"><i class="bi bi-hash me-1"></i>รวมวันนี้</div>
+                <div class="fs-5 fw-extrabold text-white mb-0">${totalToday} <span class="fs-9 text-white-70 font-normal">รายการ</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    };
+
     window.renderHistoryTable = function renderHistoryTable() {
       const tbody = document.getElementById('historyTableBody');
       const filterType = document.getElementById('historyFilterType')?.value || 'ALL';
       const searchQuery = (document.getElementById('historySearchInput')?.value || '').toLowerCase().trim();
+      const isAdmin = (typeof currentRole !== 'undefined' && currentRole === 'ADMIN');
+
+      // Update Daily Summary Overview Card
+      if (typeof window.updateDailyTransactionSummary === 'function') {
+        window.updateDailyTransactionSummary();
+      }
+
       if (!tbody) return;
 
       // Update sort header icons
@@ -4881,9 +7712,9 @@
         } else if (tx.type === 'ยืมอุปกรณ์') {
           typeBadge = '<span class="badge bg-warning text-dark"><i class="bi bi-arrow-repeat me-1"></i> ยืมอุปกรณ์</span>';
         } else if (tx.type === 'คืนอุปกรณ์') {
-          typeBadge = '<span class="badge bg-info text-dark"><i class="bi bi-box-arrow-in-down me-1"></i> คืนอุปกรณ์</span>';
+          typeBadge = '<span class="badge fw-bold shadow-sm px-2.5 py-1.5" style="background-color: #0dcaf0 !important; color: #000000 !important;"><i class="bi bi-box-arrow-in-down me-1"></i> คืนอุปกรณ์</span>';
         } else if (tx.type === 'รับเข้าสต๊อก (ขาเข้า)' || tx.type === 'รับเข้าสต๊อก' || tx.type === 'เติมสต๊อกด่วน') {
-          typeBadge = '<span class="badge bg-success"><i class="bi bi-box-arrow-in-down-left me-1"></i> รับเข้าสต๊อก</span>';
+          typeBadge = '<span class="badge text-white fw-bold shadow-sm px-2.5 py-1.5" style="background-color: #00c853 !important; color: #ffffff !important;"><i class="bi bi-box-arrow-in-down-left me-1"></i> รับเข้าสต๊อก</span>';
         } else {
           typeBadge = `<span class="badge bg-secondary">${tx.type}</span>`;
         }
@@ -4912,18 +7743,27 @@
             <td class="fw-semibold text-dark">${tx.employeeName || '-'}</td>
             <td>${itemsDisplay}</td>
             <td class="text-center fw-bold fs-6">${tx.quantity !== undefined ? tx.quantity : '-'} ${tx.unit || 'ชิ้น'}</td>
-            <td class="fs-7 text-muted">
+            <td class="fs-7 text-muted" style="max-width: 220px; min-width: 150px;">
               <div><i class="bi bi-geo-alt me-1 text-danger"></i> ${tx.location || '-'}</div>
-              ${tx.note ? `<div><i class="bi bi-chat-left-text me-1"></i> ${tx.note}</div>` : ''}
+              ${tx.note ? `
+                <div class="note-single-line-scroll py-0.5 text-secondary" style="max-width: 220px;" title="${escapeHtml(tx.note)}">
+                  <i class="bi bi-chat-left-text me-1 text-secondary"></i>${escapeHtml(tx.note)}
+                </div>
+              ` : ''}
             </td>
             <td class="text-end pe-3">
               <div class="d-flex align-items-center justify-content-end gap-1">
-                <button type="button" class="btn btn-sm btn-outline-success rounded-pill px-2 py-0.5 fs-8 fw-semibold" onclick="openPrintTransactionVoucherModal('${tx.id}')" title="พิมพ์เอกสาร">
-                  <i class="bi bi-printer-fill me-1"></i>พิมพ์
+                <button type="button" class="btn btn-sm btn-outline-success rounded-pill px-2.5 py-0.5 fs-8 fw-semibold" onclick="openPrintTransactionVoucherModal('${tx.id}')" title="พิมพ์เอกสาร">
+                  พิมพ์
                 </button>
-                <button type="button" class="btn btn-sm btn-outline-danger rounded-pill px-2 py-0.5 fs-8 fw-semibold" onclick="deleteDbRecord('transactions', '${tx.id}')" title="ลบรายการประวัตินี้">
-                  <i class="bi bi-trash3-fill me-1"></i>ลบ
+                <button type="button" class="btn btn-sm btn-outline-primary rounded-pill px-2.5 py-0.5 fs-8 fw-semibold" onclick="openEditTransactionModal('${tx.id}')" title="แก้ไขวันที่และจำนวน">
+                  แก้ไข
                 </button>
+                ${isAdmin ? `
+                  <button type="button" class="btn btn-sm btn-outline-danger rounded-pill px-2.5 py-0.5 fs-8 fw-semibold" onclick="deleteTransactionRecord('${tx.id}')" title="ลบรายการประวัตินี้">
+                    ลบ
+                  </button>
+                ` : ''}
               </div>
             </td>
           </tr>
@@ -5289,11 +8129,16 @@
     window.deleteSingleAuditLog = async function(logId) {
       if (!logId) return;
       if (!window.isThammaSrithongAdmin()) {
-        if (typeof showToast === 'function') showToast("⚠️ เฉพาะ Thamma Srithong (ผู้ดูแลระบบ) เท่านั้นที่มีสิทธิ์ลบประวัติการเปลี่ยนแปลง");
-        else alert("⚠️ เฉพาะ Thamma Srithong (ผู้ดูแลระบบ) เท่านั้นที่มีสิทธิ์ลบประวัติการเปลี่ยนแปลง");
+        showToast("⚠️ เฉพาะ Thamma Srithong (ผู้ดูแลระบบ) เท่านั้นที่มีสิทธิ์ลบประวัติการเปลี่ยนแปลง");
         return;
       }
-      if (confirm('คุณต้องการลบประวัติการเปลี่ยนแปลงรายการนี้ใช่หรือไม่?')) {
+      const ok = await window.showConfirmDialog({
+        title: "ลบประวัติการเปลี่ยนแปลง",
+        message: "ต้องการลบประวัติการเปลี่ยนแปลงรายการนี้ใช่หรือไม่?",
+        type: "danger",
+        confirmText: "ลบรายการ"
+      });
+      if (ok) {
         auditLogs = auditLogs.filter(x => x.id !== logId);
         renderAuditLogsTable();
         if (isFirebaseReady && db) {
@@ -5309,15 +8154,20 @@
 
     window.clearAllAuditLogs = async function() {
       if (!window.isThammaSrithongAdmin()) {
-        if (typeof showToast === 'function') showToast("⚠️ เฉพาะ Thamma Srithong (ผู้ดูแลระบบ) เท่านั้นที่มีสิทธิ์ลบประวัติการเปลี่ยนแปลงทั้งหมด");
-        else alert("⚠️ เฉพาะ Thamma Srithong (ผู้ดูแลระบบ) เท่านั้นที่มีสิทธิ์ลบประวัติการเปลี่ยนแปลงทั้งหมด");
+        showToast("⚠️ เฉพาะ Thamma Srithong (ผู้ดูแลระบบ) เท่านั้นที่มีสิทธิ์ลบประวัติการเปลี่ยนแปลงทั้งหมด");
         return;
       }
       if (!auditLogs || auditLogs.length === 0) {
         showToast("ไม่มีประวัติการเปลี่ยนแปลงให้ลบ");
         return;
       }
-      if (confirm(`⚠️ ยืนยันลบประวัติการเปลี่ยนแปลงข้อมูลทั้งหมดจำนวน ${auditLogs.length} รายการหรือไม่?\n\nการลบจะไม่สามารถย้อนคืนได้!`)) {
+      const ok = await window.showConfirmDialog({
+        title: "ลบประวัติทั้งหมด",
+        message: `ต้องการลบประวัติการเปลี่ยนแปลงทั้งหมด ${auditLogs.length} รายการ ใช่หรือไม่?`,
+        type: "danger",
+        confirmText: "ลบทั้งหมด"
+      });
+      if (ok) {
         const total = auditLogs.length;
         auditLogs = [];
         renderAuditLogsTable();
@@ -5485,6 +8335,84 @@
       renderUserLoginLogsTable();
     };
 
+    window.calculateSessionDurations = function(logs) {
+      if (!Array.isArray(logs) || logs.length === 0) return {};
+
+      // Sort chronologically ascending (oldest to newest)
+      const sorted = [...logs].sort((a, b) => new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime());
+
+      const userMap = {};
+      sorted.forEach(log => {
+        const emailKey = (log.userEmail || log.userName || 'unknown').toLowerCase().trim();
+        if (!userMap[emailKey]) userMap[emailKey] = [];
+        userMap[emailKey].push(log);
+      });
+
+      const durationMap = {};
+      const nowMs = Date.now();
+
+      Object.keys(userMap).forEach(emailKey => {
+        const userLogs = userMap[emailKey];
+        let pendingOnlineLog = null;
+
+        userLogs.forEach(log => {
+          const logTime = new Date(log.timestamp || 0).getTime();
+          const status = (log.status || '').toLowerCase().trim();
+
+          if (status === 'online') {
+            pendingOnlineLog = log;
+            const diffMs = Math.max(0, nowMs - logTime);
+            const totalMins = Math.floor(diffMs / 60000);
+            durationMap[log.id] = {
+              minutes: totalMins,
+              diffMs: diffMs,
+              text: totalMins < 1 ? '< 1 นาที (กำลังใช้งาน)' : `${totalMins} นาที (กำลังใช้งาน)`,
+              isLive: true
+            };
+          } else if (status === 'offline') {
+            if (pendingOnlineLog) {
+              const onlineTime = new Date(pendingOnlineLog.timestamp || 0).getTime();
+              const diffMs = Math.max(0, logTime - onlineTime);
+              const totalMins = Math.floor(diffMs / 60000);
+
+              let formattedText = '';
+              if (totalMins < 1) {
+                const secs = Math.round(diffMs / 1000);
+                formattedText = `${secs} วินาที (< 1 นาที)`;
+              } else if (totalMins < 60) {
+                formattedText = `${totalMins} นาที`;
+              } else {
+                const hrs = Math.floor(totalMins / 60);
+                const mins = totalMins % 60;
+                formattedText = `${hrs} ชม. ${mins} นาที (${totalMins} นาที)`;
+              }
+
+              const durObj = {
+                minutes: totalMins,
+                diffMs: diffMs,
+                text: formattedText,
+                isLive: false
+              };
+
+              durationMap[log.id] = durObj;
+              durationMap[pendingOnlineLog.id] = durObj;
+
+              pendingOnlineLog = null;
+            } else {
+              durationMap[log.id] = {
+                minutes: 0,
+                diffMs: 0,
+                text: '-',
+                isLive: false
+              };
+            }
+          }
+        });
+      });
+
+      return durationMap;
+    };
+
     window.renderUserLoginLogsTable = function() {
       const tbody = document.getElementById('userLoginLogsTableBody');
       if (!tbody) return;
@@ -5492,8 +8420,11 @@
       const searchInput = (document.getElementById('userLoginSearchInput')?.value || '').trim().toLowerCase();
       const statusFilter = document.getElementById('userLoginStatusFilter')?.value || 'ALL';
 
+      // Pre-calculate session durations for all logs
+      const durationMap = window.calculateSessionDurations(userLoginLogs || []);
+
       // Update sort icons in table header
-      ['status', 'date', 'time', 'userName', 'userEmail'].forEach(col => {
+      ['status', 'date', 'time', 'userName', 'userEmail', 'duration'].forEach(col => {
         const iconElem = document.getElementById(`sort-icon-userlogin-${col}`);
         if (iconElem) {
           if (userLoginSortColumn === col || (userLoginSortColumn === 'timestamp' && col === 'date')) {
@@ -5524,12 +8455,14 @@
           const formatted = formatThaiBuddhistDateAndTime(log.timestamp);
           const dateStr = (formatted.dateBE || '').toLowerCase();
           const timeStr = (formatted.time24 || '').toLowerCase();
+          const durText = (durationMap[log.id]?.text || '').toLowerCase();
 
           return name.includes(searchInput) || 
                  email.includes(searchInput) || 
                  status.includes(searchInput) || 
                  dateStr.includes(searchInput) || 
-                 timeStr.includes(searchInput);
+                 timeStr.includes(searchInput) ||
+                 durText.includes(searchInput);
         }
 
         return true;
@@ -5555,6 +8488,10 @@
           result = (a.userName || '').localeCompare(b.userName || '', 'th');
         } else if (userLoginSortColumn === 'userEmail') {
           result = (a.userEmail || '').localeCompare(b.userEmail || '');
+        } else if (userLoginSortColumn === 'duration') {
+          const durA = durationMap[a.id]?.diffMs || 0;
+          const durB = durationMap[b.id]?.diffMs || 0;
+          result = durA - durB;
         }
 
         if (result === 0) {
@@ -5585,7 +8522,7 @@
       if (pageItems.length === 0) {
         tbody.innerHTML = `
           <tr>
-            <td colspan="6" class="text-center py-5 text-muted">
+            <td colspan="7" class="text-center py-5 text-muted">
               <i class="bi bi-person-badge-clock fs-1 d-block mb-2 text-secondary opacity-50"></i>
               <span class="fw-semibold">ไม่พบประวัติการเข้า-ออกจากระบบ (User Online/Offline)</span>
             </td>
@@ -5604,6 +8541,8 @@
           ? '<span class="badge bg-success bg-opacity-10 text-success rounded-pill px-2.5 py-1.5 fw-bold fs-8 d-inline-flex align-items-center gap-1.5"><i class="bi bi-circle-fill text-success fs-9"></i> Online</span>'
           : '<span class="badge bg-danger bg-opacity-10 text-danger rounded-pill px-2.5 py-1.5 fw-bold fs-8 d-inline-flex align-items-center gap-1.5"><i class="bi bi-circle-fill text-danger fs-9"></i> Offline</span>';
 
+        const durInfo = durationMap[log.id] || { text: '-', isLive: false };
+
         return `
           <tr>
             <td class="ps-3 py-3">
@@ -5620,6 +8559,15 @@
             </td>
             <td class="py-3 fs-8">
               <span class="text-secondary fw-semibold"><code>${escapeHtml(log.userEmail || 'N/A')}</code></span>
+            </td>
+            <td class="py-3 fs-8 fw-semibold text-dark">
+              ${durInfo.isLive ? 
+                `<span class="badge bg-success-subtle text-success border border-success-subtle rounded-pill px-2.5 py-1.5"><i class="bi bi-stopwatch me-1"></i>${escapeHtml(durInfo.text)}</span>` : 
+                (durInfo.text && durInfo.text !== '-' ? 
+                  `<span class="badge bg-light text-dark border border-secondary-subtle rounded-pill px-2.5 py-1.5"><i class="bi bi-hourglass-split me-1 text-primary"></i>${escapeHtml(durInfo.text)}</span>` : 
+                  `<span class="text-muted fs-8">-</span>`
+                )
+              }
             </td>
             <td class="text-center py-3 super-admin-only-element ${isSuperAdmin ? '' : 'd-none'}">
               <button class="btn btn-sm btn-outline-danger border-0 rounded-circle" onclick="deleteSingleUserLoginLog('${log.id}')" title="ลบประวัติ">
@@ -5685,7 +8633,13 @@
         showToast("⚠️ เฉพาะ Admin (jaru072@gmail.com) เท่านั้นที่มีสิทธิ์ลบประวัติ");
         return;
       }
-      if (confirm('คุณต้องการลบประวัติ Login รายการนี้ใช่หรือไม่?')) {
+      const ok = await window.showConfirmDialog({
+        title: "ลบประวัติการใช้งาน",
+        message: "ต้องการลบประวัติการใช้งานรายการนี้ใช่หรือไม่?",
+        type: "danger",
+        confirmText: "ลบประวัติ"
+      });
+      if (ok) {
         userLoginLogs = userLoginLogs.filter(x => x.id !== logId);
         renderUserLoginLogsTable();
         if (isFirebaseReady && db) {
@@ -5708,7 +8662,13 @@
         showToast("ไม่มีประวัติ Login ให้ลบ");
         return;
       }
-      if (confirm(`⚠️ ยืนยันลบประวัติการเข้า-ออกจากระบบทั้งหมดจำนวน ${userLoginLogs.length} รายการหรือไม่?`)) {
+      const ok = await window.showConfirmDialog({
+        title: "ลบประวัติทั้งหมด",
+        message: `ต้องการลบประวัติการเข้า-ออกระบบทั้งหมด ${userLoginLogs.length} รายการ ใช่หรือไม่?`,
+        type: "danger",
+        confirmText: "ลบทั้งหมด"
+      });
+      if (ok) {
         const total = userLoginLogs.length;
         userLoginLogs = [];
         renderUserLoginLogsTable();
@@ -5732,11 +8692,14 @@
         return;
       }
 
+      const durationMap = window.calculateSessionDurations ? window.calculateSessionDurations(userLoginLogs) : {};
+
       let csvContent = "\uFEFF"; // UTF-8 BOM
-      csvContent += "ลำดับ,สถานะ,วัน/เดือน/ปี (พ.ศ.),เวลา (24 ชม.),ชื่อผู้ใช้,Email,Timestamp_ISO\n";
+      csvContent += "ลำดับ,สถานะ,วัน/เดือน/ปี (พ.ศ.),เวลา (24 ชม.),ชื่อผู้ใช้,Email,ระยะเวลาใช้งาน,Timestamp_ISO\n";
 
       userLoginLogs.forEach((log, index) => {
         const { dateBE, time24 } = formatThaiBuddhistDateAndTime(log.timestamp);
+        const durText = durationMap[log.id]?.text || '-';
         const row = [
           index + 1,
           `"${(log.status || '').replace(/"/g, '""')}"`,
@@ -5744,6 +8707,7 @@
           `"${(time24 || '').replace(/"/g, '""')}"`,
           `"${(log.userName || '').replace(/"/g, '""')}"`,
           `"${(log.userEmail || '').replace(/"/g, '""')}"`,
+          `"${(durText || '').replace(/"/g, '""')}"`,
           `"${(log.timestamp || '').replace(/"/g, '""')}"`
         ];
         csvContent += row.join(",") + "\n";
@@ -5834,45 +8798,164 @@
     // ==========================================
     // TRANSACTION EMPLOYEE SEARCH & FILTER (เรียงตามชื่อ)
     // ==========================================
-    window.filterTransEmployeeSelect = function(query) {
+    // TRANSACTION EMPLOYEE SEARCH & INSTANT AUTOCOMPLETE
+    // ==========================================
+    window.selectEmployeeForTransaction = function(empId) {
+      const emp = (employeeList || []).find(e => e && e.id === empId);
+      if (!emp) return;
+
+      const select = document.getElementById('empSelect');
+      if (select) {
+        select.value = emp.id;
+        select.setCustomValidity('');
+      }
+
+      const searchInput = document.getElementById('transEmpSearchInput');
+      if (searchInput) {
+        searchInput.value = formatEmpName(emp);
+      }
+
+      const resultsBox = document.getElementById('transEmpSearchResultsBox');
+      if (resultsBox) {
+        resultsBox.classList.add('d-none');
+        resultsBox.innerHTML = '';
+      }
+
+      if (typeof handleTransEmpSelectionChange === 'function') {
+        handleTransEmpSelectionChange();
+      }
+
+      if (typeof window.updateScannerOperatorUI === 'function') {
+        window.updateScannerOperatorUI(emp);
+      }
+    };
+
+    window.filterTransEmployeeSelect = function(query, options = {}) {
       const searchInput = document.getElementById('transEmpSearchInput');
       const q = (query !== undefined ? query : (searchInput ? searchInput.value : '')).toLowerCase().trim();
       const select = document.getElementById('empSelect');
-      if (!select) return;
+      const resultsBox = document.getElementById('transEmpSearchResultsBox');
 
-      const currentVal = select.value;
-      select.innerHTML = '<option value="">-- กรุณาเลือกรายชื่อพนักงาน --</option>';
-
-      const filtered = employeeList.filter(emp => {
+      const filtered = (employeeList || []).filter(emp => {
         if (!q) return true;
-        return (emp.name && emp.name.toLowerCase().includes(q)) ||
-               (emp.nickname && emp.nickname.toLowerCase().includes(q)) ||
-               (emp.id && emp.id.toLowerCase().includes(q)) ||
-               (emp.department && emp.department.toLowerCase().includes(q)) ||
-               (emp.position && emp.position.toLowerCase().includes(q));
+        const nameStr = (emp.name || '').toLowerCase();
+        const nickStr = (emp.nickname || '').toLowerCase();
+        const idStr = (emp.id || '').toLowerCase();
+        const codeStr = (emp.code || '').toLowerCase();
+        return nameStr.includes(q) || nickStr.includes(q) || idStr.includes(q) || codeStr.includes(q);
       });
 
-      filtered.sort((a, b) => (a.name || '').localeCompare((b.name || ''), 'th'));
+      if (select) {
+        const currentVal = select.value;
+        select.innerHTML = '<option value="">-- กรุณาเลือกรายชื่อพนักงาน --</option>';
 
-      filtered.forEach(emp => {
-        const opt = document.createElement('option');
-        opt.value = emp.id;
-        const posBadge = emp.position ? ` (${emp.position})` : '';
-        opt.textContent = `👤 ${formatEmpName(emp)} [${emp.id}] - ${emp.department}${posBadge}`;
-        if (currentVal && currentVal === emp.id) opt.selected = true;
-        select.appendChild(opt);
-      });
+        filtered.sort((a, b) => (a.name || '').localeCompare((b.name || ''), 'th'));
 
-      if (filtered.length === 1 && q.length > 0) {
-        select.value = filtered[0].id;
+        filtered.forEach(emp => {
+          const opt = document.createElement('option');
+          opt.value = emp.id;
+          const posBadge = emp.position ? ` (${emp.position})` : '';
+          opt.textContent = `👤 ${formatEmpName(emp)} [${emp.id}] - ${emp.department}${posBadge}`;
+          if (currentVal && currentVal === emp.id) opt.selected = true;
+          select.appendChild(opt);
+        });
+
+        if (filtered.length === 1 && q.length > 0) {
+          select.value = filtered[0].id;
+          select.setCustomValidity('');
+        } else if (select.value) {
+          select.setCustomValidity('');
+        }
+      }
+
+      // Render instant visual popup list directly under search input
+      if (resultsBox) {
+        if (!q || (options && options.hideResultsBox)) {
+          resultsBox.classList.add('d-none');
+          resultsBox.innerHTML = '';
+          return;
+        }
+
+        if (filtered.length === 0) {
+          resultsBox.innerHTML = `
+            <div class="p-3 text-center text-muted fs-8">
+              <i class="bi bi-person-x fs-4 d-block text-secondary mb-1"></i>
+              <div>ไม่พบรายชื่อพนักงานที่ตรงกับ "${typeof escapeHtml === 'function' ? escapeHtml(q) : q}"</div>
+              <small class="text-muted">กรุณาลองค้นหาด้วยชื่อ, ชื่อเล่น หรือรหัสพนักงาน</small>
+            </div>
+          `;
+          resultsBox.classList.remove('d-none');
+          return;
+        }
+
+        let html = `
+          <div class="d-flex align-items-center justify-content-between px-2 py-1.5 border-bottom bg-light rounded-top">
+            <span class="fs-8 text-success fw-bold"><i class="bi bi-people-fill me-1"></i>พบ ${filtered.length} รายชื่อ (แตะเพื่อเลือกทันที)</span>
+            <button type="button" class="btn btn-sm btn-link p-0 text-muted fs-8 text-decoration-none" onclick="document.getElementById('transEmpSearchResultsBox').classList.add('d-none')">
+              <i class="bi bi-x-lg"></i> ปิด
+            </button>
+          </div>
+          <div class="list-group list-group-flush">
+        `;
+
+        filtered.slice(0, 15).forEach(emp => {
+          const avatar = emp.photoUrl || emp.imageUrl || (typeof DEFAULT_AVATAR_IMAGE !== 'undefined' ? DEFAULT_AVATAR_IMAGE : 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80');
+          const empFormatted = formatEmpName(emp);
+          const posText = emp.position ? ` • ${emp.position}` : '';
+          html += `
+            <button type="button" class="list-group-item list-group-item-action d-flex align-items-center justify-content-between p-2 gap-2 border-bottom-0 border-top cursor-pointer text-start" onclick="selectEmployeeForTransaction('${emp.id}')">
+              <div class="d-flex align-items-center gap-2 overflow-hidden">
+                <img src="${avatar}" class="rounded-circle border flex-shrink-0" style="width: 38px; height: 38px; object-fit: cover;" onerror="this.src='${DEFAULT_AVATAR_IMAGE}'" />
+                <div class="overflow-hidden">
+                  <div class="fw-bold text-dark text-truncate fs-7">${empFormatted}</div>
+                  <div class="fs-8 text-muted text-truncate">
+                    <span class="badge bg-secondary font-monospace me-1">${emp.id}</span>
+                    <span>${emp.department || 'ไม่ระบุแผนก'}${posText}</span>
+                  </div>
+                </div>
+              </div>
+              <span class="btn btn-sm btn-outline-success rounded-pill px-2.5 py-0.5 fs-8 flex-shrink-0 fw-semibold">
+                เลือก
+              </span>
+            </button>
+          `;
+        });
+
+        if (filtered.length > 15) {
+          html += `
+            <div class="p-1.5 text-center text-muted fs-8 bg-light">
+              แสดง 15 จากทั้งหมด ${filtered.length} คน (พิมพ์ตัวอักษรเพิ่มเพื่อเจาะจง)
+            </div>
+          `;
+        }
+
+        html += `</div>`;
+        resultsBox.innerHTML = html;
+        resultsBox.classList.remove('d-none');
       }
     };
 
     window.clearTransEmpSearch = function() {
       const input = document.getElementById('transEmpSearchInput');
       if (input) input.value = '';
+      const resultsBox = document.getElementById('transEmpSearchResultsBox');
+      if (resultsBox) {
+        resultsBox.classList.add('d-none');
+        resultsBox.innerHTML = '';
+      }
       filterTransEmployeeSelect('');
     };
+
+    // Close transEmpSearchResultsBox when clicking outside
+    document.addEventListener('click', function(e) {
+      const box = document.getElementById('transEmpSearchResultsBox');
+      const input = document.getElementById('transEmpSearchInput');
+      if (box && !box.classList.contains('d-none')) {
+        if (!box.contains(e.target) && e.target !== input) {
+          box.classList.add('d-none');
+        }
+      }
+    });
 
     window.populateQuickScanEmpDropdown = function() {
       const select = document.getElementById('quickScanEmpSelect');
@@ -5900,21 +8983,61 @@
     }
 
     // ==========================================
-    // EQUIPMENT SELECT SEARCH & FILTER FUNCTIONS
+    // EQUIPMENT SELECT SEARCH & INSTANT AUTOCOMPLETE
     // ==========================================
-    window.filterEquipSelectDropdown = function(query) {
-      const select = document.getElementById('equipSelect');
-      if (!select) return;
-      const q = (query || '').trim().toLowerCase();
-      const currentVal = select.value;
-      select.innerHTML = '<option value="">-- กรุณาเลือกอุปกรณ์การเกษตร --</option>';
+    window.selectEquipmentForTransaction = function(equipId) {
+      const item = (equipmentList || []).find(x => x && (String(x.id) === String(equipId) || String(x.code) === String(equipId)));
+      if (!item) return;
 
-      const filtered = equipmentList.filter(item => {
+      const select = document.getElementById('equipSelect');
+      if (select) {
+        select.value = item.id;
+        select.setCustomValidity('');
+      }
+
+      const searchInput = document.getElementById('equipSearchInput');
+      if (searchInput) {
+        searchInput.value = item.name;
+      }
+
+      const resultsBox = document.getElementById('transEquipSearchResultsBox');
+      if (resultsBox) {
+        resultsBox.classList.add('d-none');
+        resultsBox.innerHTML = '';
+      }
+
+      if (typeof updateEquipSelectPreview === 'function') {
+        updateEquipSelectPreview();
+      }
+    };
+
+    window.filterEquipSelectDropdown = function(query, options = {}) {
+      const select = document.getElementById('equipSelect');
+      const searchInput = document.getElementById('equipSearchInput');
+      const resultsBox = document.getElementById('transEquipSearchResultsBox');
+      const q = (query !== undefined ? query : (searchInput ? searchInput.value : '')).trim().toLowerCase();
+      const currentVal = select ? select.value : '';
+      const activeTransType = document.querySelector('input[name="transType"]:checked')?.value || 'เบิกจ่าย';
+      const selectedEmpId = document.getElementById('empSelect')?.value;
+
+      let candidateList = [...equipmentList];
+
+      // If in Return mode, only allow equipment that has been borrowed
+      if (activeTransType === 'คืนอุปกรณ์') {
+        const allActive = typeof window.getAllActiveBorrowings === 'function' ? window.getAllActiveBorrowings() : [];
+        const relevantBorrows = selectedEmpId ? allActive.filter(b => b.employeeId === selectedEmpId) : allActive;
+        const borrowedEquipIds = new Set(relevantBorrows.map(b => b.equipmentId));
+        candidateList = candidateList.filter(item => borrowedEquipIds.has(item.id));
+      }
+
+      const filtered = candidateList.filter(item => {
         if (!q) return true;
-        return (item.name && item.name.toLowerCase().includes(q)) ||
-               (item.code && item.code.toLowerCase().includes(q)) ||
-               (item.category && item.category.toLowerCase().includes(q)) ||
-               (item.location && item.location.toLowerCase().includes(q));
+        const nameStr = (item.name || '').toLowerCase();
+        const codeStr = (item.code || '').toLowerCase();
+        const catStr = (item.category || '').toLowerCase();
+        const locStr = (item.location || '').toLowerCase();
+        const descStr = (item.description || '').toLowerCase();
+        return nameStr.includes(q) || codeStr.includes(q) || catStr.includes(q) || locStr.includes(q) || descStr.includes(q);
       });
 
       filtered.sort((a, b) => {
@@ -5923,25 +9046,124 @@
         return codeA.localeCompare(codeB, undefined, { numeric: true, sensitivity: 'base' });
       });
 
-      filtered.forEach(item => {
-        const opt = document.createElement('option');
-        opt.value = item.id;
-        opt.textContent = `[${item.code}] ${item.name} (คงเหลือ: ${item.quantity} ${item.unit})`;
-        if (currentVal && currentVal === item.id) opt.selected = true;
-        select.appendChild(opt);
-      });
+      if (select) {
+        select.innerHTML = '<option value="">-- กรุณาเลือกอุปกรณ์การเกษตร --</option>';
 
-      if (filtered.length === 1 && q.length > 0) {
-        select.value = filtered[0].id;
+        filtered.forEach(item => {
+          const opt = document.createElement('option');
+          opt.value = item.id;
+          if (activeTransType === 'คืนอุปกรณ์') {
+            const allActive = typeof window.getAllActiveBorrowings === 'function' ? window.getAllActiveBorrowings() : [];
+            const matchedBorrows = allActive.filter(b => b.equipmentId === item.id && (!selectedEmpId || b.employeeId === selectedEmpId));
+            const borrowedSum = matchedBorrows.reduce((sum, b) => sum + b.remainingQty, 0);
+            opt.textContent = `[${item.code}] ${item.name} (ค้างคืน: ${borrowedSum} ${item.unit} | สต๊อกคลัง: ${item.quantity} ${item.unit})`;
+          } else if (activeTransType === 'รับเข้าสต๊อก' || activeTransType === 'รับเข้าสต๊อก (ขาเข้า)') {
+            opt.textContent = `📥 [${item.code}] ${item.name} (สต๊อกปัจจุบัน: ${item.quantity} ${item.unit})`;
+          } else {
+            opt.textContent = `[${item.code}] ${item.name} (คงเหลือ: ${item.quantity} ${item.unit})`;
+          }
+          if (currentVal && currentVal === item.id) opt.selected = true;
+          select.appendChild(opt);
+        });
+
+        if (filtered.length === 1 && q.length > 0) {
+          select.value = filtered[0].id;
+        }
+        updateEquipSelectPreview();
       }
-      updateEquipSelectPreview();
+
+      // Render instant visual search popup under the search input
+      if (resultsBox) {
+        if (!q || (options && options.hideResultsBox)) {
+          resultsBox.classList.add('d-none');
+          resultsBox.innerHTML = '';
+          return;
+        }
+
+        if (filtered.length === 0) {
+          resultsBox.innerHTML = `
+            <div class="p-3 text-center text-muted fs-8">
+              <i class="bi bi-box-seam fs-4 d-block text-secondary mb-1"></i>
+              <div>ไม่พบอุปกรณ์ที่ตรงกับ "${typeof escapeHtml === 'function' ? escapeHtml(q) : q}"</div>
+              <small class="text-muted">กรุณาลองค้นหาด้วยชื่อ, รหัส, หรือหมวดหมู่อื่น</small>
+            </div>
+          `;
+          resultsBox.classList.remove('d-none');
+          return;
+        }
+
+        let html = `
+          <div class="d-flex align-items-center justify-content-between px-2 py-1.5 border-bottom bg-light rounded-top">
+            <span class="fs-8 text-success fw-bold"><i class="bi bi-tools me-1"></i>พบ ${filtered.length} รายการ (แตะเพื่อเลือกทันที)</span>
+            <button type="button" class="btn btn-sm btn-link p-0 text-muted fs-8 text-decoration-none" onclick="document.getElementById('transEquipSearchResultsBox').classList.add('d-none')">
+              <i class="bi bi-x-lg"></i> ปิด
+            </button>
+          </div>
+          <div class="list-group list-group-flush">
+        `;
+
+        filtered.slice(0, 15).forEach(item => {
+          const img = item.imageUrl || DEFAULT_EQUIPMENT_IMAGE;
+          const unit = item.unit || 'ชิ้น';
+          const stockText = (activeTransType === 'คืนอุปกรณ์') 
+            ? `ในคลัง: ${item.quantity} ${unit}`
+            : `คงเหลือ: ${item.quantity} ${unit}`;
+
+          html += `
+            <button type="button" class="list-group-item list-group-item-action d-flex align-items-center justify-content-between p-2 gap-2 border-bottom-0 border-top cursor-pointer text-start" onclick="selectEquipmentForTransaction('${item.id}')">
+              <div class="d-flex align-items-center gap-2 overflow-hidden">
+                <img src="${img}" class="rounded-2 border flex-shrink-0" style="width: 38px; height: 38px; object-fit: cover;" onerror="this.src='${DEFAULT_EQUIPMENT_IMAGE}'" />
+                <div class="overflow-hidden">
+                  <div class="fw-bold text-dark text-truncate fs-7" title="${item.name}">${item.name}</div>
+                  <div class="fs-8 text-muted text-truncate d-flex align-items-center gap-1 flex-wrap">
+                    <span class="badge bg-secondary font-monospace">${item.code}</span>
+                    <span class="text-success fw-semibold">${stockText}</span>
+                    ${item.location ? `<span class="text-secondary"><i class="bi bi-geo-alt me-0.5"></i>${item.location}</span>` : ''}
+                  </div>
+                </div>
+              </div>
+              <span class="btn btn-sm btn-outline-success rounded-pill px-2.5 py-0.5 fs-8 flex-shrink-0 fw-semibold">
+                เลือก
+              </span>
+            </button>
+          `;
+        });
+
+        if (filtered.length > 15) {
+          html += `
+            <div class="p-1.5 text-center text-muted fs-8 bg-light">
+              แสดง 15 จากทั้งหมด ${filtered.length} รายการ (พิมพ์เพิ่มเพื่อระบุเจาะจง)
+            </div>
+          `;
+        }
+
+        html += `</div>`;
+        resultsBox.innerHTML = html;
+        resultsBox.classList.remove('d-none');
+      }
     };
 
     window.clearEquipSearch = function() {
       const input = document.getElementById('equipSearchInput');
       if (input) input.value = '';
+      const resultsBox = document.getElementById('transEquipSearchResultsBox');
+      if (resultsBox) {
+        resultsBox.classList.add('d-none');
+        resultsBox.innerHTML = '';
+      }
       filterEquipSelectDropdown('');
     };
+
+    // Close transEquipSearchResultsBox when clicking outside
+    document.addEventListener('click', function(e) {
+      const box = document.getElementById('transEquipSearchResultsBox');
+      const input = document.getElementById('equipSearchInput');
+      if (box && !box.classList.contains('d-none')) {
+        if (!box.contains(e.target) && e.target !== input) {
+          box.classList.add('d-none');
+        }
+      }
+    });
 
     window.filterQuickScanDropdown = function(query) {
       const select = document.getElementById('quickScanSelect');
@@ -5985,11 +9207,16 @@
     window.filterLabelItemSelectDropdown = function(query) {
       const select = document.getElementById('labelItemSelect');
       if (!select) return;
+      const catSelect = document.getElementById('labelCategoryFilterSelect');
+      const selectedCat = catSelect ? catSelect.value : 'ALL';
       const q = (query || '').trim().toLowerCase();
       const currentVal = select.value;
-      select.innerHTML = '<option value="ALL">📦 ทุกรายการในคลังอุปกรณ์</option>';
+
+      const catLabel = selectedCat !== 'ALL' ? ` (หมวดหมู่: ${selectedCat})` : '';
+      select.innerHTML = `<option value="ALL">📦 ทุกรายการในคลัง${catLabel}</option>`;
 
       const filtered = equipmentList.filter(item => {
+        if (selectedCat !== 'ALL' && item.category !== selectedCat) return false;
         if (!q) return true;
         return (item.name && item.name.toLowerCase().includes(q)) ||
                (item.code && item.code.toLowerCase().includes(q)) ||
@@ -6016,6 +9243,12 @@
       if (typeof renderPrintableLabelsPreview === 'function') {
         renderPrintableLabelsPreview();
       }
+    };
+
+    window.onLabelCategoryFilterChange = function() {
+      const searchInput = document.getElementById('labelItemSearchInput');
+      const query = searchInput ? searchInput.value : '';
+      filterLabelItemSelectDropdown(query);
     };
 
     window.clearLabelItemSearch = function() {
@@ -6060,6 +9293,102 @@
       filterRestockEquipDropdown('');
     };
 
+    window.validateTransQtyInputLive = function() {
+      const equipSelect = document.getElementById('equipSelect');
+      const qtyInput = document.getElementById('transQty');
+      const warningBox = document.getElementById('transQtyStockWarning');
+      const warningText = document.getElementById('transQtyStockWarningText');
+
+      if (!qtyInput) return;
+
+      const equipId = equipSelect ? equipSelect.value : '';
+      const qty = parseInt(qtyInput.value) || 0;
+      const type = document.querySelector('input[name="transType"]:checked')?.value || 'เบิกจ่าย';
+
+      if (!equipId) {
+        if (warningBox) warningBox.classList.add('d-none');
+        qtyInput.classList.remove('is-invalid');
+        return;
+      }
+
+      const item = equipmentList.find(x => x.id === equipId);
+      if (!item) {
+        if (warningBox) warningBox.classList.add('d-none');
+        qtyInput.classList.remove('is-invalid');
+        return;
+      }
+
+      // Check borrowable equipment restriction in "เบิกจ่าย" (เบิกตัดสต๊อก)
+      if (type === 'เบิกจ่าย' && typeof window.isEquipmentBorrowType === 'function' && window.isEquipmentBorrowType(item)) {
+        if (warningBox && warningText) {
+          warningText.innerHTML = `<i class="bi bi-exclamation-triangle-fill me-1"></i><strong>อุปกรณ์ประเภทยืมใช้:</strong> ชิ้นนี้เป็นอุปกรณ์ประเภทยืมใช้ (ไม่ใช่ของใช้แล้วหมดไป) ไม่สามารถนำมาเบิกตัดสต๊อกได้ กรุณาเลือกโหมด "ยืมอุปกรณ์"`;
+          warningBox.classList.remove('d-none');
+        }
+        qtyInput.classList.add('is-invalid');
+        const btnAddCart = document.getElementById('btnAddCurrentToCart');
+        if (btnAddCart) btnAddCart.disabled = true;
+        return;
+      } else {
+        const btnAddCart = document.getElementById('btnAddCurrentToCart');
+        if (btnAddCart) btnAddCart.disabled = false;
+      }
+
+      if (type === 'เบิกจ่าย' || type === 'ยืมอุปกรณ์') {
+        const existingInCart = selectedTransItems.find(x => x.id === equipId);
+        const currentCartQty = existingInCart ? (existingInCart.qty || 0) : 0;
+        const totalRequestedQty = currentCartQty + qty;
+
+        if (totalRequestedQty > item.quantity) {
+          if (warningBox && warningText) {
+            warningText.innerHTML = `<i class="bi bi-exclamation-octagon-fill me-1"></i>จำนวนที่ระบุเกินสต๊อกที่มีอยู่! (คงเหลือในคลัง: <span class="badge bg-danger fs-8">${item.quantity} ${item.unit || 'ชิ้น'}</span>${currentCartQty > 0 ? `, ในเอกสารแล้ว: ${currentCartQty} ${item.unit || 'ชิ้น'}` : ''})`;
+            warningBox.classList.remove('d-none');
+          }
+          qtyInput.classList.add('is-invalid');
+        } else {
+          if (warningBox) warningBox.classList.add('d-none');
+          qtyInput.classList.remove('is-invalid');
+        }
+      } else if (type === 'คืนอุปกรณ์') {
+        const empId = document.getElementById('empSelect')?.value;
+        const allActive = typeof window.getAllActiveBorrowings === 'function' ? window.getAllActiveBorrowings() : [];
+        const relevantBorrows = empId ? allActive.filter(b => b.employeeId === empId) : allActive;
+        const matchingBorrows = relevantBorrows.filter(b => b.equipmentId === equipId);
+        const totalBorrowedRemaining = matchingBorrows.reduce((sum, b) => sum + b.remainingQty, 0);
+
+        const now = Date.now();
+        const overdueMatching = matchingBorrows.find(b => {
+          const due = b.dueDate || (b.borrowTime ? (b.borrowTime + 3 * 86400000) : 0);
+          return due && now > due;
+        });
+
+        if (totalBorrowedRemaining <= 0) {
+          if (warningBox && warningText) {
+            warningText.innerHTML = `<i class="bi bi-exclamation-octagon-fill me-1"></i>ไม่พบรายการยืมอุปกรณ์รายการนี้ของพนักงานในระบบ`;
+            warningBox.classList.remove('d-none');
+          }
+          qtyInput.classList.add('is-invalid');
+        } else if (qty > totalBorrowedRemaining) {
+          if (warningBox && warningText) {
+            warningText.innerHTML = `<i class="bi bi-exclamation-octagon-fill me-1"></i>จำนวนที่ส่งคืนเกินจำนวนที่ยืมไปจริง (ยืมค้างไว้: <span class="badge bg-warning text-dark fs-8">${totalBorrowedRemaining} ${item.unit || 'ชิ้น'}</span>)`;
+            warningBox.classList.remove('d-none');
+          }
+          qtyInput.classList.add('is-invalid');
+        } else if (overdueMatching) {
+          if (warningBox && warningText) {
+            warningText.innerHTML = `<span class="badge bg-danger text-white me-1"><i class="bi bi-exclamation-triangle-fill me-0.5"></i>เกินกำหนด</span> อุปกรณ์นี้ครบกำหนดส่งคืนแล้ว`;
+            warningBox.classList.remove('d-none');
+          }
+          qtyInput.classList.remove('is-invalid');
+        } else {
+          if (warningBox) warningBox.classList.add('d-none');
+          qtyInput.classList.remove('is-invalid');
+        }
+      } else {
+        if (warningBox) warningBox.classList.add('d-none');
+        qtyInput.classList.remove('is-invalid');
+      }
+    };
+
     window.updateEquipSelectPreview = function() {
       const select = document.getElementById('equipSelect');
       if (!select) return;
@@ -6072,18 +9401,22 @@
       if (!equipId) {
         if (previewBox) previewBox.classList.add('d-none');
         if (infoSpan) infoSpan.innerHTML = '';
+        if (typeof window.validateTransQtyInputLive === 'function') window.validateTransQtyInputLive();
         return;
       }
 
       const item = equipmentList.find(x => x.id === equipId);
       if (!item) {
         if (previewBox) previewBox.classList.add('d-none');
+        if (typeof window.validateTransQtyInputLive === 'function') window.validateTransQtyInputLive();
         return;
       }
 
+      window.lastInteractedEquipmentId = item.id;
+
       if (unitSpan) unitSpan.textContent = item.unit || 'ชิ้น';
       if (infoSpan) {
-        infoSpan.innerHTML = `<i class="bi bi-check-circle-fill text-success me-1"></i>อุปกรณ์: <strong>${item.name}</strong> | คงเหลือ: <span class="fw-bold text-success">${item.quantity} ${item.unit}</span> | สถานที่: ${item.location || 'คลังกลาง'}`;
+        infoSpan.innerHTML = '';
       }
 
       if (previewBox) {
@@ -6095,7 +9428,29 @@
         if (codeBadge) codeBadge.textContent = item.code;
 
         const catBadge = document.getElementById('equipPreviewCatBadge');
-        if (catBadge) catBadge.textContent = item.category;
+        const isBorrow = typeof window.isEquipmentBorrowType === 'function' && window.isEquipmentBorrowType(item);
+        if (catBadge) {
+          if (isBorrow) {
+            catBadge.className = 'badge bg-warning text-dark fs-8';
+            catBadge.innerHTML = `<i class="bi bi-arrow-repeat me-0.5"></i>ประเภทยืมใช้: ${item.category}`;
+          } else {
+            catBadge.className = 'badge bg-success fs-8';
+            catBadge.textContent = item.category;
+          }
+        }
+
+        // Auto-select "ยืมอุปกรณ์" if the equipment is loanable (อุปกรณ์ประเภทยืมใช้)
+        if (isBorrow) {
+          if (typeof selectedTransItems === 'undefined' || selectedTransItems.length === 0 || currentTransCartType === 'ยืมอุปกรณ์') {
+            const borrowRadio = document.getElementById('typeBorrow');
+            if (borrowRadio && !borrowRadio.checked) {
+              borrowRadio.checked = true;
+              if (typeof window.toggleTransTypeUI === 'function') {
+                window.toggleTransTypeUI();
+              }
+            }
+          }
+        }
 
         const nameText = document.getElementById('equipPreviewNameText');
         if (nameText) nameText.textContent = item.name;
@@ -6106,17 +9461,35 @@
         const stockElem = document.getElementById('equipPreviewStockText');
         if (stockElem) {
           stockElem.textContent = `${item.quantity} ${item.unit}`;
-          if (item.quantity <= 3) {
+          if (item.quantity <= 0) {
             stockElem.className = "fs-4 fw-bold text-danger mb-0";
+          } else if (item.quantity <= 3) {
+            stockElem.className = "fs-4 fw-bold text-warning mb-0";
           } else {
             stockElem.className = "fs-4 fw-bold text-success mb-0";
           }
         }
       }
+
+      if (typeof window.validateTransQtyInputLive === 'function') {
+        window.validateTransQtyInputLive();
+      }
     };
 
-    window.quickSelectTransaction = function(equipId) {
+    window.quickSelectTransaction = function(equipId, options = {}) {
       if (!equipId) return;
+
+      const transModal = document.getElementById('transactionModal');
+      const isTransModalOpen = transModal && transModal.classList.contains('show');
+      const shouldPreserveCart = options.preserveCart || isTransModalOpen || (typeof selectedTransItems !== 'undefined' && selectedTransItems.length > 0 && window.preserveTransCartFlag);
+
+      if (!shouldPreserveCart) {
+        if (typeof window.clearTransCart === 'function') {
+          window.clearTransCart();
+        } else if (typeof clearTransCart === 'function') {
+          clearTransCart();
+        }
+      }
 
       const item = equipmentList.find(x => x.id === equipId);
 
@@ -6125,9 +9498,26 @@
       if (select) {
         const equipSearch = document.getElementById('equipSearchInput');
         if (equipSearch) equipSearch.value = item ? item.name : '';
-        filterEquipSelectDropdown(item ? item.name : '');
+        filterEquipSelectDropdown(item ? item.name : '', { hideResultsBox: true });
         select.value = equipId;
         updateEquipSelectPreview();
+        const resultsBox = document.getElementById('transEquipSearchResultsBox');
+        if (resultsBox) {
+          resultsBox.classList.add('d-none');
+          resultsBox.innerHTML = '';
+        }
+      }
+
+      // Auto-select "ยืมอุปกรณ์" immediately if the equipment is loanable (อุปกรณ์ประเภทยืมใช้)
+      const isBorrow = item && (typeof window.isEquipmentBorrowType === 'function') && window.isEquipmentBorrowType(item);
+      if (isBorrow) {
+        const borrowRadio = document.getElementById('typeBorrow');
+        if (borrowRadio && (typeof selectedTransItems === 'undefined' || selectedTransItems.length === 0 || currentTransCartType === 'ยืมอุปกรณ์')) {
+          borrowRadio.checked = true;
+          if (typeof window.toggleTransTypeUI === 'function') {
+            window.toggleTransTypeUI();
+          }
+        }
       }
 
       const quickScan = document.getElementById('quickScanSelect');
@@ -6150,52 +9540,50 @@
         if (typeof renderPrintableLabelsPreview === 'function') renderPrintableLabelsPreview();
       }
 
-      // Switch to transaction tab
-      const tabBtn = document.getElementById('transaction-tab');
-      if (tabBtn) {
-        const bsTab = new bootstrap.Tab(tabBtn);
-        bsTab.show();
-      }
+      // Open transaction modal
+      window.openTransactionModal(equipId);
 
-      if (item) {
-        showToast(`📷 สแกน/เลือกอุปกรณ์ "${item.name}" [${item.code}] เรียบร้อยแล้ว! (คงเหลือ: ${item.quantity} ${item.unit})`);
-      }
-
-      // Scroll smoothly to equipment select field
+      // Scroll smoothly to the top of transaction type buttons box
       setTimeout(() => {
-        const fieldContainer = document.getElementById('equipSelect');
-        if (fieldContainer) {
-          fieldContainer.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          fieldContainer.focus();
+        const typeBox = document.getElementById('transactionTypeBox') || document.getElementById('transactionForm');
+        if (typeBox) {
+          const navHeight = document.querySelector('.navbar.sticky-top')?.offsetHeight || 60;
+          const rect = typeBox.getBoundingClientRect();
+          const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+          const targetY = rect.top + scrollTop - navHeight - 12;
+          window.scrollTo({ top: Math.max(0, targetY), behavior: 'smooth' });
+        } else {
+          window.scrollTo({ top: 0, behavior: 'smooth' });
         }
-      }, 200);
+      }, 120);
     };
 
     function updateStats() {
-      const total = equipmentList.length;
+      const currentList = Array.isArray(equipmentList) ? equipmentList : [];
+      const total = currentList.length;
       let inStock = 0, borrowed = 0, lowStock = 0;
 
-      equipmentList.forEach(item => {
-        inStock += item.quantity;
+      currentList.forEach(item => {
+        inStock += (item.quantity || 0);
         borrowed += (item.borrowedCount || 0);
         const minQty = item.minQuantity !== undefined ? item.minQuantity : 3;
-        if (item.quantity <= minQty) lowStock++;
+        if ((item.quantity || 0) <= minQty) lowStock++;
       });
 
       const totalItemsElem = document.getElementById('statTotalItems');
       const inStockElem = document.getElementById('statInStock');
       const borrowedElem = document.getElementById('statBorrowed');
-      const totalEmpElem = document.getElementById('statTotalEmp');
+      const lowStockElem = document.getElementById('statLowStock');
 
       if (totalItemsElem) totalItemsElem.textContent = total;
       if (inStockElem) inStockElem.textContent = inStock;
       if (borrowedElem) borrowedElem.textContent = borrowed;
-      if (totalEmpElem) totalEmpElem.textContent = employeeList.length;
+      if (lowStockElem) lowStockElem.textContent = lowStock;
 
       // Update Overdue Alerts
       if (typeof calculateOverdueBorrowings === 'function') {
-        const overdueList = calculateOverdueBorrowings(window.currentOverdueThresholdDays || 3);
-        const overdueCount = overdueList.length;
+        const overdueList = calculateOverdueBorrowings(window.currentOverdueThresholdDays || 3) || [];
+        const overdueCount = Array.isArray(overdueList) ? overdueList.length : 0;
 
         const overdueBadge = document.getElementById('statOverdueBadge');
         const overdueCountElem = document.getElementById('statOverdueCount');
@@ -6208,7 +9596,19 @@
           }
         }
 
+        const btnHeaderOverdue = document.getElementById('btnHeaderOverdue');
         const headerBadge = document.getElementById('headerOverdueBadge');
+        if (btnHeaderOverdue) {
+          if (overdueCount > 0) {
+            btnHeaderOverdue.classList.remove('d-none');
+            btnHeaderOverdue.classList.add('d-flex');
+            btnHeaderOverdue.classList.add('btn-overdue-blink');
+          } else {
+            btnHeaderOverdue.classList.add('d-none');
+            btnHeaderOverdue.classList.remove('d-flex');
+            btnHeaderOverdue.classList.remove('btn-overdue-blink');
+          }
+        }
         if (headerBadge) {
           if (overdueCount > 0) {
             headerBadge.classList.remove('d-none');
@@ -6220,14 +9620,71 @@
 
         const overdueBanner = document.getElementById('overdueAlertBanner');
         const overdueBannerCount = document.getElementById('overdueBannerCount');
+        const overdueBannerStaffList = document.getElementById('overdueBannerStaffList');
         if (overdueBanner && overdueBannerCount) {
           if (overdueCount > 0) {
             overdueBanner.classList.remove('d-none');
             overdueBanner.classList.add('d-flex');
             overdueBannerCount.textContent = overdueCount;
+
+            // Render compact staff buttons for quick follow-up
+            if (overdueBannerStaffList && typeof window.calculateOverdueBorrowings === 'function') {
+              const thresh = window.currentOverdueThresholdDays !== undefined ? window.currentOverdueThresholdDays : 3;
+              const overdueItems = window.calculateOverdueBorrowings(thresh);
+              const staffMap = {};
+
+              overdueItems.forEach(item => {
+                const empKey = item.employeeId || item.employeeName || 'UNKNOWN';
+                const rawName = item.employeeName || 'ไม่ระบุชื่อ';
+                const cleanName = rawName.split('(')[0].trim();
+                if (!staffMap[empKey]) {
+                  staffMap[empKey] = {
+                    id: item.employeeId || '',
+                    name: cleanName,
+                    count: 0,
+                    qty: 0,
+                    unit: item.unit || 'ชิ้น'
+                  };
+                }
+                staffMap[empKey].count += 1;
+                staffMap[empKey].qty += (item.remainingQty || 1);
+              });
+
+              const staffList = Object.values(staffMap);
+              if (staffList.length > 0) {
+                let chipsHtml = `
+                  <span class="text-danger fw-bold d-inline-flex align-items-center gap-1 me-1 text-nowrap fs-8">
+                    <i class="bi bi-person-fill-exclamation text-danger"></i> ค้างส่งคืน (${staffList.length} คน):
+                  </span>
+                `;
+                staffList.forEach(s => {
+                  const empObj = (employeeList || []).find(e => e.id === s.id || e.name === s.name);
+                  const avatar = empObj && empObj.photoUrl ? empObj.photoUrl : '';
+                  chipsHtml += `
+                    <button type="button" class="btn btn-xs bg-white text-danger border border-danger border-opacity-50 rounded-pill px-2.5 py-1 fw-bold shadow-xs d-inline-flex align-items-center gap-1 hover-shadow" onclick="showOverdueBorrowingsModal('${s.name.replace(/'/g, "\\'")}')" title="คลิกเพื่อดูรายการและติดตามคืนจากคุณ ${s.name} (${s.count} รายการ, รวม ${s.qty} ${s.unit})">
+                      ${avatar ? `<img src="${avatar}" class="rounded-circle border" style="width: 16px; height: 16px; object-fit: cover;" />` : `<i class="bi bi-person-circle"></i>`}
+                      <span>${s.name}</span>
+                      <span class="badge bg-danger text-white rounded-pill ms-0.5">${s.count}</span>
+                    </button>
+                  `;
+                });
+                overdueBannerStaffList.innerHTML = chipsHtml;
+                overdueBannerStaffList.classList.remove('d-none');
+                overdueBannerStaffList.classList.add('d-flex');
+              } else {
+                overdueBannerStaffList.innerHTML = '';
+                overdueBannerStaffList.classList.add('d-none');
+                overdueBannerStaffList.classList.remove('d-flex');
+              }
+            }
           } else {
             overdueBanner.classList.add('d-none');
             overdueBanner.classList.remove('d-flex');
+            if (overdueBannerStaffList) {
+              overdueBannerStaffList.innerHTML = '';
+              overdueBannerStaffList.classList.add('d-none');
+              overdueBannerStaffList.classList.remove('d-flex');
+            }
           }
         }
       }
@@ -6249,14 +9706,20 @@
       // Update Top Toggle Button
       const topText = document.getElementById('toggleSummaryStatsText');
       const topIcon = document.getElementById('toggleSummaryStatsIcon');
-      if (topText) topText.textContent = newIsHidden ? 'แสดงสรุปข้อมูล' : 'ซ่อนสรุปข้อมูล';
+      if (topText) topText.textContent = newIsHidden ? 'สรุปข้อมูล' : 'ซ่อนสรุปข้อมูล';
       if (topIcon) topIcon.className = newIsHidden ? 'bi bi-eye-fill text-primary' : 'bi bi-eye-slash-fill text-danger';
 
       // Update Header Toggle Button
       const hdrText = document.getElementById('hdrToggleStatsText');
       const hdrIcon = document.getElementById('hdrToggleStatsIcon');
-      if (hdrText) hdrText.textContent = newIsHidden ? 'แสดงสรุปข้อมูล' : 'ซ่อนสรุปข้อมูล';
+      if (hdrText) hdrText.textContent = newIsHidden ? 'สรุปข้อมูล' : 'ซ่อนสรุปข้อมูล';
       if (hdrIcon) hdrIcon.className = newIsHidden ? 'bi bi-eye-fill text-primary' : 'bi bi-eye-slash-fill text-danger';
+
+      // Update new Eye Icon in Header
+      const eyeIcon = document.getElementById('summaryStatsEyeIcon');
+      if (eyeIcon) {
+        eyeIcon.className = newIsHidden ? 'bi bi-eye text-success fs-5' : 'bi bi-eye-slash-fill text-danger fs-5';
+      }
     };
 
     // Modal Action Windows
@@ -6673,6 +10136,283 @@
       window.print();
     };
 
+    // ==========================================
+    // TRANSACTION EDIT & DELETE MODULE (แก้ไขวันที่/จำนวน และลบรายการ)
+    // ==========================================
+    window.editTxDatetimePicker = null;
+
+    window.openEditTransactionModal = function(txId) {
+      if (!txId) return;
+      const tx = (transactionHistory || []).find(x => x.id === txId);
+      if (!tx) {
+        showToast("❌ ไม่พบข้อมูลรายการประวัติที่ต้องการแก้ไข", { type: "danger" });
+        return;
+      }
+
+      const idElem = document.getElementById('editTxId');
+      if (idElem) idElem.value = tx.id;
+
+      const docInfo = document.getElementById('editTxDocInfo');
+      if (docInfo) docInfo.textContent = `#${tx.docNo || tx.id}`;
+
+      const equipIdElem = document.getElementById('editTxEquipId');
+      if (equipIdElem) equipIdElem.value = tx.equipmentId || '';
+
+      const typeElem = document.getElementById('editTxType');
+      if (typeElem) typeElem.value = tx.type || '';
+
+      const curQty = Number(tx.quantity !== undefined ? tx.quantity : 1);
+      const oldQtyElem = document.getElementById('editTxOldQty');
+      if (oldQtyElem) oldQtyElem.value = curQty;
+
+      const qtyInput = document.getElementById('editTxQuantityInput');
+      if (qtyInput) qtyInput.value = curQty;
+
+      const oldQtyLabel = document.getElementById('editTxOldQtyLabel');
+      if (oldQtyLabel) oldQtyLabel.textContent = `จำนวนเดิม: ${curQty} ${tx.unit || 'ชิ้น'}`;
+
+      const unitLabel = document.getElementById('editTxUnitLabel');
+      if (unitLabel) unitLabel.textContent = tx.unit || 'ชิ้น';
+
+      const equipNameElem = document.getElementById('editTxEquipName');
+      if (equipNameElem) equipNameElem.textContent = `${tx.equipmentName || '-'} [${tx.equipmentCode || '-'}]`;
+
+      const empNameElem = document.getElementById('editTxEmpName');
+      if (empNameElem) empNameElem.textContent = tx.employeeName || '-';
+
+      const typeBadge = document.getElementById('editTxTypeBadge');
+      if (typeBadge) {
+        typeBadge.textContent = tx.type || '-';
+        if (tx.type === 'เบิกจ่าย') typeBadge.className = 'badge bg-danger fs-8';
+        else if (tx.type === 'ยืมอุปกรณ์') typeBadge.className = 'badge bg-warning text-dark fs-8';
+        else if (tx.type === 'คืนอุปกรณ์') typeBadge.className = 'badge bg-info text-dark fs-8';
+        else if (tx.type && tx.type.includes('รับเข้า')) typeBadge.className = 'badge bg-success fs-8';
+        else typeBadge.className = 'badge bg-secondary fs-8';
+      }
+
+      const locInput = document.getElementById('editTxLocationInput');
+      if (locInput) locInput.value = tx.location || '';
+
+      const noteInput = document.getElementById('editTxNoteInput');
+      if (noteInput) noteInput.value = tx.note || '';
+
+      // Initialize or set Flatpickr for Date & Time
+      const dateElem = document.getElementById('editTxDatetimeInput');
+      if (dateElem) {
+        let targetDate = new Date();
+        if (typeof getRecordTimestampMs === 'function') {
+          const ms = getRecordTimestampMs(tx);
+          if (ms > 0) targetDate = new Date(ms);
+        }
+
+        if (!window.editTxDatetimePicker && typeof flatpickr !== 'undefined') {
+          const thLocale = (flatpickr.l10ns && flatpickr.l10ns.th) ? flatpickr.l10ns.th : 'default';
+          window.editTxDatetimePicker = flatpickr(dateElem, {
+            enableTime: true,
+            time_24hr: true,
+            dateFormat: 'Y-m-d H:i',
+            altInput: true,
+            altInputClass: 'form-control form-control-sm rounded-3 bg-white cursor-pointer shadow-2xs fw-bold',
+            altFormat: 'd/m/Y H:i น.',
+            locale: thLocale,
+            disableMobile: true,
+            onReady: function(selectedDates, dateStr, instance) {
+              if (typeof applyThaiBuddhistYear === 'function') applyThaiBuddhistYear(instance);
+            },
+            onValueUpdate: function(selectedDates, dateStr, instance) {
+              if (typeof applyThaiBuddhistYear === 'function') applyThaiBuddhistYear(instance);
+            },
+            onMonthChange: function(selectedDates, dateStr, instance) {
+              if (typeof applyThaiBuddhistYear === 'function') applyThaiBuddhistYear(instance);
+            },
+            onYearChange: function(selectedDates, dateStr, instance) {
+              if (typeof applyThaiBuddhistYear === 'function') applyThaiBuddhistYear(instance);
+            }
+          });
+        }
+
+        if (window.editTxDatetimePicker) {
+          window.editTxDatetimePicker.setDate(targetDate, true);
+          if (typeof applyThaiBuddhistYear === 'function') applyThaiBuddhistYear(window.editTxDatetimePicker);
+        } else {
+          dateElem.value = tx.timestamp || targetDate.toLocaleString('th-TH');
+        }
+      }
+
+      const modalElem = document.getElementById('editTransactionModal');
+      if (modalElem) {
+        const modal = new bootstrap.Modal(modalElem);
+        modal.show();
+      }
+    };
+
+    window.adjustEditTxQty = function(delta) {
+      const input = document.getElementById('editTxQuantityInput');
+      if (!input) return;
+      let val = parseInt(input.value, 10) || 1;
+      val = Math.max(1, val + delta);
+      input.value = val;
+    };
+
+    window.handleSaveEditedTransaction = async function(e) {
+      if (e) e.preventDefault();
+      const txId = document.getElementById('editTxId')?.value;
+      const tx = (transactionHistory || []).find(x => x.id === txId);
+      if (!tx) {
+        showToast("❌ ไม่พบข้อมูลรายการที่ต้องการแก้ไข", { type: "danger" });
+        return;
+      }
+
+      const oldQty = parseInt(document.getElementById('editTxOldQty')?.value, 10) || 1;
+      const newQty = parseInt(document.getElementById('editTxQuantityInput')?.value, 10) || 1;
+      if (newQty <= 0) {
+        alert("กรุณาระบุจำนวนอย่างน้อย 1 ชิ้น");
+        return;
+      }
+
+      const diff = newQty - oldQty;
+
+      let newTimestampStr = tx.timestamp;
+      let newRawTimestamp = tx.rawTimestamp || Date.now();
+      if (window.editTxDatetimePicker && window.editTxDatetimePicker.selectedDates && window.editTxDatetimePicker.selectedDates[0]) {
+        const selDate = window.editTxDatetimePicker.selectedDates[0];
+        newRawTimestamp = selDate.getTime();
+        newTimestampStr = selDate.toLocaleString('th-TH');
+      } else {
+        const manualVal = document.getElementById('editTxDatetimeInput')?.value?.trim();
+        if (manualVal) newTimestampStr = manualVal;
+      }
+
+      const newLocation = (document.getElementById('editTxLocationInput')?.value || '').trim();
+      const newNote = (document.getElementById('editTxNoteInput')?.value || '').trim();
+
+      // Recalculate stock if quantity changed
+      let stockUpdatedMsg = '';
+      const equipId = tx.equipmentId || tx.code;
+      const equipItem = (equipmentList || []).find(x => x.id === equipId || x.code === equipId || x.name === tx.equipmentName);
+
+      if (diff !== 0 && equipItem) {
+        const currentStock = Number(equipItem.quantity || 0);
+        const currentBorrowed = Number(equipItem.borrowedCount || 0);
+        let newStock = currentStock;
+        let newBorrowed = currentBorrowed;
+
+        if (tx.type === 'เบิกจ่าย') {
+          newStock = currentStock - diff;
+        } else if (tx.type === 'รับเข้าสต๊อก' || tx.type === 'รับเข้าสต๊อก (ขาเข้า)' || tx.type === 'เติมสต๊อกด่วน') {
+          newStock = currentStock + diff;
+        } else if (tx.type === 'ยืมอุปกรณ์') {
+          newStock = currentStock - diff;
+          newBorrowed = Math.max(0, currentBorrowed + diff);
+        } else if (tx.type === 'คืนอุปกรณ์') {
+          newStock = currentStock + diff;
+          newBorrowed = Math.max(0, currentBorrowed - diff);
+        }
+
+        if (newStock < 0) {
+          const confirmNeg = await window.showConfirmDialog({
+            title: "แจ้งเตือนจำนวนสต๊อก",
+            message: `การแก้ไขจำนวนนี้จะทำให้ยอดคงเหลือของ "${equipItem.name}" ติดลบ (${newStock} ${equipItem.unit || 'ชิ้น'})\n\nคุณต้องการยืนยันบันทึกหรือไม่?`,
+            type: "warning",
+            confirmText: "ยืนยันบันทึก"
+          });
+          if (!confirmNeg) return;
+        }
+
+        equipItem.quantity = Math.max(0, newStock);
+        if (tx.type === 'ยืมอุปกรณ์' || tx.type === 'คืนอุปกรณ์') {
+          equipItem.borrowedCount = newBorrowed;
+        }
+
+        if (isFirebaseReady && db && equipItem.id) {
+          try {
+            await setDoc(doc(db, "equipment", equipItem.id), equipItem, { merge: true });
+          } catch (err) {
+            console.warn("Update equipment stock error:", err);
+          }
+        }
+        stockUpdatedMsg = ` (ปรับสต๊อก ${equipItem.name} คงเหลือ ${equipItem.quantity} ${equipItem.unit || ''})`;
+      }
+
+      // Update Transaction Object
+      tx.timestamp = newTimestampStr;
+      tx.rawTimestamp = newRawTimestamp;
+      tx.quantity = newQty;
+      if (newLocation) tx.location = newLocation;
+      tx.note = newNote;
+      if (tx.items && Array.isArray(tx.items) && tx.items.length === 1) {
+        tx.items[0].quantity = newQty;
+      }
+
+      // Re-sort transactionHistory by timestamp desc
+      transactionHistory.sort((a, b) => {
+        const tA = (typeof getRecordTimestampMs === 'function') ? getRecordTimestampMs(a) : (a.rawTimestamp || 0);
+        const tB = (typeof getRecordTimestampMs === 'function') ? getRecordTimestampMs(b) : (b.rawTimestamp || 0);
+        return tB - tA;
+      });
+
+      saveToLocalStorage();
+
+      if (isFirebaseReady && db) {
+        try {
+          await setDoc(doc(db, "transactions", tx.id), tx, { merge: true });
+        } catch (err) {
+          console.warn("Firestore update transaction error:", err);
+        }
+      }
+
+      // Update UI across the app
+      renderHistoryTable();
+      if (typeof renderEquipmentHistoryModalTable === 'function') renderEquipmentHistoryModalTable();
+      renderCatalogGrid();
+      renderStaffTable();
+      if (typeof updateStats === 'function') updateStats();
+
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('ประวัติรายการ', 'แก้ไข', `แก้ไขรายการ #${tx.id} วันที่: ${newTimestampStr}, จำนวน: ${oldQty} -> ${newQty} ${tx.unit || ''}${stockUpdatedMsg}`, tx.id);
+      }
+
+      const modalElem = document.getElementById('editTransactionModal');
+      if (modalElem) {
+        const modalInst = bootstrap.Modal.getInstance(modalElem);
+        if (modalInst) modalInst.hide();
+      }
+
+      showToast(`🎉 บันทึกการแก้ไขรายการประวัติเรียบร้อยแล้ว!${stockUpdatedMsg}`, { title: "แก้ไขสำเร็จ", type: "success" });
+    };
+
+    window.deleteTransactionRecord = async function(txId) {
+      if (!txId) return;
+      if (typeof currentRole !== 'undefined' && currentRole !== 'ADMIN') {
+        showToast("⚠️ เฉพาะผู้ดูแลระบบ (Admin) เท่านั้นที่มีสิทธิ์ลบรายการประวัติ", { type: "warning" });
+        return;
+      }
+      const txObj = (transactionHistory || []).find(x => x.id === txId);
+      if (!txObj) return;
+
+      const desc = `${txObj.type || 'รายการ'} ${txObj.equipmentName || ''} จำนวน ${txObj.quantity || 1} ${txObj.unit || ''} (${txObj.employeeName || ''})`;
+      const ok = await window.showConfirmDialog({
+        title: "ยืนยันการลบรายการประวัติ",
+        message: `คุณต้องการลบรายการประวัตินี้ใช่หรือไม่?\n\n• ${desc}\n• วันที่: ${txObj.timestamp || '-'}\n\n⚠️ เมื่อลบแล้ว ข้อมูลประวัติการทำรายการนี้จะถูกนำออกจากระบบ`,
+        type: "danger",
+        confirmText: "ลบรายการประวัติ"
+      });
+      if (!ok) return;
+
+      transactionHistory = transactionHistory.filter(x => x.id !== txId);
+      if (isFirebaseReady && db) {
+        try { await deleteDoc(doc(db, "transactions", txId)); } catch(e){}
+      }
+      saveToLocalStorage();
+      renderHistoryTable();
+      if (typeof renderEquipmentHistoryModalTable === 'function') renderEquipmentHistoryModalTable();
+      if (typeof updateStats === 'function') updateStats();
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('ประวัติรายการ', 'ลบ', `ลบรายการประวัติ #${txId} (${desc})`, txId);
+      }
+      showToast(`🗑️ ลบรายการประวัติ #${txId} เรียบร้อยแล้ว`, { type: 'success' });
+    };
+
     window.printEmployeeHistoryReport = function() {
       if (!currentEmpHistoryId) return;
       const emp = employeeList.find(x => x.id === currentEmpHistoryId);
@@ -6740,7 +10480,7 @@
           </div>
 
           <div class="header-box">
-            <h2>โครงการทุ่งสวรรค์ ตะวันฉาย (Flora Garden)</h2>
+            <h2>${(typeof window.getFloraProjectTitle === 'function' ? window.getFloraProjectTitle() : 'โครงการรัตนบุปผา และผลิตดอกไม้ธรรมยาตรา')}</h2>
             <h4>รายงานประวัติการเบิก-ยืม-คืน อุปกรณ์การเกษตรรายบุคคล</h4>
             <small>พิมพ์รายงานเมื่อ: ${new Date().toLocaleString('th-TH')}</small>
           </div>
@@ -7791,11 +11531,11 @@
           qtyColor = 'text-warning-emphasis';
           qtyPrefix = '-';
         } else if (r.type === 'คืนอุปกรณ์') {
-          typeBadge = '<span class="badge bg-info text-dark"><i class="bi bi-box-arrow-in-down me-1"></i> คืนอุปกรณ์</span>';
+          typeBadge = '<span class="badge fw-bold shadow-sm px-2.5 py-1.5" style="background-color: #0dcaf0 !important; color: #000000 !important;"><i class="bi bi-box-arrow-in-down me-1"></i> คืนอุปกรณ์</span>';
           qtyColor = 'text-info-emphasis';
           qtyPrefix = '+';
         } else if (r.type.includes('รับเข้า') || r.type.includes('เติมสต๊อก')) {
-          typeBadge = '<span class="badge bg-success"><i class="bi bi-box-arrow-in-down-left me-1"></i> รับเข้าสต๊อก</span>';
+          typeBadge = '<span class="badge text-white fw-bold shadow-sm px-2.5 py-1.5" style="background-color: #00c853 !important; color: #ffffff !important;"><i class="bi bi-box-arrow-in-down-left me-1"></i> รับเข้าสต๊อก</span>';
           qtyColor = 'text-success';
           qtyPrefix = '+';
         } else {
@@ -8285,6 +12025,22 @@
       }
     };
 
+    window.printEquipmentQrCode = function() {
+      if (!activeModalEquipId) return;
+      const item = equipmentList.find(x => x.id === activeModalEquipId);
+      if (!item) return;
+
+      const modalElem = document.getElementById('equipmentQrModal');
+      const modalInst = bootstrap.Modal.getInstance(modalElem);
+      if (modalInst) modalInst.hide();
+
+      setTimeout(() => {
+        if (typeof openPrintLabelModal === 'function') {
+          openPrintLabelModal(item.id);
+        }
+      }, 200);
+    };
+
     let currentPopupMenuEquipId = null;
 
     window.openEquipmentPopupMenu = function(equipId) {
@@ -8348,7 +12104,9 @@
       if (!equipId) return;
 
       setTimeout(() => {
-        if (actionType === 'BORROWERS') {
+        if (actionType === 'HISTORY') {
+          if (typeof openEquipmentTransactionHistoryModal === 'function') openEquipmentTransactionHistoryModal(equipId);
+        } else if (actionType === 'BORROWERS') {
           if (typeof showEquipmentBorrowersModal === 'function') showEquipmentBorrowersModal(equipId);
         } else if (actionType === 'RESTOCK') {
           if (typeof openRestockInboundModal === 'function') openRestockInboundModal(equipId);
@@ -8365,14 +12123,359 @@
     };
 
     // ==========================================
+    // EQUIPMENT TRANSACTION HISTORY MODAL LOGIC
+    // ==========================================
+    let currentEquipHistoryId = null;
+
+    window.toggleEqHistMetrics = function() {
+      const container = document.getElementById('eqHistMetricsContainer');
+      const icon = document.getElementById('eqHistEyeIcon');
+      if (!container) return;
+      const isHidden = container.classList.contains('d-none');
+      if (isHidden) {
+        container.classList.remove('d-none');
+        if (icon) icon.className = 'bi bi-eye-slash';
+      } else {
+        container.classList.add('d-none');
+        if (icon) icon.className = 'bi bi-eye';
+      }
+    };
+
+    window.openEquipmentTransactionHistoryModal = function(equipId) {
+      if (!equipId) return;
+      const item = (equipmentList || []).find(x => x.id === equipId || x.code === equipId);
+      if (!item) {
+        if (typeof showToast === 'function') showToast("❌ ไม่พบข้อมูลอุปกรณ์ที่เลือก");
+        return;
+      }
+
+      currentEquipHistoryId = item.id;
+
+      const defaultImg = typeof DEFAULT_EQUIPMENT_IMAGE !== 'undefined' ? DEFAULT_EQUIPMENT_IMAGE : 'https://images.unsplash.com/photo-1416879595882-3373a0480b5b?w=200&auto=format&fit=crop&q=80';
+
+      // Header Preview Elements
+      const imgElem = document.getElementById('eqHistModalImg');
+      if (imgElem) {
+        imgElem.src = item.imageUrl || defaultImg;
+        imgElem.onerror = function() { this.src = defaultImg; };
+      }
+
+      const nameElem = document.getElementById('eqHistModalName');
+      if (nameElem) nameElem.textContent = item.name || 'ไม่มีชื่ออุปกรณ์';
+
+      const codeElem = document.getElementById('eqHistModalCode');
+      if (codeElem) codeElem.textContent = item.code || item.id;
+
+      const catElem = document.getElementById('eqHistModalCat');
+      if (catElem) catElem.textContent = item.category || 'ทั่วไป';
+
+      const locElem = document.getElementById('eqHistModalLoc');
+      if (locElem) locElem.textContent = item.location || 'คลังกลาง';
+
+      // Reset Metrics Container to default hidden
+      const metricsContainer = document.getElementById('eqHistMetricsContainer');
+      if (metricsContainer) metricsContainer.classList.add('d-none');
+      const eyeIcon = document.getElementById('eqHistEyeIcon');
+      if (eyeIcon) eyeIcon.className = 'bi bi-eye';
+
+      const stockElem = document.getElementById('eqHistModalStock');
+      if (stockElem) stockElem.textContent = `${item.quantity || 0} ${item.unit || 'ชิ้น'}`;
+
+      const borrowedElem = document.getElementById('eqHistModalBorrowed');
+      if (borrowedElem) borrowedElem.textContent = `${item.borrowedCount || 0} ${item.unit || 'ชิ้น'}`;
+
+      // Borrowers shortcut button in footer
+      const btnBorrowers = document.getElementById('btnEqHistOpenBorrowers');
+      const badgeBorrowersCount = document.getElementById('btnEqHistBorrowersCount');
+      if (btnBorrowers) {
+        if ((item.borrowedCount || 0) > 0) {
+          btnBorrowers.classList.remove('d-none');
+          if (badgeBorrowersCount) badgeBorrowersCount.textContent = `${item.borrowedCount} ${item.unit || 'ชิ้น'}`;
+        } else {
+          btnBorrowers.classList.add('d-none');
+        }
+      }
+
+      // Reset Search & Type Filter
+      const searchInput = document.getElementById('eqHistSearchInput');
+      if (searchInput) searchInput.value = '';
+
+      const typeFilter = document.getElementById('eqHistTypeFilter');
+      if (typeFilter) typeFilter.value = 'ALL';
+
+      // Render Table
+      renderEquipmentHistoryModalTable();
+
+      // Show Modal
+      const modalElem = document.getElementById('equipmentTransactionHistoryModal');
+      if (modalElem) {
+        const modalInst = bootstrap.Modal.getOrCreateInstance(modalElem);
+        modalInst.show();
+      }
+    };
+
+    window.openBorrowersFromHistModal = function() {
+      const modalElem = document.getElementById('equipmentTransactionHistoryModal');
+      if (modalElem) {
+        const modal = bootstrap.Modal.getInstance(modalElem);
+        if (modal) modal.hide();
+      }
+      setTimeout(() => {
+        if (currentEquipHistoryId && typeof showEquipmentBorrowersModal === 'function') {
+          showEquipmentBorrowersModal(currentEquipHistoryId);
+        }
+      }, 250);
+    };
+
+    window.renderEquipmentHistoryModalTable = function() {
+      if (!currentEquipHistoryId) return;
+      const isAdmin = (typeof currentRole !== 'undefined' && currentRole === 'ADMIN');
+      const item = (equipmentList || []).find(x => x.id === currentEquipHistoryId);
+      if (!item) return;
+
+      const targetId = (item.id || '').toString().toLowerCase();
+      const targetCode = (item.code || '').toString().toLowerCase();
+      const targetName = (item.name || '').toString().toLowerCase();
+
+      function isMatchingEquip(eqId, eqCode, eqName) {
+        const idStr = (eqId || '').toString().toLowerCase();
+        const codeStr = (eqCode || '').toString().toLowerCase();
+        const nameStr = (eqName || '').toString().toLowerCase();
+        
+        return (targetId && idStr === targetId) ||
+               (targetCode && codeStr === targetCode) ||
+               (targetCode && idStr === targetCode) ||
+               (targetName && nameStr.length > 0 && nameStr.includes(targetName));
+      }
+
+      // 1. Extract all transactions relating to this equipment
+      const relatedTxs = [];
+      let totalDisbursedQty = 0;
+      let totalRestockedQty = 0;
+
+      (transactionHistory || []).forEach(tx => {
+        if (!tx) return;
+        let matchedQty = 0;
+        let matchedUnit = item.unit || 'ชิ้น';
+
+        if (Array.isArray(tx.items) && tx.items.length > 0) {
+          tx.items.forEach(it => {
+            if (isMatchingEquip(it.equipmentId, it.equipmentCode, it.equipmentName)) {
+              matchedQty += Number(it.quantity || 0);
+              if (it.unit) matchedUnit = it.unit;
+            }
+          });
+        } else {
+          if (isMatchingEquip(tx.equipmentId, tx.equipmentCode, tx.equipmentName)) {
+            matchedQty = Number(tx.quantity || 0);
+            if (tx.unit) matchedUnit = tx.unit;
+          }
+        }
+
+        if (matchedQty > 0 || isMatchingEquip(tx.equipmentId, tx.equipmentCode, tx.equipmentName)) {
+          const effectiveQty = matchedQty > 0 ? matchedQty : (Number(tx.quantity) || 1);
+          relatedTxs.push({
+            ...tx,
+            itemSpecificQty: effectiveQty,
+            itemSpecificUnit: matchedUnit
+          });
+
+          const txType = tx.type || '';
+          if (txType === 'เบิกจ่าย') {
+            totalDisbursedQty += effectiveQty;
+          } else if (txType === 'รับเข้าสต๊อก' || txType === 'เติมสต๊อก') {
+            totalRestockedQty += effectiveQty;
+          }
+        }
+      });
+
+      // Update Header Stats
+      const totalTxElem = document.getElementById('eqHistModalTotalTx');
+      if (totalTxElem) totalTxElem.textContent = `${relatedTxs.length} รายการ`;
+
+      const disbursedElem = document.getElementById('eqHistModalDisbursed');
+      if (disbursedElem) disbursedElem.textContent = `${totalDisbursedQty} ${item.unit || 'ชิ้น'}`;
+
+      const restockedElem = document.getElementById('eqHistModalRestocked');
+      if (restockedElem) restockedElem.textContent = `${totalRestockedQty} ${item.unit || 'ชิ้น'}`;
+
+      // 2. Sort strictly by latest date/time first (เรียงตามวันที่ล่าสุด)
+      relatedTxs.sort((a, b) => {
+        const tA = (a.rawTimestamp || (a.timestamp ? new Date(a.timestamp).getTime() : 0)) || 0;
+        const tB = (b.rawTimestamp || (b.timestamp ? new Date(b.timestamp).getTime() : 0)) || 0;
+        return tB - tA; // LATEST FIRST
+      });
+
+      // 3. Filter by search query & type filter
+      const searchQuery = (document.getElementById('eqHistSearchInput')?.value || '').toLowerCase().trim();
+      const selectedType = document.getElementById('eqHistTypeFilter')?.value || 'ALL';
+
+      const filtered = relatedTxs.filter(tx => {
+        const matchesType = selectedType === 'ALL' || (tx.type && tx.type.includes(selectedType));
+        if (!matchesType) return false;
+
+        if (!searchQuery) return true;
+
+        const empName = String(tx.employeeName || '').toLowerCase();
+        const empCode = String(tx.employeeCode || tx.employeeId || '').toLowerCase();
+        const locStr = String(tx.location || '').toLowerCase();
+        const noteStr = String(tx.note || '').toLowerCase();
+        const timeStr = String(tx.timestamp || '').toLowerCase();
+        const typeStr = String(tx.type || '').toLowerCase();
+        const docNo = String(tx.docNo || tx.id || '').toLowerCase();
+
+        return empName.includes(searchQuery) ||
+               empCode.includes(searchQuery) ||
+               locStr.includes(searchQuery) ||
+               noteStr.includes(searchQuery) ||
+               timeStr.includes(searchQuery) ||
+               typeStr.includes(searchQuery) ||
+               docNo.includes(searchQuery);
+      });
+
+      // 4. Render Table
+      const tbody = document.getElementById('eqHistTableBody');
+      const emptyState = document.getElementById('eqHistEmptyState');
+      const countBadge = document.getElementById('eqHistCountBadge');
+
+      if (countBadge) countBadge.textContent = `พบ ${filtered.length} รายการ`;
+
+      if (!tbody) return;
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = '';
+        if (emptyState) emptyState.classList.remove('d-none');
+        return;
+      }
+
+      if (emptyState) emptyState.classList.add('d-none');
+
+      let html = '';
+      filtered.forEach(tx => {
+        // Type Badge
+        let typeBadge = '';
+        const t = tx.type || '';
+        if (t === 'เบิกจ่าย') {
+          typeBadge = `<span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 px-2 py-1"><i class="bi bi-box-arrow-up-right me-1"></i>เบิกจ่าย</span>`;
+        } else if (t === 'ยืมอุปกรณ์') {
+          typeBadge = `<span class="badge bg-warning bg-opacity-25 text-dark border border-warning border-opacity-50 px-2 py-1"><i class="bi bi-arrow-repeat me-1 text-warning"></i>ยืมอุปกรณ์</span>`;
+        } else if (t === 'คืนอุปกรณ์') {
+          typeBadge = `<span class="badge px-2.5 py-1.5 fw-bold shadow-sm" style="background-color: #0dcaf0 !important; color: #000000 !important;"><i class="bi bi-box-arrow-in-down-left me-1"></i>คืนอุปกรณ์</span>`;
+        } else if (t === 'รับเข้าสต๊อก' || t === 'เติมสต๊อก') {
+          typeBadge = `<span class="badge text-white px-2.5 py-1.5 fw-bold shadow-sm" style="background-color: #00c853 !important; color: #ffffff !important;"><i class="bi bi-plus-circle-fill me-1"></i>รับเข้าสต๊อก</span>`;
+        } else {
+          typeBadge = `<span class="badge bg-secondary bg-opacity-10 text-secondary border px-2 py-1">${escapeHtml(t || '-')}</span>`;
+        }
+
+        // Employee Info
+        const empObj = (employeeList || []).find(e => e.id === tx.employeeId || (e.name && tx.employeeName && tx.employeeName.includes(e.name)));
+        const empAvatar = empObj?.photoUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80';
+        const empName = empObj ? empObj.name : (tx.employeeName || 'พนักงาน');
+        const empDept = empObj ? empObj.department : (tx.employeeDepartment || 'ทั่วไป');
+
+        // Due Date / Status
+        let dueOrStatus = '-';
+        if (t === 'ยืมอุปกรณ์') {
+          let rawDue = tx.dueDateStr || '';
+          if (!rawDue && tx.dueDate) {
+            const d = new Date(tx.dueDate);
+            if (!isNaN(d.getTime())) {
+              const day = String(d.getDate()).padStart(2, '0');
+              const month = String(d.getMonth() + 1).padStart(2, '0');
+              const yearBE = d.getFullYear() + 543;
+              const hours = String(d.getHours()).padStart(2, '0');
+              const mins = String(d.getMinutes()).padStart(2, '0');
+              rawDue = `${day}/${month}/${yearBE} ${hours}:${mins}`;
+            }
+          }
+          if (!rawDue) {
+            rawDue = (typeof formatDueDateForReceipt === 'function' ? formatDueDateForReceipt(tx) : (tx.dueDate || '3 วัน'));
+          }
+          const cleanDueText = String(rawDue).replace(/\s*น\.?$/g, '').trim();
+          dueOrStatus = `<span class="text-danger fw-semibold">${cleanDueText}</span>`;
+        } else if (t === 'คืนอุปกรณ์') {
+          dueOrStatus = `<span class="badge bg-success-subtle text-success"><i class="bi bi-check2-all me-1"></i>คืนแล้ว</span>`;
+        } else if (t === 'รับเข้าสต๊อก' || t === 'เติมสต๊อก') {
+          dueOrStatus = `<span class="badge bg-light text-muted border">เติมคลัง</span>`;
+        } else if (t === 'เบิกจ่าย') {
+          dueOrStatus = `<span class="badge bg-light text-muted border">ตัดสต๊อก</span>`;
+        }
+
+        const qtyDisplay = `<strong class="text-dark fs-7">${tx.itemSpecificQty || tx.quantity || 1}</strong> <span class="text-muted fs-9">${tx.itemSpecificUnit || tx.unit || 'ชิ้น'}</span>`;
+
+        html += `
+          <tr>
+            <td class="ps-3 text-nowrap">
+              <div class="fw-bold text-dark fs-8">${tx.timestamp || '-'}</div>
+              <small class="text-muted font-monospace fs-9">#${tx.docNo || (tx.id ? tx.id.substring(0, 8) : '-')}</small>
+            </td>
+            <td>${typeBadge}</td>
+            <td>
+              <div class="d-flex align-items-center gap-2">
+                <img src="${empAvatar}" loading="lazy" class="rounded-circle border shadow-2xs" style="width: 28px; height: 28px; object-fit: cover;" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'" />
+                <div>
+                  <div class="fw-semibold text-dark fs-8 text-truncate" style="max-width: 170px;">${escapeHtml(empName)}</div>
+                  <span class="badge bg-light text-secondary border fs-9 py-0.5">${escapeHtml(empDept)}</span>
+                </div>
+              </div>
+            </td>
+            <td class="text-center text-nowrap">${qtyDisplay}</td>
+            <td class="fs-8">${dueOrStatus}</td>
+            <td class="fs-8 text-secondary text-truncate" style="max-width: 140px;" title="${escapeHtml(tx.location || item.location || 'คลังกลาง')}">
+              <i class="bi bi-geo-alt-fill me-1 text-danger"></i>${escapeHtml(tx.location || item.location || 'คลังกลาง')}
+            </td>
+            <td class="fs-8 text-secondary" style="max-width: 200px; min-width: 140px;">
+              ${tx.note ? `
+                <div class="note-single-line-scroll text-secondary py-1" style="max-width: 200px;" title="${escapeHtml(tx.note)}">
+                  ${escapeHtml(tx.note)}
+                </div>
+              ` : '<span class="text-muted">-</span>'}
+            </td>
+            <td class="text-center pe-3">
+              ${tx.id ? `
+                <div class="d-flex align-items-center justify-content-center gap-1">
+                  <button type="button" class="btn btn-xs btn-outline-success rounded-pill px-2.5 py-0.5 shadow-2xs fw-semibold" onclick="openPrintTransactionVoucherModal('${tx.id}')" title="พิมพ์ใบเอกสาร">
+                    พิมพ์
+                  </button>
+                  <button type="button" class="btn btn-xs btn-outline-primary rounded-pill px-2.5 py-0.5 shadow-2xs fw-semibold" onclick="openEditTransactionModal('${tx.id}')" title="แก้ไขวันที่และจำนวน">
+                    แก้ไข
+                  </button>
+                  ${isAdmin ? `
+                    <button type="button" class="btn btn-xs btn-outline-danger rounded-pill px-2.5 py-0.5 shadow-2xs fw-semibold" onclick="deleteTransactionRecord('${tx.id}')" title="ลบรายการประวัตินี้">
+                      ลบ
+                    </button>
+                  ` : ''}
+                </div>
+              ` : '<span class="text-muted">-</span>'}
+            </td>
+          </tr>
+        `;
+      });
+
+      tbody.innerHTML = html;
+    };
+
+    // ==========================================
     // EQUIPMENT BORROWERS MODAL LOGIC
     // ==========================================
-    window.showEquipmentBorrowersModal = function(equipId) {
+    window.currentBorrowersModalEquipId = null;
+    window.currentBorrowersModalFilterEmp = null;
+
+    window.clearBorrowersModalFilter = function() {
+      if (window.currentBorrowersModalEquipId) {
+        showEquipmentBorrowersModal(window.currentBorrowersModalEquipId, null);
+      }
+    };
+
+    window.showEquipmentBorrowersModal = function(equipId, filterEmpIdOrName = null) {
       const item = (equipmentList || []).find(x => x.id === equipId || x.code === equipId);
       if (!item) {
         showToast("❌ ไม่พบข้อมูลอุปกรณ์ที่เลือก");
         return;
       }
+
+      window.currentBorrowersModalEquipId = item.id;
+      window.currentBorrowersModalFilterEmp = filterEmpIdOrName;
 
       const defaultImg = typeof DEFAULT_EQUIPMENT_IMAGE !== 'undefined' ? DEFAULT_EQUIPMENT_IMAGE : 'https://images.unsplash.com/photo-1416879595882-3373a0480b5b?w=200&auto=format&fit=crop&q=80';
 
@@ -8396,6 +12499,9 @@
 
       const totalElem = document.getElementById('eqBorrowersTotal');
       if (totalElem) totalElem.textContent = `${item.borrowedCount || 0} ${item.unit || 'ชิ้น'}`;
+
+      const damagedElem = document.getElementById('eqBorrowersDamaged');
+      if (damagedElem) damagedElem.textContent = `${item.repairCount || 0} ${item.unit || 'ชิ้น'}`;
 
       const targetId = (item.id || '').toString().toLowerCase();
       const targetCode = (item.code || '').toString().toLowerCase();
@@ -8459,13 +12565,15 @@
             borrowedQty: 0,
             lastBorrowTime: tx.timestamp || '-',
             dueDateStr: tx.dueDateStr || (tx.dueDate ? (typeof formatDueDateForReceipt === 'function' ? formatDueDateForReceipt(tx) : null) : null),
-            dueDate: tx.dueDate || null
+            dueDate: tx.dueDate || null,
+            lastTxId: tx.id || null
           };
         }
 
         if (type === 'ยืมอุปกรณ์') {
           borrowerMap[key].borrowedQty += qtyInTx;
           borrowerMap[key].lastBorrowTime = tx.timestamp || borrowerMap[key].lastBorrowTime;
+          borrowerMap[key].lastTxId = tx.id || borrowerMap[key].lastTxId;
           if (tx.dueDateStr) borrowerMap[key].dueDateStr = tx.dueDateStr;
           else if (tx.dueDate && typeof formatDueDateForReceipt === 'function') borrowerMap[key].dueDateStr = formatDueDateForReceipt(tx);
           if (tx.dueDate) borrowerMap[key].dueDate = tx.dueDate;
@@ -8476,17 +12584,72 @@
 
       const activeBorrowers = Object.values(borrowerMap).filter(b => b.borrowedQty > 0);
 
+      let displayBorrowers = activeBorrowers;
+      const filterNotice = document.getElementById('eqBorrowersFilterNotice');
+      const filterNoticeText = document.getElementById('eqBorrowersFilterNoticeText');
+      let isFiltered = false;
+
+      if (filterEmpIdOrName) {
+        const fKey = (typeof filterEmpIdOrName === 'object' ? (filterEmpIdOrName.id || filterEmpIdOrName.name) : String(filterEmpIdOrName)).trim().toLowerCase();
+        displayBorrowers = activeBorrowers.filter(b => {
+          const bId = (b.employeeId || '').toLowerCase();
+          const bCode = (b.empObj && b.empObj.employeeCode ? b.empObj.employeeCode : '').toLowerCase();
+          const bName = (b.employeeName || '').toLowerCase();
+          return bId === fKey || bCode === fKey || bName.includes(fKey) || fKey.includes(bName);
+        });
+        isFiltered = true;
+
+        if (filterNotice && filterNoticeText) {
+          const targetB = displayBorrowers[0] || activeBorrowers.find(b => {
+            const bId = (b.employeeId || '').toLowerCase();
+            const bName = (b.employeeName || '').toLowerCase();
+            return bId === fKey || bName.includes(fKey) || fKey.includes(bName);
+          });
+          const targetName = targetB ? targetB.employeeName : (typeof filterEmpIdOrName === 'object' ? filterEmpIdOrName.name : filterEmpIdOrName);
+          const targetQty = targetB ? targetB.borrowedQty : '';
+          filterNoticeText.innerHTML = `🎯 <strong>สแกนตรงกับผู้ยืม:</strong> กำลังกรองเฉพาะรายการของ <strong>คุณ ${targetName}</strong> ${targetQty ? `(ยืมอยู่ ${targetQty} ${item.unit || 'ชิ้น'})` : ''} สามารถกดปุ่ม「คืน」เพื่อรับคืนอุปกรณ์เข้าคลังได้ทันที`;
+          filterNotice.classList.remove('d-none');
+          filterNotice.classList.add('d-flex');
+        }
+      } else {
+        if (filterNotice) {
+          filterNotice.classList.add('d-none');
+          filterNotice.classList.remove('d-flex');
+        }
+      }
+
       const tbody = document.getElementById('eqBorrowersTableBody');
       const countBadge = document.getElementById('eqBorrowersCountBadge');
 
-      if (countBadge) countBadge.textContent = `${activeBorrowers.length} พนักงาน`;
+      if (countBadge) {
+        if (isFiltered) {
+          countBadge.textContent = `${displayBorrowers.length} จาก ${activeBorrowers.length} พนักงาน`;
+        } else {
+          countBadge.textContent = `${activeBorrowers.length} พนักงาน`;
+        }
+      }
 
       if (tbody) {
-        if (activeBorrowers.length === 0) {
-          if ((item.borrowedCount || 0) > 0) {
+        if (displayBorrowers.length === 0) {
+          if (isFiltered && activeBorrowers.length > 0) {
             tbody.innerHTML = `
               <tr>
-                <td colspan="6" class="text-center py-4 text-muted">
+                <td colspan="8" class="text-center py-4 text-muted">
+                  <i class="bi bi-person-x text-warning fs-3 d-block mb-1"></i>
+                  <div class="fw-bold text-dark">ไม่พบข้อมูลการยืมของพนักงานที่ระบุสำหรับอุปกรณ์ชิ้นนี้</div>
+                  <small class="text-secondary">พนักงานอาจทำการคืนอุปกรณ์ไปแล้ว หรือระบุชื่อ/รหัสไม่ตรง</small>
+                  <div class="mt-2">
+                    <button type="button" class="btn btn-sm btn-outline-primary rounded-pill px-3" onclick="clearBorrowersModalFilter()">
+                      <i class="bi bi-people me-1"></i>ดูพนักงานทุกคนที่กำลังยืม (${activeBorrowers.length} คน)
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            `;
+          } else if ((item.borrowedCount || 0) > 0) {
+            tbody.innerHTML = `
+              <tr>
+                <td colspan="8" class="text-center py-4 text-muted">
                   <i class="bi bi-info-circle text-warning fs-3 d-block mb-1"></i>
                   <div class="fw-bold text-dark">มียอดถูกยืมอยู่ในระบบ ${item.borrowedCount} ${item.unit || 'ชิ้น'}</div>
                   <small class="text-secondary">ยังไม่มีข้อมูลรายชื่อพนักงานยืมในประวัติล่าสุด หรือเป็นยอดจากการทำรายการก่อนการซิงค์ระบบ</small>
@@ -8496,7 +12659,7 @@
           } else {
             tbody.innerHTML = `
               <tr>
-                <td colspan="6" class="text-center py-4 text-muted">
+                <td colspan="8" class="text-center py-4 text-muted">
                   <i class="bi bi-check-circle text-success fs-3 d-block mb-1"></i>
                   <div class="fw-bold text-dark">ไม่มีพนักงานยืมอุปกรณ์ชิ้นนี้อยู่ขณะนี้</div>
                   <small class="text-secondary">อุปกรณ์ทั้งหมดพร้อมใช้งานอยู่ในคลังกลาง</small>
@@ -8506,9 +12669,17 @@
           }
         } else {
           let html = '';
-          activeBorrowers.forEach(b => {
+          const damagesMap = (window.damagedEquipmentReports || {});
+
+          displayBorrowers.forEach(b => {
             const empAvatar = b.empObj && b.empObj.photoUrl ? b.empObj.photoUrl : 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80';
             
+            const dmgKey = `${item.id}_${b.employeeId || b.employeeName}`;
+            const dmgRecord = damagesMap[dmgKey] || {};
+            const damagedQty = Number(dmgRecord.damagedQty || 0);
+            const damageNote = dmgRecord.note || '';
+            const safeDamageNote = (damageNote || '').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/[\r\n]+/g, ' ');
+
             let dueDateText = b.dueDateStr;
             if (!dueDateText && b.dueDate) {
               dueDateText = typeof formatDueDateForReceipt === 'function' ? formatDueDateForReceipt(b) : null;
@@ -8521,10 +12692,29 @@
             const isOverdue = b.dueDate ? (now > b.dueDate) : false;
 
             html += `
-              <tr class="${isOverdue ? 'overdue-pulse-row' : ''}">
+              <tr class="${isOverdue ? 'overdue-pulse-row' : ''} ${isFiltered ? 'table-warning bg-warning bg-opacity-10 border border-warning' : ''}">
+                <td class="text-center">
+                  <button type="button" class="btn btn-sm ${isFiltered ? 'btn-success text-white' : 'btn-info text-dark'} rounded-pill px-3 py-1 fs-7 fw-bold shadow-sm" onclick="returnEquipmentFromBorrowersModal(event, '${item.id}', '${b.employeeId || ''}', ${b.borrowedQty})" title="บันทึกรับคืนอุปกรณ์นี้เข้าคลังทันที">
+                    <i class="bi bi-box-arrow-in-down me-0.5"></i> คืน
+                  </button>
+                </td>
+                <td class="text-center text-nowrap">
+                  <span class="badge bg-warning bg-opacity-25 text-dark border border-warning rounded-pill px-2.5 py-1 fw-bold fs-7">ยืม ${b.borrowedQty}</span>
+                </td>
+                <td class="text-center text-nowrap">
+                  ${damagedQty > 0 ? `
+                    <button type="button" class="btn btn-sm btn-danger rounded-pill px-2.5 py-0.5 fw-bold shadow-sm fs-7" onclick="openReportDamageModal('${item.id}', '${b.employeeId || ''}', ${b.borrowedQty}, ${damagedQty}, '${safeDamageNote}')" title="${damageNote ? `ชำรุด: ${damageNote}` : 'มีอุปกรณ์ชำรุด (คลิกเพื่อแก้ไข)'}">
+                      ชำรุด ${damagedQty}
+                    </button>
+                  ` : `
+                    <button type="button" class="btn btn-sm btn-outline-secondary rounded-pill px-2.5 py-0.5 fw-semibold fs-7" onclick="openReportDamageModal('${item.id}', '${b.employeeId || ''}', ${b.borrowedQty}, 0, '')" title="คลิกเพื่อบันทึกแจ้งอุปกรณ์ชำรุด">
+                      ชำรุด
+                    </button>
+                  `}
+                </td>
                 <td>
                   <div class="d-flex align-items-center gap-2">
-                    <img src="${empAvatar}" class="rounded-circle border shadow-sm" style="width: 32px; height: 32px; object-fit: cover;" />
+                    <img src="${empAvatar}" loading="lazy" class="rounded-circle border shadow-sm" style="width: 32px; height: 32px; object-fit: cover;" />
                     <div>
                       <div class="fw-bold text-dark">${b.employeeName}</div>
                       ${b.empObj && b.empObj.employeeCode ? `<span class="badge bg-dark font-monospace fs-8">${b.empObj.employeeCode}</span>` : ''}
@@ -8532,20 +12722,26 @@
                   </div>
                 </td>
                 <td><span class="badge bg-light text-dark border fs-8">${b.department}</span></td>
-                <td class="text-center fw-bold text-warning fs-6">${b.borrowedQty} ${item.unit || 'ชิ้น'}</td>
-                <td class="text-center fs-8 text-secondary">${b.lastBorrowTime}</td>
+                <td class="text-center fs-8 text-secondary text-nowrap">${b.lastBorrowTime}</td>
                 <td class="text-center fs-8">
-                  <div class="fw-bold ${isOverdue ? 'text-danger' : 'text-dark'}">${dueDateText}</div>
-                  ${isOverdue ? '<span class="badge bg-danger text-white fs-8 mt-0.5 overdue-pulse-badge"><i class="bi bi-exclamation-triangle-fill me-1"></i>เกินกำหนดคืน</span>' : '<span class="badge bg-warning bg-opacity-25 text-dark border border-warning fs-8 mt-0.5"><i class="bi bi-calendar-check me-1"></i>กำหนดส่งคืน</span>'}
+                  <div class="d-inline-flex flex-column align-items-center cursor-pointer p-1.5 rounded-3 hover-bg-light transition-all" onclick="openEditBorrowerDueDateModal('${item.id}', '${b.employeeId || ''}', '${b.employeeName.replace(/'/g, "\\'")}', ${b.dueDate || 0}, '${b.lastTxId || ''}', ${b.borrowedQty}, '${dueDateText.replace(/'/g, "\\'")}')" title="คลิกเพื่อแก้ไขกำหนดวัน/เวลาส่งคืน" style="cursor: pointer;">
+                    <div class="fw-bold ${isOverdue ? 'text-danger' : 'text-dark'} d-inline-flex align-items-center gap-1">
+                      <span>${dueDateText}</span>
+                      <i class="bi bi-pencil-fill text-muted" style="font-size: 11px;"></i>
+                    </div>
+                    ${isOverdue 
+                      ? '<span class="badge bg-danger text-white fs-8 mt-0.5 overdue-pulse-badge"><i class="bi bi-exclamation-triangle-fill me-1"></i>เกินกำหนดคืน</span>' 
+                      : '<span class="badge bg-warning bg-opacity-25 text-dark border border-warning fs-8 mt-0.5"><i class="bi bi-calendar-check me-1"></i>กำหนดส่งคืน <i class="bi bi-pencil-square ms-0.5"></i></span>'}
+                  </div>
                 </td>
                 <td class="text-center">
                   <div class="d-flex align-items-center justify-content-center gap-1">
-                    <button type="button" class="btn btn-xs btn-success rounded-pill px-2 py-1 fs-8 fw-bold shadow-sm d-inline-flex align-items-center gap-1" onclick="sendLineOverdueReminder('${b.employeeId || ''}', '${b.employeeName.replace(/'/g, "\\'")}', '${item.name.replace(/'/g, "\\'")}', '${item.code || ''}', ${b.borrowedQty}, '${item.unit || 'ชิ้น'}', ${isOverdue ? 1 : 0}, '${dueDateText}')" title="ส่งการแจ้งเตือนติดตามคืนทาง LINE">
+                    <button type="button" class="btn btn-xs btn-success rounded-pill px-2.5 py-1 fs-8 fw-bold shadow-sm d-inline-flex align-items-center gap-1" onclick="sendLineOverdueReminder('${b.employeeId || ''}', '${b.employeeName.replace(/'/g, "\\'")}', '${item.name.replace(/'/g, "\\'")}', '${item.code || ''}', ${b.borrowedQty}, '${item.unit || 'ชิ้น'}', ${isOverdue ? 1 : 0}, '${dueDateText}')" title="ส่งการแจ้งเตือนติดตามคืนทาง LINE">
                       <i class="bi bi-line"></i> LINE
                     </button>
                     ${b.employeeId ? `
-                      <button type="button" class="btn btn-sm btn-outline-success rounded-pill px-2 py-1 fs-8 fw-semibold" onclick="viewBorrowerEmpHistory('${b.employeeId}')">
-                        <i class="bi bi-clock-history me-1"></i> ประวัติ
+                      <button type="button" class="btn btn-xs btn-outline-secondary rounded-pill px-2 py-1 fs-8 fw-semibold" onclick="viewBorrowerEmpHistory('${b.employeeId}')" title="ดูประวัติการยืม-คืนของพนักงานนี้">
+                        <i class="bi bi-clock-history me-0.5"></i> ประวัติ
                       </button>
                     ` : ''}
                   </div>
@@ -8616,6 +12812,509 @@
     };
 
     // ==========================================
+    // REPORT EQUIPMENT DAMAGE FUNCTIONS
+    // ==========================================
+    window.damagedEquipmentReports = JSON.parse(localStorage.getItem('flora_equipment_damages') || '{}');
+
+    window.openReportDamageModal = function(equipId, empId, borrowedQty, currentDamagedQty, currentDamageNote) {
+      const equipObj = (equipmentList || []).find(x => String(x.id) === String(equipId) || String(x.code) === String(equipId));
+      const empObj = (employeeList || []).find(x => String(x.id) === String(empId) || String(x.code) === String(empId));
+      const equipName = equipObj ? equipObj.name : 'อุปกรณ์';
+      const empName = empObj ? empObj.name : (empId || 'พนักงาน');
+      const unit = equipObj ? (equipObj.unit || 'ชิ้น') : 'ชิ้น';
+
+      document.getElementById('damageEquipId').value = equipId;
+      document.getElementById('damageEmpId').value = empId || '';
+      document.getElementById('damageMaxQty').value = borrowedQty;
+
+      document.getElementById('damageEquipName').textContent = `${equipName} [${equipObj ? (equipObj.code || equipObj.id) : ''}]`;
+      document.getElementById('damageEmpName').textContent = empName;
+      document.getElementById('damageUnitLabel').textContent = unit;
+      document.getElementById('damageMaxHint').textContent = `* ยืมอยู่ทั้งหมด ${borrowedQty} ${unit} (หากต้องการยกเลิกสถานะชำรุด ให้ใส่เป็น 0)`;
+
+      const qtyInput = document.getElementById('damageQtyInput');
+      if (qtyInput) {
+        qtyInput.max = borrowedQty;
+        qtyInput.value = currentDamagedQty || 0;
+      }
+
+      const noteInput = document.getElementById('damageNoteInput');
+      if (noteInput) {
+        noteInput.value = currentDamageNote || '';
+      }
+
+      const modalElem = document.getElementById('reportDamageModal');
+      if (modalElem) {
+        const modal = bootstrap.Modal.getOrCreateInstance(modalElem);
+        modal.show();
+      }
+    };
+
+    window.saveEquipmentDamageReport = function() {
+      const equipId = document.getElementById('damageEquipId')?.value || '';
+      const empId = document.getElementById('damageEmpId')?.value || '';
+      const maxQty = parseInt(document.getElementById('damageMaxQty')?.value, 10) || 1;
+      const qty = parseInt(document.getElementById('damageQtyInput')?.value, 10) || 0;
+      const note = (document.getElementById('damageNoteInput')?.value || '').trim();
+
+      if (qty < 0) {
+        showToast('กรุณาระบุจำนวนชำรุดให้ถูกต้อง (ตั้งแต่ 0 ขึ้นไป)');
+        return;
+      }
+      if (qty > maxQty) {
+        showToast(`จำนวนชำรุดต้องไม่เกินจำนวนที่ยืม (${maxQty})`);
+        return;
+      }
+
+      if (!window.damagedEquipmentReports) {
+        window.damagedEquipmentReports = {};
+      }
+
+      const key = `${equipId}_${empId}`;
+      if (qty > 0) {
+        window.damagedEquipmentReports[key] = {
+          equipId: equipId,
+          empId: empId,
+          damagedQty: qty,
+          note: note,
+          updatedAt: Date.now()
+        };
+        showToast(`บันทึกแจ้งชำรุด ${qty} รายการ เรียบร้อยแล้ว`);
+      } else {
+        delete window.damagedEquipmentReports[key];
+        showToast('ยกเลิกรายการชำรุดเรียบร้อยแล้ว');
+      }
+
+      try {
+        localStorage.setItem('flora_equipment_damages', JSON.stringify(window.damagedEquipmentReports));
+      } catch (e) {
+        console.warn('Save damaged reports localStorage error:', e);
+      }
+
+      const modalElem = document.getElementById('reportDamageModal');
+      if (modalElem) {
+        const modal = bootstrap.Modal.getInstance(modalElem);
+        if (modal) modal.hide();
+      }
+
+      // Refresh borrowers modal only if open
+      const borrowersModalElem = document.getElementById('equipmentBorrowersModal');
+      if (borrowersModalElem && borrowersModalElem.classList.contains('show') && typeof showEquipmentBorrowersModal === 'function') {
+        showEquipmentBorrowersModal(equipId);
+      }
+
+      // Refresh overdue borrowings table if open
+      if (typeof renderOverdueTable === 'function') {
+        renderOverdueTable();
+      }
+    };
+
+    // Return equipment directly from the borrowers modal
+    window.returnEquipmentFromBorrowersModal = async function(e, equipId, empId, returnQty) {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+
+      try {
+        const equipObj = (equipmentList || []).find(x => String(x.id) === String(equipId) || String(x.code) === String(equipId));
+        const empObj = (employeeList || []).find(x => String(x.id) === String(empId) || String(x.code) === String(empId));
+        const equipName = equipObj ? equipObj.name : 'อุปกรณ์';
+        const empName = empObj ? empObj.name : 'พนักงาน';
+        const unit = equipObj ? equipObj.unit : 'ชิ้น';
+        const qtyNum = parseInt(returnQty, 10) || 1;
+
+        // Check damage report for this employee & equipment
+        const dmgKey = `${equipId}_${empObj ? empObj.id : (empId || '')}`;
+        const damagesMap = (window.damagedEquipmentReports || {});
+        const dmgRecord = damagesMap[dmgKey] || {};
+        const damagedQty = Math.min(qtyNum, Number(dmgRecord.damagedQty || 0));
+        const goodQty = Math.max(0, qtyNum - damagedQty);
+        const damageNote = dmgRecord.note || '';
+
+        let confirmMsg = `ต้องการบันทึกรับคืน "${equipName}" จำนวน ${qtyNum} ${unit} จากคุณ ${empName} เข้าคลังทันทีหรือไม่?`;
+        if (damagedQty > 0) {
+          confirmMsg = `ต้องการบันทึกรับคืน "${equipName}" จากคุณ ${empName} หรือไม่?\n• สภาพสมบูรณ์: ${goodQty} ${unit} (นำกลับเข้าคลัง)\n• ชำรุด: ${damagedQty} ${unit} (แยกเข้าหมวดรอซ่อม)`;
+        }
+
+        let confirmed = false;
+        if (typeof window.showConfirmDialog === 'function') {
+          confirmed = await window.showConfirmDialog({
+            title: "ยืนยันรับคืนอุปกรณ์เข้าคลัง",
+            message: confirmMsg,
+            type: damagedQty > 0 ? "warning" : "info",
+            icon: damagedQty > 0 ? "bi-tools" : "bi-box-arrow-in-down",
+            confirmText: "บันทึกรับคืน",
+            cancelText: "ยกเลิก",
+            target: e ? (e.currentTarget || e.target) : null
+          });
+        } else {
+          confirmed = true;
+        }
+
+        if (!confirmed) return;
+
+        // 1. Update inventory stock (แบบที่ 1: สภาพสมบูรณ์กลับเข้า quantity, ส่วนชำรุดแยกเข้า repairCount)
+        if (equipObj) {
+          equipObj.quantity = (equipObj.quantity || 0) + goodQty;
+          if (damagedQty > 0) {
+            equipObj.repairCount = (equipObj.repairCount || 0) + damagedQty;
+          }
+          equipObj.borrowedCount = Math.max(0, (equipObj.borrowedCount || 0) - qtyNum);
+
+          if (isFirebaseReady && db && equipObj.id) {
+            setDoc(doc(db, "equipment", equipObj.id), equipObj, { merge: true }).catch(err => {
+              console.warn("Firestore update equipment stock error from borrowers modal:", err);
+            });
+          }
+        }
+
+        // Clear damaged report record if returned
+        if (damagesMap[dmgKey]) {
+          delete damagesMap[dmgKey];
+          try {
+            localStorage.setItem('flora_equipment_damages', JSON.stringify(damagesMap));
+          } catch (e) {}
+        }
+
+        // 2. Create transaction record
+        const now = new Date();
+        const docNo = 'DOC-' + String(Date.now()).slice(-6);
+        const txNote = damagedQty > 0 
+          ? `บันทึกรับคืนอุปกรณ์: สมบูรณ์ ${goodQty} ${unit}, ชำรุดส่งซ่อม ${damagedQty} ${unit}${damageNote ? ` (${damageNote})` : ''}` 
+          : 'บันทึกรับคืนอุปกรณ์จากหน้ารายชื่อผู้ยืม';
+
+        const newTx = {
+          id: 'tx-' + String(Date.now()).slice(-6),
+          docNo: docNo,
+          type: 'คืนอุปกรณ์',
+          employeeId: empObj ? empObj.id : (empId || 'UNKNOWN'),
+          employeeName: empObj ? `${empObj.name} (${empObj.department || 'แผนกทั่วไป'})` : 'พนักงาน',
+          employeeCode: empObj ? (empObj.code || empObj.id) : '',
+          employeeDepartment: empObj ? (empObj.department || 'แผนกทั่วไป') : 'แผนกทั่วไป',
+          items: [{
+            equipmentId: equipId,
+            equipmentName: equipName,
+            equipmentCode: equipObj ? (equipObj.code || equipObj.id) : '',
+            quantity: qtyNum,
+            unit: unit,
+            imageUrl: equipObj?.imageUrl || '',
+            location: equipObj?.location || 'คลังหลัก'
+          }],
+          equipmentId: equipId,
+          equipmentName: `${equipName} [${equipObj ? (equipObj.code || equipObj.id) : ''}]`,
+          quantity: qtyNum,
+          unit: unit,
+          location: equipObj?.location || 'คลังหลัก',
+          note: txNote,
+          damagedQty: damagedQty,
+          goodQty: goodQty,
+          dueDate: null,
+          dueDateStr: null,
+          rawTimestamp: now.getTime(),
+          timestamp: now.toLocaleString('th-TH')
+        };
+
+        transactionHistory.unshift(newTx);
+        saveToLocalStorage();
+
+        if (isFirebaseReady && db) {
+          try {
+            await setDoc(doc(db, "transactions", newTx.id), newTx, { merge: true });
+          } catch (err) {
+            console.warn("Firestore add transaction error from borrowers modal:", err);
+          }
+        }
+
+        if (typeof logAuditAction === 'function') {
+          logAuditAction('ประวัติรายการ', 'เพิ่ม', `ทำรายการคืนอุปกรณ์ (${qtyNum} ${unit}): ${equipName} จากคุณ ${empName}${damagedQty > 0 ? ` (ชำรุด ${damagedQty} ${unit})` : ''}`, newTx.id);
+        }
+
+        let summaryToast = `✅ บันทึกรับคืน "${equipName}" (${qtyNum} ${unit}) จากคุณ ${empName} เรียบร้อยแล้ว`;
+        if (damagedQty > 0) {
+          summaryToast = `✅ รับคืน "${equipName}": สภาพสมบูรณ์ ${goodQty} ${unit} เข้าคลัง, ชำรุด ${damagedQty} ${unit} แยกเข้าหมวดรอซ่อม`;
+        }
+        showToast(summaryToast);
+
+        // Refresh lists & UI
+        renderCatalogGrid();
+        renderStaffTable();
+        renderHistoryTable();
+        populateEquipmentDropdown();
+        populateQuickScanDropdown();
+        updateStats();
+
+        // Refresh the borrowers modal data or close if 0
+        if (equipObj && equipObj.id) {
+          showEquipmentBorrowersModal(equipObj.id, window.currentBorrowersModalFilterEmp);
+        }
+
+        // Automatic sync
+        if (typeof validateFirestoreHistorySync === 'function') {
+          validateFirestoreHistorySync(false);
+        }
+      } catch (err) {
+        console.error("Return from borrowers modal error:", err);
+        showToast("เกิดข้อผิดพลาดในการบันทึกคืนอุปกรณ์");
+      }
+    };
+
+    // ==========================================
+    // EDIT BORROWER DUE DATE MODAL FUNCTIONS
+    // ==========================================
+    window.editBorrowerDueDatePicker = null;
+
+    window.initEditBorrowerDueDatePicker = function() {
+      const elem = document.getElementById('editDueDateInput');
+      if (!elem || typeof flatpickr === 'undefined') return;
+      if (window.editBorrowerDueDatePicker) return;
+
+      const thLocale = (flatpickr.l10ns && flatpickr.l10ns.th) ? flatpickr.l10ns.th : {
+        weekdays: {
+          shorthand: ["อา", "จ", "อ", "พ", "พฤ", "ศ", "ส"],
+          longhand: ["อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"]
+        },
+        months: {
+          shorthand: ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."],
+          longhand: ["มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน", "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"]
+        },
+        firstDayOfWeek: 1,
+        time_24hr: true
+      };
+
+      window.editBorrowerDueDatePicker = flatpickr(elem, {
+        dateFormat: 'Y-m-d',
+        altInput: true,
+        altInputClass: 'form-control rounded-end-3 border-start-0 fw-bold fs-7 bg-white cursor-pointer',
+        altFormat: 'd/m/Y',
+        locale: thLocale,
+        disableMobile: true,
+        onReady: function(selectedDates, dateStr, instance) {
+          applyThaiBuddhistYearOnlyDate(instance);
+        },
+        onValueUpdate: function(selectedDates, dateStr, instance) {
+          applyThaiBuddhistYearOnlyDate(instance);
+        },
+        onMonthChange: function(selectedDates, dateStr, instance) {
+          applyThaiBuddhistYearOnlyDate(instance);
+        },
+        onYearChange: function(selectedDates, dateStr, instance) {
+          applyThaiBuddhistYearOnlyDate(instance);
+        },
+        onOpen: function(selectedDates, dateStr, instance) {
+          applyThaiBuddhistYearOnlyDate(instance);
+        }
+      });
+    };
+
+    function applyThaiBuddhistYearOnlyDate(instance) {
+      if (!instance) return;
+
+      if (instance.altInput && Array.isArray(instance.selectedDates) && instance.selectedDates.length > 0) {
+        const d = instance.selectedDates[0];
+        const day = String(d.getDate()).padStart(2, '0');
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        const yearBE = d.getFullYear() + 543;
+
+        instance.altInput.value = `${day}/${month}/${yearBE}`;
+      }
+
+      if (instance.calendarContainer) {
+        const yearInputs = instance.calendarContainer.querySelectorAll('.cur-year');
+        yearInputs.forEach(yInput => {
+          const val = parseInt(yInput.value || yInput.getAttribute('value') || '0', 10);
+          if (val && val < 2400) {
+            yInput.value = val + 543;
+          }
+        });
+      }
+    }
+
+    window.openEditBorrowerDueDateModal = function(equipId, empId, empName, currentDueDateMs, txId, borrowQty, currentDueDateText) {
+      const equipObj = (equipmentList || []).find(x => String(x.id) === String(equipId) || String(x.code) === String(equipId));
+      const equipName = equipObj ? `${equipObj.name} [${equipObj.code}]` : 'อุปกรณ์การเกษตร';
+
+      const equipIdInput = document.getElementById('editDueDateEquipId');
+      const empIdInput = document.getElementById('editDueDateEmpId');
+      const txIdInput = document.getElementById('editDueDateTxId');
+      if (equipIdInput) equipIdInput.value = equipId || '';
+      if (empIdInput) empIdInput.value = empId || '';
+      if (txIdInput) txIdInput.value = txId || '';
+
+      const nameElem = document.getElementById('editDueDateEquipName');
+      const empElem = document.getElementById('editDueDateEmpName');
+      const qtyElem = document.getElementById('editDueDateBorrowQty');
+      const curTextElem = document.getElementById('editDueDateCurrentText');
+
+      if (nameElem) nameElem.textContent = equipName;
+      if (empElem) empElem.textContent = empName || '-';
+      if (qtyElem) qtyElem.textContent = `${borrowQty || 1} ${equipObj ? equipObj.unit : 'ชิ้น'}`;
+      if (curTextElem) curTextElem.textContent = currentDueDateText || 'ยังไม่กำหนด';
+
+      // Initialize flatpickr if needed
+      if (!window.editBorrowerDueDatePicker) {
+        initEditBorrowerDueDatePicker();
+      }
+
+      // Calculate initial target date & time
+      let targetDate = new Date();
+      if (currentDueDateMs && Number(currentDueDateMs) > 0) {
+        targetDate = new Date(Number(currentDueDateMs));
+      } else {
+        targetDate.setDate(targetDate.getDate() + 3);
+        targetDate.setHours(17, 0, 0, 0);
+      }
+
+      if (window.editBorrowerDueDatePicker) {
+        window.editBorrowerDueDatePicker.setDate(targetDate, true);
+        applyThaiBuddhistYearOnlyDate(window.editBorrowerDueDatePicker);
+      } else {
+        const yyyy = targetDate.getFullYear();
+        const mm = String(targetDate.getMonth() + 1).padStart(2, '0');
+        const dd = String(targetDate.getDate()).padStart(2, '0');
+        const dateInp = document.getElementById('editDueDateInput');
+        if (dateInp) dateInp.value = `${yyyy}-${mm}-${dd}`;
+      }
+
+      // Format time in 24hr format
+      const hh = String(targetDate.getHours()).padStart(2, '0');
+      const timeSelect = document.getElementById('editDueTimeSelect');
+      if (timeSelect) {
+        let optionFound = false;
+        for (let opt of timeSelect.options) {
+          if (opt.value === `${hh}:00` || opt.value.startsWith(`${hh}:`)) {
+            timeSelect.value = opt.value;
+            optionFound = true;
+            break;
+          }
+        }
+        if (!optionFound) timeSelect.value = '17:00';
+      }
+
+      const noteInp = document.getElementById('editDueDateNoteInput');
+      if (noteInp) noteInp.value = '';
+
+      const modalElem = document.getElementById('editBorrowerDueDateModal');
+      if (modalElem) {
+        const bsModal = bootstrap.Modal.getOrCreateInstance(modalElem);
+        bsModal.show();
+      }
+    };
+
+    window.applyQuickDueDateOffset = function(days) {
+      const d = new Date();
+      d.setDate(d.getDate() + Number(days));
+      d.setHours(17, 0, 0, 0);
+
+      if (window.editBorrowerDueDatePicker) {
+        window.editBorrowerDueDatePicker.setDate(d, true);
+        applyThaiBuddhistYearOnlyDate(window.editBorrowerDueDatePicker);
+      } else {
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        const dateInp = document.getElementById('editDueDateInput');
+        if (dateInp) dateInp.value = `${yyyy}-${mm}-${dd}`;
+      }
+
+      const timeSelect = document.getElementById('editDueTimeSelect');
+      if (timeSelect) timeSelect.value = '17:00';
+    };
+
+    window.saveEditedBorrowerDueDate = async function() {
+      const equipId = document.getElementById('editDueDateEquipId')?.value || '';
+      const empId = document.getElementById('editDueDateEmpId')?.value || '';
+      const txId = document.getElementById('editDueDateTxId')?.value || '';
+      const noteVal = (document.getElementById('editDueDateNoteInput')?.value || '').trim();
+      const timeVal = document.getElementById('editDueTimeSelect')?.value || '17:00';
+
+      let selectedDate = null;
+      if (window.editBorrowerDueDatePicker && Array.isArray(window.editBorrowerDueDatePicker.selectedDates) && window.editBorrowerDueDatePicker.selectedDates.length > 0) {
+        selectedDate = window.editBorrowerDueDatePicker.selectedDates[0];
+      } else {
+        const rawDate = document.getElementById('editDueDateInput')?.value || '';
+        if (rawDate) {
+          selectedDate = new Date(rawDate);
+        }
+      }
+
+      if (!selectedDate || isNaN(selectedDate.getTime())) {
+        showToast("⚠️ กรุณาระบุวันที่กำหนดส่งคืน");
+        return;
+      }
+
+      const timeParts = timeVal.split(':');
+      const hours = parseInt(timeParts[0], 10) || 17;
+      const minutes = parseInt(timeParts[1], 10) || 0;
+
+      const finalDateObj = new Date(selectedDate);
+      finalDateObj.setHours(hours, minutes, 0, 0);
+
+      const newDueDateMs = finalDateObj.getTime();
+      const day = String(finalDateObj.getDate()).padStart(2, '0');
+      const month = String(finalDateObj.getMonth() + 1).padStart(2, '0');
+      const yearBE = finalDateObj.getFullYear() + 543;
+      const timeStr = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+      const newDueDateStr = `${day}/${month}/${yearBE} เวลา ${timeStr} น.`;
+
+      // Find matching transactions in transactionHistory:
+      const updatedTxIds = [];
+
+      (transactionHistory || []).forEach(tx => {
+        if (!tx) return;
+        const isTargetTx = (txId && tx.id === txId);
+        const isMatchEmpAndEquip = (tx.type === 'ยืมอุปกรณ์' && 
+                                    (tx.employeeId === empId || (empId && String(tx.employeeId) === String(empId))) &&
+                                    (String(tx.equipmentId) === String(equipId) || (Array.isArray(tx.items) && tx.items.some(it => String(it.equipmentId) === String(equipId)))));
+
+        if (isTargetTx || isMatchEmpAndEquip) {
+          tx.dueDate = newDueDateMs;
+          tx.dueDateStr = newDueDateStr;
+          if (noteVal) {
+            tx.dueDateChangeNote = noteVal;
+            tx.note = tx.note ? `${tx.note} (แก้ไขกำหนดส่งคืน: ${noteVal})` : `แก้ไขกำหนดส่งคืน: ${noteVal}`;
+          }
+          if (tx.id) updatedTxIds.push(tx.id);
+        }
+      });
+
+      // Save to localStorage
+      if (typeof saveToLocalStorage === 'function') {
+        saveToLocalStorage();
+      }
+
+      // Sync to Firestore if ready
+      if (isFirebaseReady && db && updatedTxIds.length > 0) {
+        try {
+          for (const id of updatedTxIds) {
+            const txObj = (transactionHistory || []).find(t => t.id === id);
+            if (txObj) {
+              await setDoc(doc(db, "transactions", id), {
+                dueDate: newDueDateMs,
+                dueDateStr: newDueDateStr,
+                note: txObj.note || ''
+              }, { merge: true });
+            }
+          }
+        } catch (fsErr) {
+          console.warn("Firestore update due date warning:", fsErr);
+        }
+      }
+
+      // Hide edit modal
+      const editModalElem = document.getElementById('editBorrowerDueDateModal');
+      if (editModalElem) {
+        const bsModal = bootstrap.Modal.getInstance(editModalElem);
+        if (bsModal) bsModal.hide();
+      }
+
+      showToast(`✅ บันทึกกำหนดส่งคืนใหม่เป็น "${newDueDateStr}" เรียบร้อยแล้ว`);
+
+      // Refresh borrowers modal table immediately
+      if (equipId && typeof showEquipmentBorrowersModal === 'function') {
+        showEquipmentBorrowersModal(equipId);
+      }
+    };
+
+    // ==========================================
     // OVERDUE BORROWINGS SYSTEM LOGIC
     // ==========================================
     window.currentOverdueThresholdDays = 3;
@@ -8647,6 +13346,7 @@
         altInputClass: 'form-control fw-bold border-warning bg-white cursor-pointer fs-7',
         altFormat: 'd/m/Y H:i',
         locale: thLocale,
+        disableMobile: true,
         onReady: function(selectedDates, dateStr, instance) {
           applyThaiBuddhistYear(instance);
         },
@@ -8668,7 +13368,7 @@
     function applyThaiBuddhistYear(instance) {
       if (!instance) return;
 
-      if (instance.altInput && instance.selectedDates.length > 0) {
+      if (instance.altInput && Array.isArray(instance.selectedDates) && instance.selectedDates.length > 0) {
         const d = instance.selectedDates[0];
         const day = String(d.getDate()).padStart(2, '0');
         const month = String(d.getMonth() + 1).padStart(2, '0');
@@ -8713,13 +13413,49 @@
     };
 
     window.toggleTransTypeUI = function() {
-      const selectedType = document.querySelector('input[name="transType"]:checked')?.value;
+      const selectedType = document.querySelector('input[name="transType"]:checked')?.value || 'เบิกจ่าย';
+
+      // Enforce single-type document constraint: prevent switching type if cart already has items
+      if (selectedTransItems.length > 0 && currentTransCartType && currentTransCartType !== selectedType) {
+        const typeNameMap = {
+          'เบิกจ่าย': 'เบิกตัดสต๊อก',
+          'ยืมอุปกรณ์': 'ยืมอุปกรณ์',
+          'คืนอุปกรณ์': 'คืนอุปกรณ์',
+          'รับเข้าสต๊อก': 'รับเข้าสต๊อก',
+          'รับเข้าสต๊อก (ขาเข้า)': 'รับเข้าสต๊อก'
+        };
+        const oldName = typeNameMap[currentTransCartType] || currentTransCartType;
+        const newName = typeNameMap[selectedType] || selectedType;
+
+        const confirmReset = confirm(`⚠️ เอกสารใบนี้มีรายการ "${oldName}" ค้างอยู่ ${selectedTransItems.length} รายการ\n\nระบบไม่อนุญาตให้นำรายการต่างประเภทมาปนในเอกสารใบเดียวกัน\nหากต้องการเปลี่ยนเป็น "${newName}" ต้องล้างรายการเดิมในเอกสารออกก่อน\n\nต้องการล้างรายการเดิมและเปลี่ยนประเภทหรือไม่?`);
+
+        if (confirmReset) {
+          window.clearTransCart();
+          currentTransCartType = selectedType;
+        } else {
+          // Revert radio button back to currentTransCartType
+          const radioMap = {
+            'เบิกจ่าย': 'typeIssue',
+            'ยืมอุปกรณ์': 'typeBorrow',
+            'คืนอุปกรณ์': 'typeReturn',
+            'รับเข้าสต๊อก': 'typeStockIn',
+            'รับเข้าสต๊อก (ขาเข้า)': 'typeStockIn'
+          };
+          const revertId = radioMap[currentTransCartType] || 'typeIssue';
+          const el = document.getElementById(revertId);
+          if (el) el.checked = true;
+          return;
+        }
+      } else if (selectedTransItems.length === 0) {
+        currentTransCartType = selectedType;
+      }
+
       const box = document.getElementById('borrowDueDateBox');
       if (box) {
         if (selectedType === 'ยืมอุปกรณ์') {
           box.classList.remove('d-none');
           initThaiFlatpickr();
-          if (!window.transDueDatePicker || window.transDueDatePicker.selectedDates.length === 0) {
+          if (!window.transDueDatePicker || !Array.isArray(window.transDueDatePicker.selectedDates) || window.transDueDatePicker.selectedDates.length === 0) {
             setQuickDueDate(3);
           }
         } else {
@@ -8727,19 +13463,471 @@
         }
       }
 
+      // Return Active Borrows Card UI
+      const returnBorrowsCard = document.getElementById('returnActiveBorrowsCard');
+      if (returnBorrowsCard) {
+        if (selectedType === 'คืนอุปกรณ์') {
+          returnBorrowsCard.classList.remove('d-none');
+          if (typeof window.refreshReturnActiveBorrowsUI === 'function') {
+            window.refreshReturnActiveBorrowsUI();
+          }
+        } else {
+          returnBorrowsCard.classList.add('d-none');
+        }
+      }
+
+      // Stock In Helper Banner
+      const stockInBanner = document.getElementById('stockInHelperBanner');
+      if (stockInBanner) {
+        if (selectedType === 'รับเข้าสต๊อก' || selectedType === 'รับเข้าสต๊อก (ขาเข้า)') {
+          stockInBanner.classList.remove('d-none');
+        } else {
+          stockInBanner.classList.add('d-none');
+        }
+      }
+
+      // Labels & Headings adaptation
+      const empLabel = document.getElementById('transEmpSelectLabel');
+      if (empLabel) {
+        if (selectedType === 'คืนอุปกรณ์') {
+          empLabel.innerHTML = '2. เลือกพนักงานผู้ส่งคืนอุปกรณ์ <span class="text-danger">*</span>';
+        } else if (selectedType === 'รับเข้าสต๊อก') {
+          empLabel.innerHTML = '2. เลือกเจ้าหน้าที่ผู้รับเข้าพัสดุ <span class="text-danger">*</span>';
+        } else {
+          empLabel.innerHTML = '2. เลือกรายชื่อผู้ทำรายการ <span class="text-danger">*</span>';
+        }
+      }
+
+      const equipLabel = document.getElementById('transEquipSelectLabel');
+      if (equipLabel) {
+        if (selectedType === 'คืนอุปกรณ์') {
+          equipLabel.innerHTML = '3. เลือกอุปกรณ์ที่ต้องการคืน';
+        } else if (selectedType === 'รับเข้าสต๊อก') {
+          equipLabel.innerHTML = '3. เลือกอุปกรณ์การเกษตรที่รับเข้า';
+        } else {
+          equipLabel.innerHTML = '3. เลือกอุปกรณ์การเกษตร';
+        }
+      }
+
+      const qtyLabel = document.getElementById('transQtyLabel');
+      if (qtyLabel) {
+        if (selectedType === 'คืนอุปกรณ์') {
+          qtyLabel.textContent = '4. ระบุจำนวนที่ส่งคืน';
+        } else if (selectedType === 'รับเข้าสต๊อก') {
+          qtyLabel.textContent = '4. ระบุจำนวนที่รับเข้าคลัง';
+        } else {
+          qtyLabel.textContent = '4. ระบุจำนวน เบิก/ยืม/คืน/รับเข้า';
+        }
+      }
+
+      const btnAddCartSpan = document.getElementById('btnAddCartSpan');
+      if (btnAddCartSpan) {
+        if (selectedType === 'ยืมอุปกรณ์') {
+          btnAddCartSpan.textContent = 'เพิ่มเข้าเอกสารยืม';
+        } else if (selectedType === 'คืนอุปกรณ์') {
+          btnAddCartSpan.textContent = 'เพิ่มเข้าเอกสารคืน';
+        } else if (selectedType === 'รับเข้าสต๊อก' || selectedType === 'รับเข้าสต๊อก (ขาเข้า)') {
+          btnAddCartSpan.textContent = 'เพิ่มเข้าเอกสารรับเข้า';
+        } else {
+          btnAddCartSpan.textContent = 'เพิ่มเข้าเอกสารเบิกจ่าย';
+        }
+      }
+
+      const cartTitleHeader = document.getElementById('transCartTitleHeader');
+      if (cartTitleHeader) {
+        if (selectedType === 'ยืมอุปกรณ์') {
+          cartTitleHeader.textContent = 'รายการอุปกรณ์ในเอกสารยืมฉบับนี้';
+        } else if (selectedType === 'คืนอุปกรณ์') {
+          cartTitleHeader.textContent = 'รายการอุปกรณ์ในเอกสารคืนฉบับนี้';
+        } else if (selectedType === 'รับเข้าสต๊อก' || selectedType === 'รับเข้าสต๊อก (ขาเข้า)') {
+          cartTitleHeader.textContent = 'รายการอุปกรณ์ในเอกสารรับเข้าสต๊อกใบนี้';
+        } else {
+          cartTitleHeader.textContent = 'รายการอุปกรณ์ในเอกสารเบิกจ่ายใบนี้';
+        }
+      }
+
       const submitBtn = document.getElementById('btnSubmitTransaction');
       if (submitBtn) {
         if (selectedType === 'ยืมอุปกรณ์') {
-          submitBtn.innerHTML = '<i class="bi bi-check-circle-fill me-2"></i> บันทึก ยืมอุปกรณ์';
+          submitBtn.className = 'btn btn-warning btn-lg flex-grow-1 py-3 rounded-3 fw-bold shadow-sm';
+          submitBtn.innerHTML = '<i class="bi bi-arrow-repeat me-2"></i> บันทึกยืมอุปกรณ์';
         } else if (selectedType === 'คืนอุปกรณ์') {
-          submitBtn.innerHTML = '<i class="bi bi-check-circle-fill me-2"></i> บันทึก คืนอุปกรณ์';
+          submitBtn.className = 'btn btn-info btn-lg flex-grow-1 py-3 rounded-3 fw-bold text-dark shadow-sm';
+          submitBtn.innerHTML = '<i class="bi bi-box-arrow-in-down me-2"></i> บันทึกรับคืนอุปกรณ์';
+        } else if (selectedType === 'รับเข้าสต๊อก' || selectedType === 'รับเข้าสต๊อก (ขาเข้า)') {
+          submitBtn.className = 'btn btn-success btn-lg flex-grow-1 py-3 rounded-3 fw-bold shadow-sm';
+          submitBtn.innerHTML = '<i class="bi bi-box-arrow-in-down-left me-2"></i> บันทึกรับเข้าสต๊อก';
         } else {
-          submitBtn.innerHTML = '<i class="bi bi-check-circle-fill me-2"></i> บันทึก ตัดสต๊อก';
+          submitBtn.className = 'btn btn-danger btn-lg flex-grow-1 py-3 rounded-3 fw-bold shadow-sm';
+          submitBtn.innerHTML = '<i class="bi bi-box-arrow-up me-2"></i> บันทึกเบิกตัดสต๊อก';
         }
+      }
+
+      if (typeof populateEquipmentDropdown === 'function') {
+        populateEquipmentDropdown();
       }
 
       if (typeof renderTransCartList === 'function') {
         renderTransCartList();
+      }
+
+      if (typeof window.validateTransQtyInputLive === 'function') {
+        window.validateTransQtyInputLive();
+      }
+    };
+
+    // Calculate all active borrowings currently remaining in the system
+    window.getAllActiveBorrowings = function() {
+      if (!Array.isArray(transactionHistory) || transactionHistory.length === 0) {
+        return [];
+      }
+
+      const sortedTxs = [...transactionHistory].sort((a, b) => {
+        const tA = (a.rawTimestamp || (a.timestamp ? new Date(a.timestamp).getTime() : 0));
+        const tB = (b.rawTimestamp || (b.timestamp ? new Date(b.timestamp).getTime() : 0));
+        return tA - tB;
+      });
+
+      const activeBatches = [];
+
+      sortedTxs.forEach(tx => {
+        if (!tx) return;
+        const type = tx.type || '';
+        if (type !== 'ยืมอุปกรณ์' && type !== 'คืนอุปกรณ์') return;
+
+        const txTime = tx.rawTimestamp || (tx.timestamp ? new Date(tx.timestamp).getTime() : Date.now());
+        const empId = tx.employeeId || tx.employeeName || 'unknown';
+        const empName = tx.employeeName || 'ไม่ระบุชื่อ';
+
+        let itemsInTx = [];
+        if (Array.isArray(tx.items) && tx.items.length > 0) {
+          itemsInTx = tx.items;
+        } else if (tx.equipmentId || tx.equipmentName) {
+          itemsInTx = [{
+            equipmentId: tx.equipmentId,
+            equipmentCode: tx.equipmentCode,
+            equipmentName: tx.equipmentName,
+            quantity: Number(tx.quantity || 0)
+          }];
+        }
+
+        itemsInTx.forEach(it => {
+          const qty = Number(it.quantity || 0);
+          if (qty <= 0) return;
+
+          if (type === 'ยืมอุปกรณ์') {
+            activeBatches.push({
+              txId: tx.id,
+              docNo: tx.docNo || tx.id,
+              borrowTime: txTime,
+              timestampStr: tx.timestamp || new Date(txTime).toLocaleString('th-TH'),
+              dueDate: tx.dueDate || null,
+              dueDateStr: tx.dueDateStr || null,
+              employeeId: tx.employeeId,
+              employeeName: empName,
+              equipmentId: it.equipmentId,
+              equipmentCode: it.equipmentCode,
+              equipmentName: it.equipmentName,
+              borrowedQty: qty,
+              remainingQty: qty,
+              note: tx.note || ''
+            });
+          } else if (type === 'คืนอุปกรณ์') {
+            let returnRemaining = qty;
+            for (let i = 0; i < activeBatches.length && returnRemaining > 0; i++) {
+              const batch = activeBatches[i];
+              if (batch.remainingQty <= 0) continue;
+
+              const sameEmp = (batch.employeeId && tx.employeeId && batch.employeeId === tx.employeeId) ||
+                              (batch.employeeName && empName && batch.employeeName === empName);
+
+              const sameEq = (batch.equipmentId && it.equipmentId && batch.equipmentId === it.equipmentId) ||
+                             (batch.equipmentCode && it.equipmentCode && batch.equipmentCode === it.equipmentCode) ||
+                             (batch.equipmentName && it.equipmentName && batch.equipmentName === it.equipmentName);
+
+              if (sameEmp && sameEq) {
+                const deduct = Math.min(batch.remainingQty, returnRemaining);
+                batch.remainingQty -= deduct;
+                returnRemaining -= deduct;
+              }
+            }
+          }
+        });
+      });
+
+      return activeBatches.filter(b => b.remainingQty > 0);
+    };
+
+    // Refresh Return Active Borrows UI list in the transaction screen
+    window.refreshReturnActiveBorrowsUI = function() {
+      const container = document.getElementById('returnActiveBorrowListContainer');
+      const badge = document.getElementById('activeBorrowCountBadge');
+      const noBorrowAlert = document.getElementById('noBorrowAlertForEmp');
+      if (!container) return;
+
+      const selectedEmpId = document.getElementById('empSelect')?.value;
+      const allActive = window.getAllActiveBorrowings();
+
+      let targetBorrows = allActive;
+      if (selectedEmpId) {
+        targetBorrows = allActive.filter(b => b.employeeId === selectedEmpId);
+      }
+
+      const now = Date.now();
+      const overdueList = targetBorrows.filter(b => {
+        const due = b.dueDate || (b.borrowTime ? (b.borrowTime + 3 * 86400000) : 0);
+        return due && now > due;
+      });
+
+      if (badge) {
+        if (overdueList.length > 0) {
+          badge.className = 'badge bg-danger text-white fs-8';
+          badge.innerHTML = `<i class="bi bi-exclamation-triangle-fill me-1"></i>ค้างคืน ${targetBorrows.length} (เกินกำหนด ${overdueList.length})`;
+        } else {
+          badge.className = 'badge bg-warning text-dark fs-8';
+          badge.textContent = `ค้างคืน ${targetBorrows.length} รายการ`;
+        }
+      }
+
+      if (noBorrowAlert) {
+        if (selectedEmpId && targetBorrows.length === 0) {
+          noBorrowAlert.classList.remove('d-none');
+        } else {
+          noBorrowAlert.classList.add('d-none');
+        }
+      }
+
+      if (targetBorrows.length === 0) {
+        container.innerHTML = `
+          <div class="text-center py-3 px-2 text-muted bg-white rounded-3 border fs-8">
+            <i class="bi bi-check-circle-fill text-success fs-5 d-block mb-1"></i>
+            <div>${selectedEmpId ? 'พนักงานท่านนี้ไม่มีรายการอุปกรณ์ที่ค้างยืมในระบบ' : 'ไม่มีรายการยืมอุปกรณ์ที่ค้างส่งคืนในระบบ'}</div>
+            <small class="text-secondary">เฉพาะอุปกรณ์ที่ถูกยืมไปเท่านั้นจึงจะสามารถบันทึกส่งคืนเข้าคลังได้</small>
+          </div>
+        `;
+        return;
+      }
+
+      let html = '<div class="row g-2">';
+      targetBorrows.forEach(b => {
+        const eqObj = (equipmentList || []).find(e => e.id === b.equipmentId || e.code === b.equipmentCode);
+        const img = eqObj?.imageUrl || DEFAULT_EQUIPMENT_IMAGE;
+        const unit = eqObj?.unit || 'ชิ้น';
+        const empNameClean = b.employeeName ? b.employeeName.split('(')[0].trim() : 'พนักงาน';
+
+        let dueTimeMs = b.dueDate;
+        if (!dueTimeMs && b.borrowTime) {
+          dueTimeMs = b.borrowTime + (3 * 24 * 60 * 60 * 1000);
+        }
+        const isOverdue = dueTimeMs ? (now > dueTimeMs) : false;
+
+        html += `
+          <div class="col-12 col-md-6">
+            <div class="card rounded-3 p-2.5 bg-white h-100 shadow-none d-flex flex-row align-items-center justify-content-between gap-2 ${isOverdue ? 'border-danger border-2' : 'border'}">
+              <div class="d-flex align-items-center gap-2 overflow-hidden">
+                <img src="${img}" class="rounded-2 border flex-shrink-0" style="width: 42px; height: 42px; object-fit: cover;" onerror="this.src='${DEFAULT_EQUIPMENT_IMAGE}'" />
+                <div class="overflow-hidden">
+                  <div class="fw-bold text-dark text-truncate fs-7" title="${b.equipmentName}">${b.equipmentName}</div>
+                  <div class="d-flex align-items-center gap-1 flex-wrap fs-8">
+                    <span class="badge bg-secondary font-monospace">${b.equipmentCode || 'ITEM'}</span>
+                    <span class="text-primary fw-semibold"><i class="bi bi-person me-0.5"></i>${empNameClean}</span>
+                    <span class="badge bg-warning text-dark fw-bold">ค้าง: ${b.remainingQty} ${unit}</span>
+                    ${isOverdue ? '<span class="badge bg-danger text-white fw-bold"><i class="bi bi-exclamation-triangle-fill me-0.5"></i>เกินกำหนด</span>' : ''}
+                  </div>
+                  <div class="d-flex align-items-center gap-1.5 flex-wrap fs-8 text-truncate mt-0.5">
+                    <small class="text-muted"><i class="bi bi-clock me-0.5"></i>ยืม: ${b.timestampStr || '-'}</small>
+                    ${isOverdue && b.dueDateStr ? `<small class="text-danger fw-semibold"><i class="bi bi-calendar-x me-0.5"></i>กำหนด: ${b.dueDateStr}</small>` : ''}
+                  </div>
+                </div>
+              </div>
+              <button type="button" class="btn btn-sm btn-info text-dark fw-bold rounded-pill px-2.5 py-1.5 flex-shrink-0 shadow-sm d-flex align-items-center gap-1" onclick="quickReturnAllActiveBorrow(event, '${b.equipmentId}', '${b.employeeId}', ${b.remainingQty})">
+                <i class="bi bi-box-arrow-in-down fs-7"></i>
+                <span class="fs-8">คืน</span>
+              </button>
+            </div>
+          </div>
+        `;
+      });
+      html += '</div>';
+
+      container.innerHTML = html;
+    };
+
+    // Quick direct 1-click return all quantity for an active borrowing and close window
+    window.quickReturnAllActiveBorrow = async function(e, equipId, empId, returnQty) {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+
+      try {
+        const equipObj = (equipmentList || []).find(x => String(x.id) === String(equipId) || String(x.code) === String(equipId));
+        const empObj = (employeeList || []).find(x => String(x.id) === String(empId) || String(x.code) === String(empId));
+        const equipName = equipObj ? equipObj.name : 'อุปกรณ์';
+        const empName = empObj ? empObj.name : 'พนักงาน';
+        const unit = equipObj ? equipObj.unit : 'ชิ้น';
+        const qtyNum = parseInt(returnQty, 10) || 1;
+
+        let confirmed = false;
+        if (typeof window.showConfirmDialog === 'function') {
+          confirmed = await window.showConfirmDialog({
+            title: "ยืนยันรับคืนอุปกรณ์",
+            message: `ต้องการบันทึกรับคืน "${equipName}" จำนวน ${qtyNum} ${unit} จากคุณ ${empName} เข้าคลังทันทีหรือไม่?`,
+            type: "info",
+            icon: "bi-box-arrow-in-down",
+            confirmText: "คืน",
+            cancelText: "ยกเลิก",
+            target: e ? (e.currentTarget || e.target) : null
+          });
+        } else {
+          confirmed = true;
+        }
+
+        if (!confirmed) return;
+
+        // 1. Update inventory stock
+        if (equipObj) {
+          equipObj.quantity = (equipObj.quantity || 0) + qtyNum;
+          equipObj.borrowedCount = Math.max(0, (equipObj.borrowedCount || 0) - qtyNum);
+
+          if (isFirebaseReady && db && equipObj.id) {
+            setDoc(doc(db, "equipment", equipObj.id), equipObj, { merge: true }).catch(err => {
+              console.warn("Firestore update equipment stock error on quick return:", err);
+            });
+          }
+        }
+
+        // 2. Create transaction record
+        const now = new Date();
+        const docNo = 'DOC-' + String(Date.now()).slice(-6);
+        const newTx = {
+          id: 'tx-' + String(Date.now()).slice(-6),
+          docNo: docNo,
+          type: 'คืนอุปกรณ์',
+          employeeId: empObj ? empObj.id : (empId || 'UNKNOWN'),
+          employeeName: empObj ? `${empObj.name} (${empObj.department || 'แผนกทั่วไป'})` : 'พนักงาน',
+          employeeCode: empObj ? (empObj.code || empObj.id) : '',
+          employeeDepartment: empObj ? (empObj.department || 'แผนกทั่วไป') : 'แผนกทั่วไป',
+          items: [{
+            equipmentId: equipId,
+            equipmentName: equipName,
+            equipmentCode: equipObj ? (equipObj.code || equipObj.id) : '',
+            quantity: qtyNum,
+            unit: unit,
+            imageUrl: equipObj?.imageUrl || '',
+            location: equipObj?.location || 'คลังหลัก'
+          }],
+          equipmentId: equipId,
+          equipmentName: `${equipName} [${equipObj ? (equipObj.code || equipObj.id) : ''}]`,
+          quantity: qtyNum,
+          unit: unit,
+          location: equipObj?.location || 'คลังหลัก',
+          note: 'บันทึกรับคืนอุปกรณ์ทั้งหมดแบบรวดเร็ว (1-Click Quick Return)',
+          dueDate: null,
+          dueDateStr: null,
+          rawTimestamp: now.getTime(),
+          timestamp: now.toLocaleString('th-TH')
+        };
+
+        transactionHistory.unshift(newTx);
+        saveToLocalStorage();
+
+        if (isFirebaseReady && db) {
+          try {
+            await setDoc(doc(db, "transactions", newTx.id), newTx, { merge: true });
+          } catch (err) {
+            console.warn("Firestore add transaction error on quick return:", err);
+          }
+        }
+
+        if (typeof logAuditAction === 'function') {
+          logAuditAction('ประวัติรายการ', 'เพิ่ม', `ทำรายการคืนอุปกรณ์ทั้งหมด (${qtyNum} ${unit}): ${equipName} จากคุณ ${empName}`, newTx.id);
+        }
+
+        showToast(`✅ บันทึกรับคืน "${equipName}" (${qtyNum} ${unit}) จากคุณ ${empName} เรียบร้อยแล้ว`);
+
+        // 3. Reset form & refresh UI
+        clearTransCart();
+        document.getElementById('transactionForm')?.reset();
+        if (typeof toggleTransTypeUI === 'function') toggleTransTypeUI();
+        const stockInfo = document.getElementById('equipStockInfo');
+        if (stockInfo) stockInfo.innerHTML = '';
+        const previewBox = document.getElementById('equipSelectPreviewBox');
+        if (previewBox) previewBox.classList.add('d-none');
+
+        renderCatalogGrid();
+        renderStaffTable();
+        renderHistoryTable();
+        populateEquipmentDropdown();
+        populateQuickScanDropdown();
+        updateStats();
+
+        // Automatic sync
+        if (typeof validateFirestoreHistorySync === 'function') {
+          validateFirestoreHistorySync(false);
+        }
+
+        // Close window and switch back to that equipment in catalog
+        if (typeof returnToCatalogEquipment === 'function') {
+          returnToCatalogEquipment(equipId);
+        } else if (typeof switchNavTab === 'function') {
+          switchNavTab('catalog-tab');
+        }
+      } catch (err) {
+        console.error("Quick return error:", err);
+        showToast("เกิดข้อผิดพลาดในการบันทึกคืนอุปกรณ์");
+      }
+    };
+
+    // Quick select active borrowing to form
+    window.selectActiveBorrowForReturn = function(equipId, empId, maxQty) {
+      if (equipId) {
+        window.lastInteractedEquipmentId = equipId;
+      }
+      const typeReturnRadio = document.getElementById('typeReturn');
+      if (typeReturnRadio) {
+        typeReturnRadio.checked = true;
+        window.toggleTransTypeUI();
+      }
+
+      if (empId) {
+        const empSelect = document.getElementById('empSelect');
+        if (empSelect) {
+          empSelect.value = empId;
+          const searchInput = document.getElementById('transEmpSearchInput');
+          const emp = employeeList.find(x => x.id === empId);
+          if (searchInput && emp) searchInput.value = emp.name;
+        }
+      }
+
+      if (equipId) {
+        const equipSelect = document.getElementById('equipSelect');
+        if (equipSelect) {
+          equipSelect.value = equipId;
+          if (typeof updateEquipSelectPreview === 'function') updateEquipSelectPreview();
+        }
+      }
+
+      const qtyInput = document.getElementById('transQty');
+      if (qtyInput) {
+        qtyInput.value = maxQty || 1;
+      }
+
+      showToast(`🎯 เลือกรายการ "${equipmentList.find(x=>x.id===equipId)?.name || 'อุปกรณ์'}" สำหรับส่งคืนแล้ว`);
+    };
+
+    // Handle employee change in transaction form
+    window.handleTransEmpSelectionChange = function() {
+      const select = document.getElementById('empSelect');
+      if (select) {
+        select.setCustomValidity('');
+      }
+      const selectedType = document.querySelector('input[name="transType"]:checked')?.value;
+      if (selectedType === 'คืนอุปกรณ์') {
+        if (typeof window.refreshReturnActiveBorrowsUI === 'function') {
+          window.refreshReturnActiveBorrowsUI();
+        }
+        if (typeof populateEquipmentDropdown === 'function') {
+          populateEquipmentDropdown();
+        }
       }
     };
 
@@ -8880,7 +14068,29 @@
       if (typeof updateStats === 'function') updateStats();
     };
 
-    window.showOverdueBorrowingsModal = function() {
+    window.toggleOverdueStatsCards = function() {
+      const row = document.getElementById('overdueStatsCardsRow');
+      const icon = document.getElementById('toggleOverdueStatsIcon');
+      const text = document.getElementById('toggleOverdueStatsText');
+      if (!row) return;
+
+      const isHidden = row.classList.contains('d-none');
+      if (isHidden) {
+        row.classList.remove('d-none');
+        if (icon) icon.className = 'bi bi-eye-slash-fill';
+        if (text) text.textContent = 'ซ่อนสรุปสถิติ';
+      } else {
+        row.classList.add('d-none');
+        if (icon) icon.className = 'bi bi-eye-fill';
+        if (text) text.textContent = 'ดูสรุปสถิติ';
+      }
+    };
+
+    window.showOverdueBorrowingsModal = function(searchQuery) {
+      const searchInput = document.getElementById('overdueSearchInput');
+      if (searchInput) {
+        searchInput.value = typeof searchQuery === 'string' ? searchQuery : '';
+      }
       renderOverdueTable();
       const modalElem = document.getElementById('overdueBorrowingsModal');
       if (modalElem) {
@@ -8891,10 +14101,11 @@
 
     window.renderOverdueTable = function() {
       const thresh = window.currentOverdueThresholdDays !== undefined ? window.currentOverdueThresholdDays : 3;
-      const list = calculateOverdueBorrowings(thresh);
+      const list = typeof calculateOverdueBorrowings === 'function' ? (calculateOverdueBorrowings(thresh) || []) : [];
 
       const searchVal = (document.getElementById('overdueSearchInput')?.value || '').toLowerCase().trim();
-      const filtered = list.filter(item => {
+      const filtered = (list || []).filter(item => {
+        if (!item) return false;
         if (!searchVal) return true;
         const emp = (item.employeeName || '').toLowerCase();
         const eq = (item.equipmentName || '').toLowerCase();
@@ -8909,7 +14120,7 @@
 
       const uniqueEmps = new Set(filtered.map(x => x.employeeId || x.employeeName));
       let sumQty = 0;
-      filtered.forEach(x => sumQty += x.remainingQty);
+      filtered.forEach(x => sumQty += (x.remainingQty || 0));
 
       if (totalItemsElem) totalItemsElem.innerHTML = `${filtered.length} <span class="fs-7 text-muted font-normal">รายการ</span>`;
       if (totalEmpsElem) totalEmpsElem.innerHTML = `${uniqueEmps.size} <span class="fs-7 text-muted font-normal">คน</span>`;
@@ -8921,7 +14132,7 @@
       if (filtered.length === 0) {
         tbody.innerHTML = `
           <tr>
-            <td colspan="7" class="text-center py-5 text-muted">
+            <td colspan="9" class="text-center py-5 text-muted">
               <i class="bi bi-check-circle-fill text-success fs-1 d-block mb-2"></i>
               <div class="fw-bold text-dark fs-6">ไม่มีรายการยืมอุปกรณ์เกินกำหนด${thresh > 0 ? ` (${thresh} วัน)` : ''}</div>
               <small class="text-secondary">พนักงานทุกคนส่งคืนอุปกรณ์ตรงเวลา หรือยังไม่ถึงเกณฑ์ระยะเวลาที่เลือก</small>
@@ -8932,9 +14143,18 @@
       }
 
       let html = '';
+      const damagesMap = (window.damagedEquipmentReports || {});
+
       filtered.forEach(it => {
         const empAvatar = it.employeeObj && it.employeeObj.photoUrl ? it.employeeObj.photoUrl : 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80';
         const eqImg = it.equipmentObj && it.equipmentObj.imageUrl ? it.equipmentObj.imageUrl : 'https://images.unsplash.com/photo-1416879595882-3373a0480b5b?w=200&auto=format&fit=crop&q=80';
+        const cleanEmpName = it.employeeName ? it.employeeName.split('(')[0].trim() : 'พนักงาน';
+
+        const dmgKey = `${it.equipmentId}_${it.employeeId || it.employeeName}`;
+        const dmgRecord = damagesMap[dmgKey] || {};
+        const damagedQty = Number(dmgRecord.damagedQty || 0);
+        const damageNote = dmgRecord.note || '';
+        const safeDamageNote = (damageNote || '').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/[\r\n]+/g, ' ');
 
         let overdueBadge = '';
         if (thresh === 0) {
@@ -8947,21 +14167,39 @@
 
         html += `
           <tr class="${it.daysOverdue > 0 ? 'overdue-pulse-row' : ''}">
-            <td class="ps-3">
+            <td class="text-center ps-3">
+              <button type="button" class="btn btn-sm btn-info text-dark rounded-pill px-3 py-1 fs-7 fw-bold shadow-sm" onclick="quickReturnOverdueTransaction(event, '${it.employeeId || ''}', '${it.equipmentId || ''}', ${it.remainingQty})" title="บันทึกรับคืนอุปกรณ์นี้เข้าคลังทันที">
+                คืน
+              </button>
+            </td>
+            <td class="text-center text-nowrap">
+              <span class="badge bg-warning bg-opacity-25 text-dark border border-warning rounded-pill px-2.5 py-1 fw-bold fs-7">ยืม ${it.remainingQty}</span>
+            </td>
+            <td class="text-center text-nowrap">
+              ${damagedQty > 0 ? `
+                <button type="button" class="btn btn-sm btn-danger rounded-pill px-2.5 py-0.5 fw-bold shadow-sm fs-7" onclick="openReportDamageModal('${it.equipmentId || ''}', '${it.employeeId || ''}', ${it.remainingQty}, ${damagedQty}, '${safeDamageNote}')" title="${damageNote ? `ชำรุด: ${damageNote}` : 'มีอุปกรณ์ชำรุด (คลิกเพื่อแก้ไข)'}">
+                  ชำรุด ${damagedQty}
+                </button>
+              ` : `
+                <button type="button" class="btn btn-sm btn-outline-secondary rounded-pill px-2.5 py-0.5 fw-semibold fs-7" onclick="openReportDamageModal('${it.equipmentId || ''}', '${it.employeeId || ''}', ${it.remainingQty}, 0, '')" title="คลิกเพื่อบันทึกแจ้งอุปกรณ์ชำรุด">
+                  ชำรุด
+                </button>
+              `}
+            </td>
+            <td>
               <div class="d-flex align-items-center gap-2">
                 <img src="${empAvatar}" class="rounded-circle border shadow-sm" style="width: 36px; height: 36px; object-fit: cover;" />
                 <div>
-                  <div class="fw-bold text-dark">${it.employeeName}</div>
+                  <div class="fw-bold text-dark text-nowrap" title="${it.employeeName}">${cleanEmpName}</div>
                   ${it.employeeObj && it.employeeObj.employeeCode ? `<span class="badge bg-dark font-monospace fs-8">${it.employeeObj.employeeCode}</span>` : ''}
                 </div>
               </div>
             </td>
-            <td><span class="badge bg-light text-dark border fs-8">${it.department}</span></td>
             <td>
               <div class="d-flex align-items-center gap-2">
                 <img src="${eqImg}" class="rounded-3 border" style="width: 32px; height: 32px; object-fit: cover;" />
                 <div>
-                  <div class="fw-semibold text-dark fs-8">${it.equipmentName}</div>
+                  <div class="fw-semibold text-dark fs-8 text-nowrap">${it.equipmentName}</div>
                   <span class="badge bg-secondary font-monospace fs-8" style="font-size: 9px;">${it.equipmentCode || 'EQ'}</span>
                 </div>
               </div>
@@ -8971,17 +14209,14 @@
               ${it.dueDateStr ? `<div class="fw-bold text-danger mt-0.5" style="font-size: 10px;"><i class="bi bi-calendar-check me-1"></i>กำหนดคืน: ${it.dueDateStr}</div>` : ''}
             </td>
             <td class="text-center">${overdueBadge}</td>
-            <td class="text-center fw-bold text-danger fs-6">${it.remainingQty} ${it.unit}</td>
+            <td><span class="badge bg-light text-dark border fs-8 text-nowrap">${it.department}</span></td>
             <td class="text-center pe-3 text-nowrap">
               <div class="d-flex align-items-center justify-content-center gap-1">
-                <button type="button" class="btn btn-xs btn-success rounded-pill px-2.5 py-1 fs-8 fw-bold shadow-sm d-inline-flex align-items-center gap-1" onclick="sendLineOverdueReminder('${it.employeeId || ''}', '${it.employeeName.replace(/'/g, "\\'")}', '${it.equipmentName.replace(/'/g, "\\'")}', '${it.equipmentCode || ''}', ${it.remainingQty}, '${it.unit || 'ชิ้น'}', ${it.daysOverdue || 0}, '${it.dueDateStr || ''}')" title="ส่งการแจ้งเตือนติดตามคืนอุปกรณ์เกินกำหนดทาง LINE">
+                <button type="button" class="btn btn-xs btn-success rounded-pill px-2.5 py-1 fs-8 fw-bold shadow-sm d-inline-flex align-items-center gap-1" onclick="sendLineOverdueReminder('${it.employeeId || ''}', '${cleanEmpName.replace(/'/g, "\\'")}', '${it.equipmentName.replace(/'/g, "\\'")}', '${it.equipmentCode || ''}', ${it.remainingQty}, '${it.unit || 'ชิ้น'}', ${it.daysOverdue || 0}, '${it.dueDateStr || ''}')" title="ส่งการแจ้งเตือนติดตามคืนอุปกรณ์เกินกำหนดทาง LINE">
                   <i class="bi bi-line fs-7"></i> LINE
                 </button>
-                <button type="button" class="btn btn-xs btn-outline-warning rounded-pill px-2 py-1 fs-8 fw-semibold" onclick="sendOverdueReminder('${it.employeeId || ''}', '${it.employeeName.replace(/'/g, "\\'")}', '${it.equipmentName.replace(/'/g, "\\'")}')" title="ส่งการแจ้งเตือนติดตามคืนอุปกรณ์">
+                <button type="button" class="btn btn-xs btn-outline-warning rounded-pill px-2 py-1 fs-8 fw-semibold" onclick="sendOverdueReminder('${it.employeeId || ''}', '${cleanEmpName.replace(/'/g, "\\'")}', '${it.equipmentName.replace(/'/g, "\\'")}')" title="ส่งการแจ้งเตือนติดตามคืนอุปกรณ์">
                   <i class="bi bi-bell-fill text-warning me-1"></i> แจ้งเตือน
-                </button>
-                <button type="button" class="btn btn-xs btn-primary rounded-pill px-2.5 py-1 fs-8 fw-bold" onclick="quickReturnOverdueTransaction('${it.employeeId || ''}', '${it.equipmentId || ''}', ${it.remainingQty})" title="ทำรายการคืนอุปกรณ์ชิ้นนี้ทันที">
-                  <i class="bi bi-box-arrow-in-down me-1"></i> คืนด่วน
                 </button>
               </div>
             </td>
@@ -9099,48 +14334,154 @@
       }, 300);
     };
 
-    window.quickReturnOverdueTransaction = function(empId, equipId, qty) {
-      const modalElem = document.getElementById('overdueBorrowingsModal');
-      if (modalElem) {
-        const modal = bootstrap.Modal.getInstance(modalElem);
-        if (modal) modal.hide();
+    window.quickReturnOverdueTransaction = async function(e, empId, equipId, returnQty) {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+
+      try {
+        const equipObj = (equipmentList || []).find(x => String(x.id) === String(equipId) || String(x.code) === String(equipId));
+        const empObj = (employeeList || []).find(x => String(x.id) === String(empId) || String(x.code) === String(empId));
+        const equipName = equipObj ? equipObj.name : 'อุปกรณ์';
+        const empName = empObj ? empObj.name : (itEmpNameFallback(empId) || 'พนักงาน');
+        const unit = equipObj ? equipObj.unit : 'ชิ้น';
+        const qtyNum = parseInt(returnQty, 10) || 1;
+
+        // Check damage report for this employee & equipment
+        const dmgKey = `${equipId}_${empObj ? empObj.id : (empId || '')}`;
+        const damagesMap = (window.damagedEquipmentReports || {});
+        const dmgRecord = damagesMap[dmgKey] || {};
+        const damagedQty = Math.min(qtyNum, Number(dmgRecord.damagedQty || 0));
+        const goodQty = Math.max(0, qtyNum - damagedQty);
+        const damageNote = dmgRecord.note || '';
+
+        let confirmMsg = `ต้องการบันทึกรับคืน "${equipName}" จำนวน ${qtyNum} ${unit} จากคุณ ${empName} เข้าคลังทันทีหรือไม่?`;
+        if (damagedQty > 0) {
+          confirmMsg = `ต้องการบันทึกรับคืน "${equipName}" จากคุณ ${empName} หรือไม่?\n• สภาพสมบูรณ์: ${goodQty} ${unit} (นำกลับเข้าคลัง)\n• ชำรุด: ${damagedQty} ${unit} (แยกเข้าหมวดรอซ่อม)`;
+        }
+
+        let confirmed = false;
+        if (typeof window.showConfirmDialog === 'function') {
+          confirmed = await window.showConfirmDialog({
+            title: "ยืนยันรับคืนอุปกรณ์",
+            message: confirmMsg,
+            type: damagedQty > 0 ? "warning" : "info",
+            icon: damagedQty > 0 ? "bi-tools" : "bi-box-arrow-in-down",
+            confirmText: "คืน",
+            cancelText: "ยกเลิก",
+            target: e ? (e.currentTarget || e.target) : null
+          });
+        } else {
+          confirmed = true;
+        }
+
+        if (!confirmed) return;
+
+        // 1. Update inventory stock (แบบที่ 1: สภาพสมบูรณ์กลับเข้า quantity, ส่วนชำรุดแยกเข้า repairCount)
+        if (equipObj) {
+          equipObj.quantity = (equipObj.quantity || 0) + goodQty;
+          if (damagedQty > 0) {
+            equipObj.repairCount = (equipObj.repairCount || 0) + damagedQty;
+          }
+          equipObj.borrowedCount = Math.max(0, (equipObj.borrowedCount || 0) - qtyNum);
+
+          if (isFirebaseReady && db && equipObj.id) {
+            setDoc(doc(db, "equipment", equipObj.id), equipObj, { merge: true }).catch(err => {
+              console.warn("Firestore update equipment stock error on overdue return:", err);
+            });
+          }
+        }
+
+        // Clear damaged report record if returned
+        if (damagesMap[dmgKey]) {
+          delete damagesMap[dmgKey];
+          try {
+            localStorage.setItem('flora_equipment_damages', JSON.stringify(damagesMap));
+          } catch (e) {}
+        }
+
+        // 2. Create transaction record
+        const now = new Date();
+        const docNo = 'DOC-' + String(Date.now()).slice(-6);
+        const txNote = damagedQty > 0
+          ? `บันทึกรับคืนอุปกรณ์เกินกำหนด: สมบูรณ์ ${goodQty} ${unit}, ชำรุดส่งซ่อม ${damagedQty} ${unit}${damageNote ? ` (${damageNote})` : ''}`
+          : 'คืนอุปกรณ์จากการติดตามรายการยืมเกินกำหนด';
+
+        const newTx = {
+          id: 'tx-' + String(Date.now()).slice(-6),
+          docNo: docNo,
+          type: 'คืนอุปกรณ์',
+          employeeId: empObj ? empObj.id : (empId || 'UNKNOWN'),
+          employeeName: empObj ? `${empObj.name} (${empObj.department || 'แผนกทั่วไป'})` : empName,
+          employeeCode: empObj ? (empObj.code || empObj.id) : '',
+          employeeDepartment: empObj ? (empObj.department || 'แผนกทั่วไป') : 'แผนกทั่วไป',
+          items: [{
+            equipmentId: equipId,
+            equipmentName: equipName,
+            equipmentCode: equipObj ? (equipObj.code || equipObj.id) : '',
+            quantity: qtyNum,
+            unit: unit
+          }],
+          equipmentId: equipId,
+          equipmentName: equipName,
+          equipmentCode: equipObj ? (equipObj.code || equipObj.id) : '',
+          quantity: qtyNum,
+          unit: unit,
+          timestamp: typeof formatThaiDateTime === 'function' ? formatThaiDateTime(now) : now.toLocaleString('th-TH'),
+          rawTimestamp: now.getTime(),
+          note: txNote,
+          damagedQty: damagedQty,
+          goodQty: goodQty
+        };
+
+        transactionHistory.unshift(newTx);
+        saveToLocalStorage();
+
+        if (isFirebaseReady && db) {
+          try {
+            await setDoc(doc(db, "transactions", newTx.id), newTx, { merge: true });
+          } catch (err) {
+            console.warn("Firestore add transaction error on overdue return:", err);
+          }
+        }
+
+        if (typeof logAuditAction === 'function') {
+          logAuditAction('ประวัติรายการ', 'เพิ่ม', `ทำรายการคืนอุปกรณ์เกินกำหนด: ${equipName} จำนวน ${qtyNum} ${unit} จากคุณ ${empName}${damagedQty > 0 ? ` (ชำรุด ${damagedQty} ${unit})` : ''}`, newTx.id);
+        }
+
+        let summaryToast = `✅ บันทึกรับคืน "${equipName}" (${qtyNum} ${unit}) จากคุณ ${empName} เข้าคลังเรียบร้อยแล้ว`;
+        if (damagedQty > 0) {
+          summaryToast = `✅ รับคืน "${equipName}": สภาพสมบูรณ์ ${goodQty} ${unit} เข้าคลัง, ชำรุด ${damagedQty} ${unit} แยกเข้าหมวดรอซ่อม`;
+        }
+        showToast(summaryToast);
+
+        // Refresh overdue table & stats immediately in this modal without closing
+        renderOverdueTable();
+        updateStats();
+        renderCatalogGrid();
+        renderStaffTable();
+        renderHistoryTable();
+
+        // Refresh borrowers modal if open
+        if (typeof showEquipmentBorrowersModal === 'function' && equipObj && equipObj.id) {
+          const borrowersModalElem = document.getElementById('equipmentBorrowersModal');
+          if (borrowersModalElem && borrowersModalElem.classList.contains('show')) {
+            showEquipmentBorrowersModal(equipObj.id);
+          }
+        }
+
+        if (typeof validateFirestoreHistorySync === 'function') {
+          validateFirestoreHistorySync(false);
+        }
+      } catch (err) {
+        console.error("Overdue quick return error:", err);
+        showToast("เกิดข้อผิดพลาดในการบันทึกคืนอุปกรณ์");
       }
-
-      setTimeout(() => {
-        const tabBtn = document.getElementById('transaction-tab');
-        if (tabBtn) {
-          const bsTab = new bootstrap.Tab(tabBtn);
-          bsTab.show();
-        }
-
-        const typeReturnRadio = document.getElementById('typeReturn');
-        if (typeReturnRadio) {
-          typeReturnRadio.checked = true;
-          if (typeof toggleTransTypeUI === 'function') toggleTransTypeUI();
-        }
-
-        const empSelect = document.getElementById('transEmployeeSelect');
-        if (empSelect && empId) {
-          empSelect.value = empId;
-        }
-
-        if (equipId && typeof quickSelectTransaction === 'function') {
-          quickSelectTransaction(equipId);
-        }
-
-        const qtyInput = document.getElementById('transQty');
-        if (qtyInput && qty > 0) {
-          qtyInput.value = qty;
-        }
-
-        const noteInput = document.getElementById('transNote');
-        if (noteInput) {
-          noteInput.value = `คืนอุปกรณ์ยืมเกินกำหนด (ติดตามผ่านระบบแจ้งเตือน)`;
-        }
-
-        showToast(`↩️ เตรียมข้อมูลคืนอุปกรณ์ "${qty} ชิ้น" เรียบร้อยแล้ว กรุณาตรวจสอบและกดบันทึกรายการ`);
-      }, 300);
     };
+
+    function itEmpNameFallback(empId) {
+      const emp = (employeeList || []).find(x => x.id === empId);
+      return emp ? emp.name : 'พนักงาน';
+    }
 
     window.copyOverdueNotificationText = function() {
       const thresh = window.currentOverdueThresholdDays !== undefined ? window.currentOverdueThresholdDays : 3;
@@ -9197,44 +14538,1179 @@
     };
 
     // ==========================================
-    // AUDIO & SCANNER ENGINE LOGIC
+    // HARDWARE SCANNER AUTO-DETECT ENGINE (โหมดยิงสแกนบาร์โค้ด & QR Code อัตโนมัติ)
     // ==========================================
-    function playScanBeep() {
+    let scannerAutoDetectEnabled = true;
+    let scannerSoundEnabled = true;
+    let scannerAutoActionMode = 'SMART_CONTEXT'; // 'SMART_CONTEXT' | 'AUTO_CLOCK_IN' | 'AUTO_SELECT_FORM' | 'SHOW_POPUP_MODAL'
+    let scannerHistoryList = [];
+    let scannerKeyBuffer = '';
+    let scannerKeyTimestamps = [];
+    let scannerBufferResetTimer = null;
+    let scannerHudDismissTimer = null;
+    let scannerLastProcessedCode = '';
+    let scannerLastProcessedTime = 0;
+
+    function loadScannerSettings() {
+      try {
+        const savedAuto = localStorage.getItem('flora_scanner_autodetect_enabled');
+        if (savedAuto !== null) scannerAutoDetectEnabled = savedAuto === 'true';
+
+        const savedSound = localStorage.getItem('flora_scanner_sound_enabled');
+        if (savedSound !== null) scannerSoundEnabled = savedSound === 'true';
+
+        const savedMode = localStorage.getItem('flora_scanner_auto_action');
+        if (savedMode) scannerAutoActionMode = savedMode;
+        if (MAIN_STOCK_ONLY_MODE && scannerAutoActionMode === 'AUTO_CLOCK_IN') {
+          scannerAutoActionMode = 'SMART_CONTEXT';
+        }
+
+        const savedHistory = localStorage.getItem('flora_scanner_history');
+        if (savedHistory) {
+          const parsed = JSON.parse(savedHistory);
+          if (Array.isArray(parsed)) scannerHistoryList = parsed.slice(0, 50);
+        }
+      } catch (e) {
+        console.warn("Scanner settings load error:", e);
+      }
+      updateScannerStatusUI();
+    }
+
+    function saveScannerSettings() {
+      try {
+        localStorage.setItem('flora_scanner_autodetect_enabled', String(scannerAutoDetectEnabled));
+        localStorage.setItem('flora_scanner_sound_enabled', String(scannerSoundEnabled));
+        localStorage.setItem('flora_scanner_auto_action', scannerAutoActionMode);
+        localStorage.setItem('flora_scanner_history', JSON.stringify(scannerHistoryList.slice(0, 50)));
+      } catch (e) {}
+      updateScannerStatusUI();
+    }
+
+    function updateScannerStatusUI() {
+      const headerBtn = document.getElementById('btnHardwareScannerStatus');
+      const pulseDot = document.getElementById('scannerStatusPulseDot');
+      const btnText = document.getElementById('scannerStatusBtnText');
+      const modalDot = document.getElementById('modalScannerPulseDot');
+      const chkAuto = document.getElementById('chkScannerAutoDetectEnabled');
+      const chkSound = document.getElementById('chkScannerSoundEnabled');
+
+      if (chkAuto) chkAuto.checked = scannerAutoDetectEnabled;
+      if (chkSound) chkSound.checked = scannerSoundEnabled;
+
+      const radios = document.getElementsByName('scannerAutoActionRadio');
+      if (radios) {
+        radios.forEach(r => {
+          if (r.value === scannerAutoActionMode) r.checked = true;
+        });
+      }
+
+      if (scannerAutoDetectEnabled) {
+        if (pulseDot) pulseDot.className = 'scanner-status-pulse-dot';
+        if (modalDot) modalDot.className = 'scanner-status-pulse-dot';
+        if (btnText) btnText.textContent = 'ยิงสแกน';
+        if (headerBtn) {
+          headerBtn.className = 'btn btn-outline-success btn-sm rounded-pill px-3 py-1.5 fw-bold shadow-sm d-flex align-items-center gap-2';
+        }
+      } else {
+        if (pulseDot) pulseDot.className = 'scanner-status-pulse-dot inactive';
+        if (modalDot) modalDot.className = 'scanner-status-pulse-dot inactive';
+        if (btnText) btnText.textContent = 'โหมดยิงสแกน: ปิดอยู่';
+        if (headerBtn) {
+          headerBtn.className = 'btn btn-outline-secondary btn-sm rounded-pill px-3 py-1.5 fw-semibold shadow-sm d-flex align-items-center gap-2';
+        }
+      }
+    }
+
+    window.playHardwareScanSuccessSound = function() {
+      if (!scannerSoundEnabled) return;
       try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const now = ctx.currentTime;
+
+        const osc1 = ctx.createOscillator();
+        const osc2 = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc1.type = 'sine';
+        osc2.type = 'triangle';
+
+        osc1.frequency.setValueAtTime(1046.5, now);
+        osc1.frequency.exponentialRampToValueAtTime(1318.5, now + 0.08);
+
+        osc2.frequency.setValueAtTime(1567.98, now);
+        osc2.frequency.exponentialRampToValueAtTime(2093.0, now + 0.08);
+
+        gain.gain.setValueAtTime(0.18, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+
+        osc1.connect(gain);
+        osc2.connect(gain);
+        gain.connect(ctx.destination);
+
+        osc1.start(now);
+        osc2.start(now);
+        osc1.stop(now + 0.22);
+        osc2.stop(now + 0.22);
+      } catch(e){}
+    };
+
+    function playScanBeep() {
+      window.playHardwareScanSuccessSound();
+    }
+
+    window.playScanDuplicateSound = function() {
+      if (!scannerSoundEnabled) return;
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const now = ctx.currentTime;
+
+        // Double low-tone warning beep (แตกต่างจากเสียงสแกนปกติชัดเจน)
+        const osc1 = ctx.createOscillator();
+        const gain1 = ctx.createGain();
+        osc1.type = 'triangle';
+        osc1.frequency.setValueAtTime(440, now);
+        osc1.frequency.linearRampToValueAtTime(370, now + 0.09);
+        gain1.gain.setValueAtTime(0.18, now);
+        gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
+        osc1.connect(gain1);
+        gain1.connect(ctx.destination);
+        osc1.start(now);
+        osc1.stop(now + 0.09);
+
+        const osc2 = ctx.createOscillator();
+        const gain2 = ctx.createGain();
+        osc2.type = 'triangle';
+        osc2.frequency.setValueAtTime(440, now + 0.12);
+        osc2.frequency.linearRampToValueAtTime(330, now + 0.22);
+        gain2.gain.setValueAtTime(0.18, now + 0.12);
+        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+        osc2.connect(gain2);
+        gain2.connect(ctx.destination);
+        osc2.start(now + 0.12);
+        osc2.stop(now + 0.22);
+      } catch(e){}
+    };
+
+    window.playHardwareScanErrorSound = function() {
+      if (!scannerSoundEnabled) return;
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const now = ctx.currentTime;
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(880, ctx.currentTime);
-        gain.gain.setValueAtTime(0.12, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15);
+
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(320, now);
+        osc.frequency.linearRampToValueAtTime(220, now + 0.25);
+
+        gain.gain.setValueAtTime(0.18, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+
         osc.connect(gain);
         gain.connect(ctx.destination);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.15);
-      } catch (e) {}
+
+        osc.start(now);
+        osc.stop(now + 0.25);
+      } catch(e){}
+    };
+
+    window.testHardwareScannerSound = function() {
+      playHardwareScanSuccessSound();
+    };
+
+    window.openHardwareScannerSettingsModal = function() {
+      loadScannerSettings();
+      renderScannerHistoryTable();
+      clearScannerTestLog();
+
+      const modalElem = document.getElementById('hardwareScannerSettingsModal');
+      if (modalElem) {
+        const modalInst = new bootstrap.Modal(modalElem);
+        modalInst.show();
+        setTimeout(() => {
+          const testInput = document.getElementById('scannerTestInput');
+          if (testInput) testInput.focus();
+        }, 400);
+      }
+    };
+
+    window.toggleScannerAutoDetectState = function(enabled) {
+      scannerAutoDetectEnabled = enabled;
+      saveScannerSettings();
+      showToast(enabled ? "🟢 เปิดโหมดยิงสแกน QR Code / บาร์โค้ดอัตโนมัติแล้ว" : "🔴 ปิดโหมดยิงสแกนอัตโนมัติแล้ว");
+    };
+
+    window.toggleScannerSoundState = function(enabled) {
+      scannerSoundEnabled = enabled;
+      saveScannerSettings();
+      if (enabled) playHardwareScanSuccessSound();
+    };
+
+    window.changeScannerAutoActionMode = function(mode) {
+      if (MAIN_STOCK_ONLY_MODE && mode === 'AUTO_CLOCK_IN') {
+        scannerAutoActionMode = 'SMART_CONTEXT';
+        saveScannerSettings();
+        showToast('การลงเวลาอยู่ที่ศูนย์ผังโครงสร้างและจัดการบุคลากร');
+        return;
+      }
+      scannerAutoActionMode = mode;
+      saveScannerSettings();
+      showToast(`⚡ ปรับรูปแบบการทำงานเป็น: ${mode === 'SMART_CONTEXT' ? 'ฉลาดตามหน้าจอ' : mode === 'AUTO_CLOCK_IN' ? 'ลงเวลาเข้างานอัตโนมัติ' : mode === 'AUTO_SELECT_FORM' ? 'ใส่ฟอร์มเบิก-ยืม' : 'เปิดหน้าต่างข้อมูล'}`);
+    };
+
+    // Clean and Resolve Scanned Code
+    window.resolveScannedCodeEntity = function(rawInput) {
+      if (!rawInput) return { type: 'UNKNOWN', entity: null, cleanCode: '', rawCode: '' };
+      let clean = String(rawInput).trim();
+
+      // Check if it's formatted as URL with query param
+      if (clean.includes('?') && clean.includes('=')) {
+        try {
+          const url = new URL(clean, window.location.origin);
+          const dataParam = url.searchParams.get('data') || url.searchParams.get('qr') || url.searchParams.get('code');
+          if (dataParam) clean = decodeURIComponent(dataParam).trim();
+        } catch(e){}
+      }
+
+      let explicitType = null;
+      if (/^(EMPLOYEE|EE|EMP|PERSONNEL|STAFF)\s*[:=\-_\/]\s*/i.test(clean)) {
+        explicitType = 'EMPLOYEE';
+        clean = clean.replace(/^(EMPLOYEE|EE|EMP|PERSONNEL|STAFF)\s*[:=\-_\/]\s*/i, '').trim();
+      } else if (/^(EQUIPMENT|EQ|TOOL|ASSET)\s*[:=\-_\/]\s*/i.test(clean)) {
+        explicitType = 'EQUIPMENT';
+        clean = clean.replace(/^(EQUIPMENT|EQ|TOOL|ASSET)\s*[:=\-_\/]\s*/i, '').trim();
+      }
+
+      const lower = clean.toLowerCase();
+
+      // 1. Match Employee
+      if (explicitType === 'EMPLOYEE' || !explicitType) {
+        const emp = (employeeList || []).find(e => 
+          (e.id && e.id.toLowerCase() === lower) ||
+          (e.code && e.code.toLowerCase() === lower) ||
+          (e.name && e.name.toLowerCase() === lower) ||
+          (e.phone && e.phone.replace(/[^0-9]/g, '') === clean.replace(/[^0-9]/g, '') && clean.length >= 9)
+        );
+        if (emp) {
+          return {
+            type: 'EMPLOYEE',
+            entity: emp,
+            cleanCode: clean,
+            rawCode: rawInput,
+            title: typeof formatEmpName === 'function' ? formatEmpName(emp) : emp.name,
+            subtitle: `${emp.department || 'ทั่วไป'} • [${emp.id}]`,
+            imageUrl: emp.photoUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80',
+            badgeText: emp.role === 'STAFF' ? 'เจ้าหน้าที่สำนักงาน (Staff)' : 'พนักงานทำเกษตร (Worker)',
+            badgeClass: emp.role === 'STAFF' ? 'bg-primary' : 'bg-success'
+          };
+        }
+      }
+
+      // 2. Match Equipment
+      if (explicitType === 'EQUIPMENT' || !explicitType) {
+        const item = (equipmentList || []).find(x => 
+          (x.code && x.code.toLowerCase() === lower) ||
+          (x.id && x.id.toLowerCase() === lower) ||
+          (x.name && x.name.toLowerCase() === lower)
+        );
+        if (item) {
+          return {
+            type: 'EQUIPMENT',
+            entity: item,
+            cleanCode: clean,
+            rawCode: rawInput,
+            title: item.name,
+            subtitle: `${item.category || 'อุปกรณ์'} • รหัส ${item.code}`,
+            imageUrl: item.imageUrl || DEFAULT_EQUIPMENT_IMAGE,
+            badgeText: `คงเหลือ: ${item.quantity} ${item.unit}`,
+            badgeClass: item.quantity <= 5 ? 'bg-danger' : 'bg-success'
+          };
+        }
+      }
+
+      // 3. Unknown Code
+      return {
+        type: 'UNKNOWN',
+        entity: null,
+        cleanCode: clean,
+        rawCode: rawInput,
+        title: clean,
+        subtitle: 'ไม่พบในฐานข้อมูล (รหัสใหม่)',
+        imageUrl: '',
+        badgeText: 'รหัสไม่รู้จัก',
+        badgeClass: 'bg-secondary'
+      };
+    };
+
+    // Process detected code
+    window.processAutoDetectedScannedCode = function(rawCode, isHardware = true, avgInterval = 0) {
+      if (!rawCode || !rawCode.trim()) return;
+      const now = Date.now();
+      const clean = rawCode.trim();
+
+      // Debounce identical scans within 800ms
+      if (clean === scannerLastProcessedCode && (now - scannerLastProcessedTime) < 800) {
+        return;
+      }
+      scannerLastProcessedCode = clean;
+      scannerLastProcessedTime = now;
+
+      const res = resolveScannedCodeEntity(clean);
+
+      // Update diagnostic if modal or test box is open
+      updateDiagnosticReadout(res, isHardware, avgInterval);
+
+      // Play Sound
+      if (res.type !== 'UNKNOWN') {
+        playHardwareScanSuccessSound();
+      } else {
+        playHardwareScanErrorSound();
+      }
+
+      // Determine active screen context
+      const activeTabPane = document.querySelector('.tab-pane.active');
+      const activeTabId = activeTabPane ? activeTabPane.id : '';
+      let actionTaken = 'แสดงข้อมูล';
+
+      // Contextual execution
+      if (res.type === 'EMPLOYEE') {
+        const emp = res.entity;
+        if (!MAIN_STOCK_ONLY_MODE && (scannerAutoActionMode === 'AUTO_CLOCK_IN' || (scannerAutoActionMode === 'SMART_CONTEXT' && activeTabId === 'attendance-pane'))) {
+          recordAttendanceDirectly(emp, 'ยิงสแกนบัตรพนักงานอัตโนมัติ (Scanner Auto-detect)');
+          actionTaken = 'บันทึกเข้างานทันที 🟢';
+        } else if (scannerAutoActionMode === 'AUTO_SELECT_FORM' || (scannerAutoActionMode === 'SMART_CONTEXT' && (activeTabId === 'transaction-pane' || activeTabId === 'borrow-cart-pane'))) {
+          selectEmployeeToFormDirectly(emp);
+          actionTaken = 'เลือกใส่ฟอร์มเบิก-ยืม 📝';
+        } else if (scannerAutoActionMode === 'SHOW_POPUP_MODAL') {
+          openScanEmpBadgeModal();
+          setTimeout(() => handleScannedEmpQrCode(clean), 350);
+          actionTaken = 'เปิดหน้าต่างสแกนพนักงาน 👁️';
+        } else {
+          // Default SMART_CONTEXT on other screens: show HUD
+          actionTaken = 'แสดงแถบข้อมูลพนักงาน';
+        }
+      } else if (res.type === 'EQUIPMENT') {
+        const item = res.entity;
+        const transModal = document.getElementById('transactionModal');
+        const isTransModalActive = transModal && transModal.classList.contains('show');
+        if (isTransModalActive || (typeof selectedTransItems !== 'undefined' && selectedTransItems.length > 0)) {
+          window.addEquipmentDirectlyToCart(item, 1);
+          actionTaken = 'เพิ่มเข้าเอกสารทันที (+1) 📝';
+        } else if (scannerAutoActionMode === 'AUTO_SELECT_FORM' || (scannerAutoActionMode === 'SMART_CONTEXT' && (activeTabId === 'transaction-pane' || activeTabId === 'borrow-cart-pane'))) {
+          selectEquipmentToFormDirectly(item);
+          actionTaken = 'เลือกใส่อุปกรณ์ลงฟอร์ม 📝';
+        } else if (scannerAutoActionMode === 'SHOW_POPUP_MODAL') {
+          openBarcodeQrScannerModal();
+          setTimeout(() => handleScannedBarcodeCode(clean), 350);
+          actionTaken = 'เปิดหน้าต่างสแกนอุปกรณ์ 👁️';
+        } else {
+          actionTaken = 'แสดงแถบข้อมูลอุปกรณ์';
+        }
+      } else {
+        // UNKNOWN
+        actionTaken = 'ไม่พบในระบบ';
+        showToast(`⚠️ ยิงสแกนพบรหัส: "${clean}" (ยังไม่มีในระบบ)`);
+      }
+
+      // Log to history
+      const historyItem = {
+        id: 'scan-' + Date.now(),
+        timestamp: new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        type: res.type,
+        rawCode: clean,
+        title: res.title,
+        entity: res.entity,
+        actionTaken: actionTaken
+      };
+      scannerHistoryList.unshift(historyItem);
+      if (scannerHistoryList.length > 50) scannerHistoryList.pop();
+      saveScannerSettings();
+      renderScannerHistoryTable();
+
+      // Show Floating HUD
+      showScannerAutoDetectHUD(res, actionTaken);
+    };
+
+    // Direct Attendance Record
+    window.recordAttendanceDirectly = function(emp, noteText = 'ยิงสแกนบัตรพนักงานอัตโนมัติ') {
+      if (!emp) return;
+      if (MAIN_STOCK_ONLY_MODE) {
+        showToast("การลงเวลาถูกย้ายไปที่ศูนย์ผังโครงสร้างและจัดการบุคลากร");
+        return;
+      }
+      const timeStr = new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }) + ' น.';
+      const todayStr = new Date().toLocaleDateString('th-TH');
+
+      const log = {
+        id: 'att-' + Date.now(),
+        employeeId: emp.id,
+        employeeName: emp.name,
+        status: 'เข้างาน',
+        time: timeStr,
+        date: todayStr,
+        note: noteText
+      };
+
+      attendanceLogs.unshift(log);
+      saveToLocalStorage();
+
+      if (isFirebaseReady && db) {
+        addDoc(collection(db, "attendance"), log).catch(()=>{});
+      }
+
+      showToast(`🟢 บันทึกเข้างานสำเร็จ! [${emp.id}] คุณ${emp.name} ลงเวลาแล้ว (${timeStr})`);
+      renderAttendanceTable();
+      updateStats();
+    };
+
+    // Direct Form Selection
+    window.selectEmployeeToFormDirectly = function(emp) {
+      if (!emp) return;
+      if (typeof window.selectEmployeeForTransaction === 'function') {
+        window.selectEmployeeForTransaction(emp.id);
+      } else {
+        const searchInput = document.getElementById('transEmpSearchInput');
+        if (searchInput) {
+          searchInput.value = typeof formatEmpName === 'function' ? formatEmpName(emp) : emp.name;
+          if (typeof filterTransEmployeeSelect === 'function') filterTransEmployeeSelect(emp.name, { hideResultsBox: true });
+        }
+        const select = document.getElementById('empSelect');
+        if (select) select.value = emp.id;
+      }
+
+      const resultsBox = document.getElementById('transEmpSearchResultsBox');
+      if (resultsBox) {
+        resultsBox.classList.add('d-none');
+        resultsBox.innerHTML = '';
+      }
+
+      const attSearch = document.getElementById('attEmpSearchInput');
+      if (attSearch) {
+        attSearch.value = emp.name;
+        if (typeof filterAttendanceEmployeeSelect === 'function') filterAttendanceEmployeeSelect(emp.name);
+      }
+      const attSelect = document.getElementById('attEmpSelect');
+      if (attSelect) attSelect.value = emp.id;
+    };
+
+    window.selectEquipmentToFormDirectly = function(item) {
+      if (!item) return;
+      const transModal = document.getElementById('transactionModal');
+      const isTransModalActive = transModal && transModal.classList.contains('show');
+      if (isTransModalActive || (typeof selectedTransItems !== 'undefined' && selectedTransItems.length > 0)) {
+        window.addEquipmentDirectlyToCart(item, 1);
+      } else {
+        if (typeof quickSelectTransaction === 'function') {
+          quickSelectTransaction(item.id);
+        }
+        showToast(`📦 เลือกอุปกรณ์ "${item.name}" [${item.code}] ใส่ฟอร์มเรียบร้อย`);
+      }
+    };
+
+    // Floating Scanner HUD
+    window.showScannerAutoDetectHUD = function(res, actionTaken = '') {
+      const container = document.getElementById('scannerAutoDetectHudContainer');
+      if (!container) return;
+
+      if (scannerHudDismissTimer) {
+        clearTimeout(scannerHudDismissTimer);
+        scannerHudDismissTimer = null;
+      }
+
+      let actionButtonsHtml = '';
+      if (res.type === 'EMPLOYEE') {
+        const emp = res.entity;
+        actionButtonsHtml = `
+          <div class="d-flex gap-1.5 mt-2 flex-wrap">
+            <button type="button" class="btn btn-success btn-sm rounded-pill fw-bold flex-grow-1 fs-8 py-1" onclick="recordAttendanceDirectly(employeeList.find(x=>x.id==='${emp.id}')); hideScannerAutoDetectHUD();">
+              <i class="bi bi-check-circle-fill me-1"></i> ลงเวลาเข้างาน 🟢
+            </button>
+            <button type="button" class="btn btn-outline-primary btn-sm rounded-pill fw-semibold fs-8 py-1" onclick="selectEmployeeToFormDirectly(employeeList.find(x=>x.id==='${emp.id}')); switchNavTab('transaction-tab'); hideScannerAutoDetectHUD();">
+              <i class="bi bi-file-earmark-plus me-1"></i> ใส่ฟอร์มเบิก 📝
+            </button>
+            <button type="button" class="btn btn-outline-secondary btn-sm rounded-pill fs-8 py-1" onclick="openEmployeeBorrowHistoryModalFromScanner('${emp.id}'); hideScannerAutoDetectHUD();">
+              <i class="bi bi-clock-history me-1"></i> ประวัติ
+            </button>
+          </div>
+        `;
+      } else if (res.type === 'EQUIPMENT') {
+        const item = res.entity;
+        actionButtonsHtml = `
+          <div class="d-flex gap-1.5 mt-2 flex-wrap">
+            <button type="button" class="btn btn-success btn-sm rounded-pill fw-bold flex-grow-1 fs-8 py-1" onclick="selectEquipmentToFormDirectly(equipmentList.find(x=>x.id==='${item.id}')); switchNavTab('transaction-tab'); hideScannerAutoDetectHUD();">
+              <i class="bi bi-cart-plus-fill me-1"></i> เลือกใส่ฟอร์ม 📝
+            </button>
+            <button type="button" class="btn btn-outline-success btn-sm rounded-pill fw-bold fs-8 py-1" onclick="quickUpdateStockFromHud('${item.id}', 1)">
+              +1 เติมสต็อก
+            </button>
+            <button type="button" class="btn btn-outline-danger btn-sm rounded-pill fw-bold fs-8 py-1" onclick="quickUpdateStockFromHud('${item.id}', -1)">
+              -1 ตัดสต็อก
+            </button>
+            <button type="button" class="btn btn-outline-dark btn-sm rounded-pill fs-8 py-1" onclick="openPrintLabelModal('${item.id}'); hideScannerAutoDetectHUD();">
+              <i class="bi bi-printer me-1"></i> ฉลาก
+            </button>
+          </div>
+        `;
+      } else {
+        // UNKNOWN
+        actionButtonsHtml = `
+          <div class="d-flex gap-1.5 mt-2">
+            <button type="button" class="btn btn-success btn-sm rounded-pill fw-bold w-100 fs-8 py-1" onclick="openAddModalWithScannedCode('${res.cleanCode}'); hideScannerAutoDetectHUD();">
+              <i class="bi bi-box-seam me-1"></i> เพิ่มเป็นอุปกรณ์ใหม่
+            </button>
+          </div>
+        `;
+      }
+
+      container.innerHTML = `
+        <div class="scanner-hud-card p-3 shadow-lg">
+          <div class="d-flex align-items-center justify-content-between mb-2">
+            <div class="d-flex align-items-center gap-1.5">
+              <span class="scanner-status-pulse-dot"></span>
+              <span class="badge bg-dark bg-opacity-75 text-warning fs-8 font-monospace">
+                <i class="bi bi-upc-scan me-1 text-success"></i> ยิงสแกนอัตโนมัติ (Auto-detect)
+              </span>
+            </div>
+            <button type="button" class="btn-close btn-close-sm" style="font-size: 0.65rem;" onclick="hideScannerAutoDetectHUD()"></button>
+          </div>
+          <div class="scanner-laser-line mb-2"></div>
+
+          <div class="d-flex align-items-center gap-2.5">
+            ${res.imageUrl ? `
+              <img src="${res.imageUrl}" class="rounded-circle border border-2 border-success shadow-sm flex-shrink-0" style="width: 50px; height: 50px; object-fit: cover;" onerror="this.src='${DEFAULT_EQUIPMENT_IMAGE}'" />
+            ` : `
+              <div class="bg-secondary bg-opacity-10 text-secondary rounded-circle d-flex align-items-center justify-content-center flex-shrink-0" style="width: 50px; height: 50px;">
+                <i class="bi bi-qr-code fs-4 text-warning"></i>
+              </div>
+            `}
+            <div class="overflow-hidden flex-grow-1">
+              <div class="d-flex align-items-center gap-1">
+                <span class="badge ${res.badgeClass || 'bg-success'} fs-8" style="font-size: 0.7rem;">${res.badgeText || ''}</span>
+                ${actionTaken ? `<span class="badge bg-light text-dark border fs-8 text-truncate" style="font-size: 0.68rem;">${actionTaken}</span>` : ''}
+              </div>
+              <h6 class="fw-bold text-dark mb-0 text-truncate fs-7 mt-0.5">${res.title}</h6>
+              <div class="text-muted fs-8 text-truncate">${res.subtitle || res.cleanCode}</div>
+            </div>
+          </div>
+
+          ${actionButtonsHtml}
+        </div>
+      `;
+
+      container.classList.remove('d-none');
+
+      scannerHudDismissTimer = setTimeout(() => {
+        hideScannerAutoDetectHUD();
+      }, 6000);
+    };
+
+    window.hideScannerAutoDetectHUD = function() {
+      const container = document.getElementById('scannerAutoDetectHudContainer');
+      if (container) container.classList.add('d-none');
+    };
+
+    window.quickUpdateStockFromHud = async function(equipId, delta) {
+      const item = (equipmentList || []).find(x => x.id === equipId);
+      if (!item) return;
+      await window.quickUpdateStockDirectly(item, delta);
+      showScannerAutoDetectHUD(resolveScannedCodeEntity(item.code), `ปรับสต็อก (${delta > 0 ? '+' : ''}${delta}) เรียบร้อย`);
+    };
+
+    window.quickUpdateStockDirectly = async function(item, delta) {
+      if (!item) return;
+      const newQty = (item.quantity || 0) + delta;
+      if (newQty < 0) {
+        alert("ไม่สามารถปรับสต็อกให้ต่ำกว่า 0 ได้");
+        return;
+      }
+      item.quantity = newQty;
+      saveToLocalStorage();
+
+      if (isFirebaseReady && db) {
+        try {
+          await setDoc(doc(db, "equipment", item.id), item, { merge: true });
+        } catch(e){}
+      }
+
+      const txType = delta > 0 ? "เติมสต็อกด่วน" : "เบิกตัดสต็อกด่วน";
+      const newTx = {
+        id: 'tx-' + String(Date.now()).slice(-6),
+        type: txType,
+        employeeId: currentAuthUser ? currentAuthUser.uid : 'SCANNER',
+        employeeName: currentAuthUser ? (currentAuthUser.displayName || 'ผู้ใช้สแกนเนอร์') : 'เครื่องยิงสแกนอัตโนมัติ',
+        equipmentId: item.id,
+        equipmentName: `${item.name} [${item.code}]`,
+        quantity: Math.abs(delta),
+        unit: item.unit,
+        location: item.location || 'คลังกลาง',
+        note: `ยิงสแกนบาร์โค้ดปรับปรุงสต็อก (${delta > 0 ? '+' : ''}${delta})`,
+        rawTimestamp: Date.now(),
+        timestamp: new Date().toLocaleString('th-TH')
+      };
+
+      transactionHistory.unshift(newTx);
+      saveToLocalStorage();
+      if (isFirebaseReady && db) {
+        addDoc(collection(db, "transactions"), newTx).catch(()=>{});
+      }
+
+      playHardwareScanSuccessSound();
+      showToast(`⚡ ปรับสต็อก "${item.name}" เรียบร้อย! คงเหลือ: ${item.quantity} ${item.unit}`);
+      renderCatalogGrid();
+      renderStaffTable();
+      updateStats();
+    };
+
+    window.openAddEquipmentWithScannedCode = function(code) {
+      openAddModal();
+      if (code) {
+        setTimeout(() => {
+          const codeInput = document.getElementById('equipCodeInput');
+          if (codeInput) codeInput.value = code;
+        }, 300);
+      }
+    };
+    window.openAddModalWithScannedCode = window.openAddEquipmentWithScannedCode;
+
+    window.openAddEmployeeModalWithScannedCode = function(code) {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('เพิ่มข้อมูลบุคลากร');
+      openAddEmployeeModal();
+      if (code) {
+        setTimeout(() => {
+          const idInput = document.getElementById('empIdInput');
+          if (idInput) idInput.value = code;
+        }, 300);
+      }
+    };
+
+    window.openEmployeeBorrowHistoryModalFromScanner = function(empId) {
+      const emp = (employeeList || []).find(x => x.id === empId);
+      if (!emp) return;
+      if (typeof switchNavTab === 'function') switchNavTab('history-tab');
+      const searchInput = document.getElementById('historySearchInput');
+      if (searchInput) {
+        searchInput.value = emp.name;
+        if (typeof renderHistoryTable === 'function') renderHistoryTable();
+      }
+      showToast(`📋 ค้นหาประวัติการเบิก-ยืมของคุณ ${emp.name}`);
+    };
+
+    // Diagnostic & History Log Renderers
+    function updateDiagnosticReadout(res, isHardware, avgInterval) {
+      const typeElem = document.getElementById('diagDetectedType');
+      const speedElem = document.getElementById('diagSpeed');
+      const resElem = document.getElementById('diagResultTitle');
+      const testInput = document.getElementById('scannerTestInput');
+
+      if (testInput) {
+        testInput.value = res.cleanCode;
+      }
+      if (typeElem) {
+        if (res.type === 'EMPLOYEE') {
+          typeElem.className = 'badge bg-success fs-8 mt-1';
+          typeElem.innerHTML = '🪪 บัตรพนักงาน (Employee)';
+        } else if (res.type === 'EQUIPMENT') {
+          typeElem.className = 'badge bg-primary fs-8 mt-1';
+          typeElem.innerHTML = '📦 อุปกรณ์ (Equipment)';
+        } else {
+          typeElem.className = 'badge bg-danger fs-8 mt-1';
+          typeElem.innerHTML = '⚠️ ไม่พบในระบบ (Unknown)';
+        }
+      }
+
+      if (speedElem) {
+        if (isHardware && avgInterval > 0) {
+          speedElem.innerHTML = `<span class="text-success">${Math.round(avgInterval)} ms/ตัว</span> <small class="text-muted fs-8">(เครื่องยิงความเร็วสูง ⚡)</small>`;
+        } else {
+          speedElem.innerHTML = `<span class="text-primary">แป้นพิมพ์ / โค้ด</span>`;
+        }
+      }
+
+      if (resElem) {
+        resElem.textContent = `${res.title} ${res.subtitle ? `(${res.subtitle})` : ''}`;
+      }
+    }
+
+    function renderScannerHistoryTable() {
+      const tbody = document.getElementById('scannerHistoryTableBody');
+      if (!tbody) return;
+      if (!scannerHistoryList || scannerHistoryList.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-3">ยังไม่มีประวัติการยิงสแกนในรอบนี้</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = scannerHistoryList.map(h => {
+        const typeBadge = h.type === 'EMPLOYEE' 
+          ? '<span class="badge bg-success">พนักงาน</span>' 
+          : h.type === 'EQUIPMENT' 
+            ? '<span class="badge bg-primary">อุปกรณ์</span>' 
+            : '<span class="badge bg-secondary">ไม่พบ</span>';
+
+        return `
+          <tr>
+            <td class="font-monospace text-muted">${h.timestamp}</td>
+            <td>${typeBadge}</td>
+            <td class="font-monospace fw-bold text-dark text-truncate" style="max-width: 130px;">${h.rawCode}</td>
+            <td class="text-truncate" style="max-width: 180px;"><b>${h.title}</b></td>
+            <td class="text-end">
+              <span class="badge bg-light text-dark border fs-8">${h.actionTaken || 'สำเร็จ'}</span>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    window.clearScannerHistory = function() {
+      scannerHistoryList = [];
+      saveScannerSettings();
+      renderScannerHistoryTable();
+      showToast("ล้างประวัติการยิงสแกนเรียบร้อยแล้ว");
+    };
+
+    window.clearScannerTestLog = function() {
+      const testInput = document.getElementById('scannerTestInput');
+      const typeElem = document.getElementById('diagDetectedType');
+      const speedElem = document.getElementById('diagSpeed');
+      const resElem = document.getElementById('diagResultTitle');
+
+      if (testInput) testInput.value = '';
+      if (typeElem) {
+        typeElem.className = 'badge bg-secondary fs-8 mt-1';
+        typeElem.textContent = '- รอสัญญาณ -';
+      }
+      if (speedElem) speedElem.textContent = '- ms';
+      if (resElem) resElem.textContent = '-';
+    };
+
+    // Global Hardware Scanner Keystroke Listener
+    function initGlobalScannerAutoDetectEngine() {
+      loadScannerSettings();
+
+      // Listen for Live Scanner Test Input box typing or scanner direct focus
+      const testInput = document.getElementById('scannerTestInput');
+      if (testInput) {
+        testInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            const val = testInput.value.trim();
+            if (val) {
+              processAutoDetectedScannedCode(val, true, 20);
+            }
+          }
+        });
+      }
+
+      window.addEventListener('keydown', (e) => {
+        if (!scannerAutoDetectEnabled) return;
+
+        // Skip non-character control keys except Enter
+        if (['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'Tab', 'Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+          return;
+        }
+
+        const now = Date.now();
+        const activeElem = document.activeElement;
+        const isEditable = activeElem && (
+          activeElem.tagName === 'INPUT' || 
+          activeElem.tagName === 'TEXTAREA' || 
+          activeElem.isContentEditable
+        );
+        const isTestInput = activeElem && activeElem.id === 'scannerTestInput';
+
+        if (scannerBufferResetTimer) {
+          clearTimeout(scannerBufferResetTimer);
+        }
+
+        if (e.key === 'Enter') {
+          if (scannerKeyBuffer.length >= 2) {
+            const intervals = [];
+            for (let i = 1; i < scannerKeyTimestamps.length; i++) {
+              intervals.push(scannerKeyTimestamps[i] - scannerKeyTimestamps[i - 1]);
+            }
+            const avgInterval = intervals.length > 0 ? (intervals.reduce((a, b) => a + b, 0) / intervals.length) : 0;
+            const hasQrPrefix = scannerKeyBuffer.startsWith('EMPLOYEE:') || scannerKeyBuffer.startsWith('EQUIPMENT:') || scannerKeyBuffer.startsWith('EQ-') || scannerKeyBuffer.startsWith('WK-') || scannerKeyBuffer.startsWith('ST-');
+            const isRapidScan = avgInterval < 75 || hasQrPrefix || isTestInput || !isEditable;
+
+            if (isRapidScan) {
+              e.preventDefault();
+              e.stopPropagation();
+
+              const codeToProcess = scannerKeyBuffer;
+              scannerKeyBuffer = '';
+              scannerKeyTimestamps = [];
+
+              // If user was typing in regular input field and scanner dumped chars into it, clean up
+              if (isEditable && !isTestInput) {
+                if (activeElem.value && activeElem.value.endsWith(codeToProcess)) {
+                  activeElem.value = activeElem.value.slice(0, -codeToProcess.length);
+                }
+              }
+
+              processAutoDetectedScannedCode(codeToProcess, true, avgInterval);
+              return;
+            }
+          }
+          scannerKeyBuffer = '';
+          scannerKeyTimestamps = [];
+          return;
+        }
+
+        // Printable characters
+        if (e.key.length === 1) {
+          scannerKeyBuffer += e.key;
+          scannerKeyTimestamps.push(now);
+
+          // Reset buffer if idle for more than 280ms
+          scannerBufferResetTimer = setTimeout(() => {
+            scannerKeyBuffer = '';
+            scannerKeyTimestamps = [];
+          }, 280);
+        }
+      }, true);
     }
 
     let html5QrScannerInstance = null;
     let isScannerActive = false;
     let activeScannedItemId = null;
+    let activeScannerDetectedEmpId = null;
     let activeScannedUnknownCode = null;
+    let currentScannerModalMode = 'NORMAL'; // 'NORMAL' | 'FOCUS_CARD'
+    window.isContinuousCartScanning = false;
+    window.lastContinuousScannedCode = null;
+    window.lastContinuousScannedTime = 0;
 
-    window.openBarcodeQrScannerModal = function() {
+    window.updateScannerOperatorUI = function(emp = null) {
+      const statusElem = document.getElementById('scannerOperatorStatusText');
+      const badgeElem = document.getElementById('scannerOperatorBadge');
+      if (!statusElem || !badgeElem) return;
+
+      if (!emp) {
+        const empSelect = document.getElementById('empSelect');
+        const empId = empSelect ? empSelect.value : null;
+        if (empId && typeof employeeList !== 'undefined' && Array.isArray(employeeList)) {
+          emp = employeeList.find(e => e && e.id === empId);
+        }
+      }
+
+      if (emp) {
+        const empDisplayName = typeof formatEmpName === 'function' ? formatEmpName(emp) : emp.name;
+        const empDept = emp.department || 'ทั่วไป';
+        statusElem.innerHTML = `<span class="fw-bold text-dark">${escapeHtml(empDisplayName)}</span> <span class="text-muted fs-8 font-monospace">[${escapeHtml(emp.id || emp.code || '')}]</span> <span class="text-secondary fs-8">(${escapeHtml(empDept)})</span>`;
+        badgeElem.className = 'badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 fs-8 text-nowrap ms-2';
+        badgeElem.textContent = 'ระบุแล้ว';
+      } else {
+        statusElem.textContent = 'รอสแกนผู้ทำรายการ';
+        badgeElem.className = 'badge bg-light text-muted border border-secondary border-opacity-25 fs-8 text-nowrap ms-2';
+        badgeElem.textContent = 'ยังไม่ระบุ';
+      }
+    };
+
+    window.clearAllScannerItemsConfirm = function() {
+      const items = (typeof selectedTransItems !== 'undefined' && Array.isArray(selectedTransItems)) ? selectedTransItems : [];
+      if (items.length === 0) return;
+      if (confirm(`ต้องการลบรายการอุปกรณ์ที่เลือกไว้ทั้งหมด (${items.length} รายการ) หรือไม่?`)) {
+        if (typeof window.clearTransCart === 'function') {
+          window.clearTransCart();
+        } else {
+          selectedTransItems = [];
+          if (typeof renderTransCartList === 'function') renderTransCartList();
+        }
+        if (typeof window.updateScannerEquipmentListUI === 'function') {
+          window.updateScannerEquipmentListUI();
+        }
+        if (typeof showToast === 'function') {
+          showToast('🗑️ ลบรายการอุปกรณ์ทั้งหมดเรียบร้อยแล้ว');
+        }
+      }
+    };
+
+    window.updateScannerEquipmentListUI = function() {
+      const countBadge = document.getElementById('continuousScanCartCountBadge');
+      const noItemsBox = document.getElementById('scannerNoItemsPlaceholder');
+      const listContainer = document.getElementById('scannerScannedItemsList');
+      const clearAllBtn = document.getElementById('scannerClearAllBtn');
+      const saveBtn = document.getElementById('btnScannerSaveTransaction');
+
+      const items = (typeof selectedTransItems !== 'undefined' && Array.isArray(selectedTransItems)) ? selectedTransItems : [];
+      if (countBadge) countBadge.textContent = items.length;
+
+      const contFooterCount = document.getElementById('continuousScanFooterCount');
+      if (contFooterCount) contFooterCount.textContent = items.length;
+
+      if (clearAllBtn) {
+        if (items.length > 0) {
+          clearAllBtn.classList.remove('d-none');
+        } else {
+          clearAllBtn.classList.add('d-none');
+        }
+      }
+
+      // ตรวจสอบและอัปเดตปุ่ม "บันทึกข้อมูล" (บันทึกเบิกตัดสต็อก / บันทึกยืมอุปกรณ์)
+      if (saveBtn) {
+        if (items.length === 0) {
+          saveBtn.disabled = true;
+          saveBtn.className = 'btn btn-secondary fw-bold rounded-pill px-4 py-2.5 shadow-sm fs-6 w-100';
+          saveBtn.innerHTML = 'บันทึกข้อมูล';
+        } else {
+          saveBtn.disabled = false;
+          // ตรวจสอบประเภทอุปกรณ์ในรายการ
+          const hasBorrowItem = items.some(it => {
+            const eq = (typeof equipmentList !== 'undefined' && Array.isArray(equipmentList)) ? equipmentList.find(e => e.id === it.id) : null;
+            return eq && (typeof window.isEquipmentBorrowType === 'function') && window.isEquipmentBorrowType(eq);
+          });
+
+          if (hasBorrowItem || currentTransCartType === 'ยืมอุปกรณ์') {
+            saveBtn.className = 'btn btn-warning fw-bold rounded-pill px-4 py-2.5 shadow-sm text-dark fs-6 w-100';
+            saveBtn.innerHTML = '<i class="bi bi-arrow-repeat me-1.5"></i> บันทึกยืมอุปกรณ์';
+          } else {
+            saveBtn.className = 'btn btn-danger fw-bold rounded-pill px-4 py-2.5 shadow-sm text-white fs-6 w-100';
+            saveBtn.innerHTML = '<i class="bi bi-box-arrow-up me-1.5"></i> บันทึกเบิกตัดสต็อก';
+          }
+        }
+      }
+
+      if (!listContainer) return;
+
+      if (items.length === 0) {
+        if (noItemsBox) noItemsBox.classList.remove('d-none');
+        listContainer.innerHTML = '';
+      } else {
+        if (noItemsBox) noItemsBox.classList.add('d-none');
+        listContainer.innerHTML = items.map(it => {
+          const equipObj = (typeof equipmentList !== 'undefined' && Array.isArray(equipmentList)) ? equipmentList.find(e => e.id === it.id) : null;
+          const currentStock = equipObj ? (equipObj.quantity || 0) : 999;
+          const isAtMax = (it.qty || 1) >= currentStock;
+          const isAtMin = (it.qty || 1) <= 1;
+
+          return `
+          <div class="d-flex align-items-center justify-content-between py-1.5 px-2.5 bg-white rounded-3 border border-light shadow-2xs">
+            <div class="d-flex align-items-center gap-1.5 overflow-hidden me-2" style="max-width: 58%;">
+              <span class="fw-semibold text-dark text-truncate fs-7">${escapeHtml(it.name || '-')}</span>
+              <span class="text-muted fs-9 font-monospace d-none d-sm-inline">[${escapeHtml(it.code || it.id || '')}]</span>
+            </div>
+            <div class="d-flex align-items-center gap-2 flex-shrink-0">
+              <div class="input-group input-group-sm align-items-center bg-light rounded-pill border px-1" style="height: 34px;">
+                <button type="button" class="btn btn-sm btn-link text-dark p-0 px-2 border-0 text-decoration-none lh-1" onclick="updateScannerItemQty('${it.id}', -1)" ${isAtMin ? 'disabled style="opacity:0.35;"' : ''} title="ลดจำนวน">
+                  <i class="bi bi-dash fw-bold fs-5"></i>
+                </button>
+                <span class="fw-bold text-dark px-2 fs-6 text-center" style="min-width: 28px;">${it.qty || 1}</span>
+                <button type="button" class="btn btn-sm btn-link text-dark p-0 px-2 border-0 text-decoration-none lh-1" onclick="updateScannerItemQty('${it.id}', 1)" ${isAtMax ? 'disabled style="opacity:0.35;"' : ''} title="เพิ่มจำนวน">
+                  <i class="bi bi-plus fw-bold fs-5"></i>
+                </button>
+              </div>
+              <button type="button" class="btn btn-sm btn-link text-danger p-1 border-0 lh-1 ms-0.5" onclick="removeCartItem('${it.id}')" title="ลบรายการนี้">
+                <i class="bi bi-trash3 fs-6"></i>
+              </button>
+            </div>
+          </div>
+        `;
+        }).join('');
+      }
+    };
+
+    // ปรับเปลี่ยนจำนวนอุปกรณ์ในหน้าต่างสแกนผ่านปุ่ม + และ -
+    window.updateScannerItemQty = function(equipId, delta) {
+      if (typeof window.updateCartItemQty === 'function') {
+        window.updateCartItemQty(equipId, delta);
+      }
+      if (typeof window.updateScannerEquipmentListUI === 'function') {
+        window.updateScannerEquipmentListUI();
+      }
+    };
+
+    // บันทึกรายการโดยตรงจากหน้าสแกนอุปกรณ์ (เบิกตัดสต็อก หรือ ยืมอุปกรณ์ อัตโนมัติ)
+    window.saveTransactionDirectlyFromScanner = async function() {
+      const items = (typeof selectedTransItems !== 'undefined' && Array.isArray(selectedTransItems)) ? selectedTransItems : [];
+      if (items.length === 0) {
+        alert("⚠️ กรุณาสแกนอุปกรณ์อย่างน้อย 1 รายการก่อนบันทึก");
+        return;
+      }
+
+      // ตรวจสอบผู้ทำรายการ
+      const empSelect = document.getElementById('empSelect');
+      const empId = empSelect ? empSelect.value : null;
+      if (!empId) {
+        alert("⚠️ กรุณาสแกนบัตรผู้ทำรายการ หรือเลือกผู้ทำรายการก่อนบันทึกข้อมูล");
+        return;
+      }
+
+      const emp = (typeof employeeList !== 'undefined' && Array.isArray(employeeList)) ? employeeList.find(x => x.id === empId) : null;
+      if (!emp) {
+        alert("❌ ไม่พบข้อมูลผู้ทำรายการในระบบ");
+        return;
+      }
+
+      // กำหนดประเภทเอกสารอัตโนมัติ: ยืมอุปกรณ์ หรือ เบิกจ่าย (เบิกตัดสต็อก)
+      const hasBorrowItem = items.some(it => {
+        const eq = (typeof equipmentList !== 'undefined' && Array.isArray(equipmentList)) ? equipmentList.find(e => e.id === it.id) : null;
+        return eq && (typeof window.isEquipmentBorrowType === 'function') && window.isEquipmentBorrowType(eq);
+      });
+
+      const determinedType = (hasBorrowItem || currentTransCartType === 'ยืมอุปกรณ์') ? 'ยืมอุปกรณ์' : 'เบิกจ่าย';
+
+      // ปรับ radio button ใน transactionForm ให้ตรง
+      const borrowRadio = document.getElementById('typeBorrow');
+      const issueRadio = document.getElementById('typeIssue');
+      if (determinedType === 'ยืมอุปกรณ์' && borrowRadio) {
+        borrowRadio.checked = true;
+      } else if (issueRadio) {
+        issueRadio.checked = true;
+      }
+      if (typeof window.toggleTransTypeUI === 'function') {
+        window.toggleTransTypeUI();
+      }
+
+      const saveBtn = document.getElementById('btnScannerSaveTransaction');
+      const originalBtnHtml = saveBtn ? saveBtn.innerHTML : 'บันทึกข้อมูล';
+      if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1.5"></span> กำลังบันทึก...';
+      }
+
+      try {
+        // สร้าง event จำลองสำหรับ handleTransactionSubmit
+        const dummyEvent = {
+          preventDefault: () => {}
+        };
+        await handleTransactionSubmit(dummyEvent);
+
+        // ปิดกล้องและหน้าต่างสแกน
+        window.stopHtml5Scanner();
+        const modalElem = document.getElementById('barcodeQrScannerModal');
+        if (modalElem) {
+          const modalInst = bootstrap.Modal.getInstance(modalElem);
+          if (modalInst) modalInst.hide();
+        }
+
+        // รีเซ็ตสถานะหน้าสแกน
+        if (typeof window.updateScannerOperatorUI === 'function') {
+          window.updateScannerOperatorUI(null);
+        }
+        if (typeof window.updateScannerEquipmentListUI === 'function') {
+          window.updateScannerEquipmentListUI();
+        }
+
+        const actionText = determinedType === 'ยืมอุปกรณ์' ? 'ยืมอุปกรณ์' : 'เบิกตัดสต็อก';
+        showToast(`✅ บันทึกรายการ "${actionText}" สำเร็จเรียบร้อยแล้ว`);
+      } catch (err) {
+        console.error("Scanner Direct Save Error:", err);
+        alert(`❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล: ${err.message || err}`);
+      } finally {
+        if (saveBtn) {
+          saveBtn.disabled = false;
+          saveBtn.innerHTML = originalBtnHtml;
+        }
+      }
+    };
+
+    window.openCatalogEquipmentScannerModal = function() {
+      currentScannerModalMode = 'FOCUS_CARD';
+      window.openBarcodeQrScannerModal();
+    };
+
+    // เปิดโหมด "สแกนหลายอัน" จากปุ่มหัวเรื่องหน้าคลังอุปกรณ์
+    window.openContinuousMultiScanModal = function() {
+      window.isContinuousCartScanning = true;
+      window.openBarcodeQrScannerModal({ forceContinuous: true });
+    };
+
+    window.openBarcodeQrScannerModal = function(options = {}) {
+      activeScannedItemId = null;
+      activeScannerDetectedEmpId = null;
+      activeScannedUnknownCode = null;
+      window.lastContinuousScannedCode = null;
+      window.lastContinuousScannedTime = 0;
+
       const promptState = document.getElementById('scannedItemPromptState');
       const resultCard = document.getElementById('scannedItemResultCard');
+      const empCard = document.getElementById('scannedEmpResultCard');
       const notFoundCard = document.getElementById('scannedItemNotFoundCard');
       if (promptState) promptState.classList.remove('d-none');
       if (resultCard) resultCard.classList.add('d-none');
+      if (empCard) empCard.classList.add('d-none');
       if (notFoundCard) notFoundCard.classList.add('d-none');
 
+      // Check if transaction document modal is active or explicitly requested continuous
+      const transModal = document.getElementById('transactionModal');
+      const isTransActive = transModal && transModal.classList.contains('show');
+      window.isContinuousCartScanning = true;
+
+      window.transDuplicateScanCounts = window.transDuplicateScanCounts || {};
+      if (selectedTransItems && Array.isArray(selectedTransItems)) {
+        selectedTransItems.forEach(item => {
+          if (!window.transDuplicateScanCounts[item.id]) {
+            window.transDuplicateScanCounts[item.id] = 1;
+          }
+        });
+      }
+
+      const contBanner = document.getElementById('continuousScanBanner');
+      const contFooter = document.getElementById('continuousScanFooterSummary');
+      const contFinishBtn = document.getElementById('btnFinishContinuousScan');
+      const contCount = document.getElementById('continuousScanCartCountBadge');
+      const contFooterCount = document.getElementById('continuousScanFooterCount');
+      const lastItemText = document.getElementById('continuousScanLastItemText');
+
+      if (window.isContinuousCartScanning) {
+        if (contBanner) contBanner.classList.add('d-none');
+        if (contFinishBtn) contFinishBtn.classList.remove('d-none');
+        const cartLen = (typeof selectedTransItems !== 'undefined' && Array.isArray(selectedTransItems)) ? selectedTransItems.length : 0;
+        if (contCount) contCount.textContent = cartLen;
+        if (contFooterCount) contFooterCount.textContent = cartLen;
+      } else {
+        if (contBanner) contBanner.classList.add('d-none');
+        if (contFinishBtn) contFinishBtn.classList.remove('d-none');
+      }
+
+      if (typeof window.updateScannerOperatorUI === 'function') {
+        window.updateScannerOperatorUI();
+      }
+      if (typeof window.updateScannerEquipmentListUI === 'function') {
+        window.updateScannerEquipmentListUI();
+      }
+
       const modalElem = document.getElementById('barcodeQrScannerModal');
-      const modalInst = new bootstrap.Modal(modalElem);
+      const modalInst = bootstrap.Modal.getOrCreateInstance(modalElem);
       modalInst.show();
 
       setTimeout(() => {
         startHtml5Scanner();
       }, 300);
+    };
+
+    window.finishContinuousScanModal = function() {
+      const wasContScanning = !!window.isContinuousCartScanning;
+      const hasCartItems = (typeof selectedTransItems !== 'undefined' && Array.isArray(selectedTransItems) && selectedTransItems.length > 0);
+      window.isContinuousCartScanning = false;
+      window.lastContinuousScannedCode = null;
+      window.stopHtml5Scanner();
+      const modalElem = document.getElementById('barcodeQrScannerModal');
+      if (modalElem) {
+        const modalInst = bootstrap.Modal.getInstance(modalElem);
+        if (modalInst) modalInst.hide();
+      }
+      if (wasContScanning || hasCartItems) {
+        const transModal = document.getElementById('transactionModal');
+        if (transModal) {
+          const bsModal = bootstrap.Modal.getOrCreateInstance(transModal);
+          bsModal.show();
+          document.body.classList.add('modal-open');
+          document.body.style.overflow = 'hidden';
+        } else if (typeof openTransactionModal === 'function') {
+          openTransactionModal();
+        }
+        setTimeout(() => {
+          if (typeof renderTransCartList === 'function') {
+            renderTransCartList();
+          }
+          const cartBox = document.getElementById('selectedTransCartBox');
+          if (cartBox) {
+            cartBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }
+        }, 150);
+        const cartLen = (typeof selectedTransItems !== 'undefined' && Array.isArray(selectedTransItems)) ? selectedTransItems.length : 0;
+        showToast(`🎉 สแกนครบเรียบร้อย! มีอุปกรณ์ในเอกสาร ${cartLen} รายการ พร้อมตรวจสอบ/แก้ไขจำนวนได้ทันที`);
+      }
     };
 
     window.restartHtml5Scanner = function() {
@@ -9245,10 +15721,19 @@
     };
 
     window.stopHtml5Scanner = function() {
+      window.isContinuousCartScanning = false;
+      window.lastContinuousScannedCode = null;
       if (html5QrScannerInstance && isScannerActive) {
         html5QrScannerInstance.stop().then(() => {
           isScannerActive = false;
         }).catch(err => console.warn("Stop scanner:", err));
+      }
+      const transModal = document.getElementById('transactionModal');
+      if (transModal && transModal.classList.contains('show')) {
+        setTimeout(() => {
+          document.body.classList.add('modal-open');
+          document.body.style.overflow = 'hidden';
+        }, 350);
       }
     };
 
@@ -9261,7 +15746,13 @@
       try {
         const config = { 
           fps: 15, 
-          qrbox: { width: 240, height: 240 },
+          qrbox: (viewfinderWidth, viewfinderHeight) => {
+            const minEdge = Math.min(viewfinderWidth, viewfinderHeight);
+            return {
+              width: Math.max(220, Math.floor(viewfinderWidth * 0.85)),
+              height: Math.max(160, Math.floor(minEdge * 0.75))
+            };
+          },
           aspectRatio: 1.0
         };
 
@@ -9271,7 +15762,6 @@
           { facingMode: "environment" },
           config,
           (decodedText) => {
-            playScanBeep();
             handleScannedBarcodeCode(decodedText);
           },
           (errorMessage) => {
@@ -9297,53 +15787,341 @@
     window.handleManualBarcodeSearch = function() {
       const input = document.getElementById('manualScannerBarcodeInput');
       if (input && input.value.trim()) {
-        playScanBeep();
-        handleScannedBarcodeCode(input.value.trim());
+        const val = input.value.trim();
+        input.value = '';
+        input.focus();
+        handleScannedBarcodeCode(val);
       }
     };
 
     window.handleScannedBarcodeCode = function(rawCode) {
-      let cleanCode = rawCode.trim();
-      if (cleanCode.startsWith('EQUIPMENT:')) {
-        cleanCode = cleanCode.replace('EQUIPMENT:', '').trim();
-      }
-
-      // Find item in equipmentList
-      const item = equipmentList.find(x => 
-        (x.code && x.code.toLowerCase() === cleanCode.toLowerCase()) || 
-        (x.id && x.id.toLowerCase() === cleanCode.toLowerCase()) ||
-        (x.name && x.name.toLowerCase().includes(cleanCode.toLowerCase()))
-      );
+      if (!rawCode) return;
+      let cleanCode = String(rawCode).trim();
+      if (!cleanCode) return;
 
       const promptState = document.getElementById('scannedItemPromptState');
       const foundCard = document.getElementById('scannedItemResultCard');
+      const empCard = document.getElementById('scannedEmpResultCard');
       const notFoundCard = document.getElementById('scannedItemNotFoundCard');
 
       if (promptState) promptState.classList.add('d-none');
 
+      // 1. Try resolveScannedCodeEntity
+      const res = (typeof resolveScannedCodeEntity === 'function') 
+        ? resolveScannedCodeEntity(cleanCode) 
+        : null;
+
+      let item = null;
+      let emp = null;
+
+      if (res && res.type === 'EMPLOYEE' && res.entity) {
+        emp = res.entity;
+      } else if (res && res.type === 'EQUIPMENT' && res.entity) {
+        item = res.entity;
+      } else {
+        // Fallback resolution with prefix stripping
+        let lookupCode = cleanCode;
+        if (/^(EQUIPMENT|EQ|TOOL|ASSET)\s*[:=\-_\/]\s*/i.test(lookupCode)) {
+          lookupCode = lookupCode.replace(/^(EQUIPMENT|EQ|TOOL|ASSET)\s*[:=\-_\/]\s*/i, '').trim();
+        }
+        if (/^(EMPLOYEE|EMP|STAFF|PERSON)\s*[:=\-_\/]\s*/i.test(lookupCode)) {
+          lookupCode = lookupCode.replace(/^(EMPLOYEE|EMP|STAFF|PERSON)\s*[:=\-_\/]\s*/i, '').trim();
+        }
+
+        const lowerLookup = lookupCode.toLowerCase();
+        // Check equipment list first
+        item = (equipmentList || []).find(x => 
+          (x.code && x.code.toLowerCase() === lowerLookup) || 
+          (x.id && x.id.toLowerCase() === lowerLookup) ||
+          (x.name && x.name.toLowerCase().includes(lowerLookup))
+        );
+
+        // Check employee list
+        if (!item) {
+          emp = (employeeList || []).find(e => 
+            (e.id && e.id.toLowerCase() === lowerLookup) || 
+            (e.code && e.code.toLowerCase() === lowerLookup) ||
+            (e.name && e.name.toLowerCase().includes(lowerLookup)) ||
+            (e.phone && e.phone.replace(/[^0-9]/g, '') === lookupCode.replace(/[^0-9]/g, '') && lookupCode.length >= 9)
+          );
+        }
+      }
+
       if (item) {
+        // If opened from catalog search bar to focus equipment card
+        if (currentScannerModalMode === 'FOCUS_CARD') {
+          stopHtml5Scanner();
+          const modalElem = document.getElementById('barcodeQrScannerModal');
+          if (modalElem) {
+            const modalInst = bootstrap.Modal.getInstance(modalElem);
+            if (modalInst) modalInst.hide();
+          }
+          currentScannerModalMode = 'NORMAL';
+
+          if (typeof window.returnToCatalogEquipment === 'function') {
+            window.returnToCatalogEquipment(item.id);
+          }
+          showToast(`🔍 สแกนพบอุปกรณ์ "${item.name}" [${item.code}] โฟกัสตำแหน่งในคลังเรียบร้อย!`);
+          return;
+        }
+
         activeScannedItemId = item.id;
+        activeScannerDetectedEmpId = null;
+
+        const autoSelectCheck = document.getElementById('autoSelectBarcodeScannerCheckbox');
+        const isAutoSelect = !autoSelectCheck || autoSelectCheck.checked;
+        const transModal = document.getElementById('transactionModal');
+        const isTransModalActive = transModal && transModal.classList.contains('show');
+        const scannerModalElem = document.getElementById('barcodeQrScannerModal');
+        const isScannerModalOpen = scannerModalElem && (scannerModalElem.classList.contains('show') || scannerModalElem.style.display === 'block');
+
+        // 1. Continuous scanning mode (when inside scanner modal or transaction document modal)
+        if (window.isContinuousCartScanning || isTransModalActive || isScannerModalOpen) {
+          const now = Date.now();
+          if (cleanCode === window.lastContinuousScannedCode && (now - window.lastContinuousScannedTime) < 1500) {
+            // Ignore repetitive video frame within 1.5s for the same code
+            return;
+          }
+          window.lastContinuousScannedCode = cleanCode;
+          window.lastContinuousScannedTime = now;
+
+          window.transDuplicateScanCounts = window.transDuplicateScanCounts || {};
+          const existingInCart = (selectedTransItems || []).find(x => x.id === item.id);
+
+          if (existingInCart) {
+            // สแกนซ้ำรายการเดิม: ไม่เพิ่มจำนวนในเอกสาร
+            const currentScanTimes = (window.transDuplicateScanCounts[item.id] || 1) + 1;
+            window.transDuplicateScanCounts[item.id] = currentScanTimes;
+
+            // มีเสียงเตือนที่แตกต่างจากสแกนครั้งแรก (Double low warning tone)
+            if (typeof window.playScanDuplicateSound === 'function') {
+              window.playScanDuplicateSound();
+            }
+
+            if (empCard) empCard.classList.add('d-none');
+            if (notFoundCard) notFoundCard.classList.add('d-none');
+            if (foundCard) foundCard.classList.add('d-none');
+            if (promptState) promptState.classList.add('d-none');
+
+            const imgElem = document.getElementById('scannedItemImg');
+            if (imgElem) imgElem.src = item.imageUrl || DEFAULT_EQUIPMENT_IMAGE;
+            const nameElem = document.getElementById('scannedItemName');
+            if (nameElem) nameElem.textContent = item.name;
+            const catElem = document.getElementById('scannedItemCategory');
+            if (catElem) catElem.textContent = item.category;
+            const codeElem = document.getElementById('scannedItemCode');
+            if (codeElem) codeElem.textContent = `รหัสสินค้า: ${item.code}`;
+            const locElem = document.getElementById('scannedItemLocation');
+            if (locElem) locElem.textContent = item.location || 'คลังกลาง';
+            const stockElem = document.getElementById('scannedItemStock');
+            if (stockElem) stockElem.textContent = `${item.quantity} ${item.unit}`;
+
+            const lastItemText = document.getElementById('continuousScanLastItemText');
+            if (lastItemText) {
+              lastItemText.innerHTML = '';
+            }
+            const contBanner = document.getElementById('continuousScanBanner');
+            if (contBanner) contBanner.classList.add('d-none');
+
+            const contBadge = document.getElementById('continuousScanCartCountBadge');
+            if (contBadge) contBadge.textContent = selectedTransItems.length;
+            const contFooterCount = document.getElementById('continuousScanFooterCount');
+            if (contFooterCount) contFooterCount.textContent = selectedTransItems.length;
+
+            if (typeof window.updateScannerEquipmentListUI === 'function') {
+              window.updateScannerEquipmentListUI();
+            }
+
+            // ถ้าสแกนซ้ำรายการเดิมครั้งที่ 3 ขึ้นไป ให้มี popup แจ้งเตือนนาน 3 วินาทีแล้วหายไป
+            if (currentScanTimes >= 3) {
+              if (typeof showToast === 'function') {
+                showToast(`⚠️ อุปกรณ์ "${item.name}" [${item.code || item.id}] มีอยู่ในรายการเอกสารแล้ว (สแกนซ้ำครั้งที่ ${currentScanTimes - 1})`, {
+                  title: "แจ้งเตือนการสแกนซ้ำ",
+                  duration: 3000
+                });
+              }
+            }
+
+            return;
+          }
+
+          // สแกนครั้งแรกของรายการนี้
+          window.transDuplicateScanCounts[item.id] = 1;
+
+          if (typeof playScanBeep === 'function') {
+            playScanBeep();
+          }
+
+          // Keep scanner open and running!
+          const added = window.addEquipmentDirectlyToCart(item, 1, { keepScannerOpen: true, fromScanner: true, suppressSound: true, silentToast: true });
+          if (added) {
+            if (empCard) empCard.classList.add('d-none');
+            if (notFoundCard) notFoundCard.classList.add('d-none');
+            if (foundCard) foundCard.classList.add('d-none');
+            if (promptState) promptState.classList.add('d-none');
+
+            const imgElem = document.getElementById('scannedItemImg');
+            if (imgElem) imgElem.src = item.imageUrl || DEFAULT_EQUIPMENT_IMAGE;
+            const nameElem = document.getElementById('scannedItemName');
+            if (nameElem) nameElem.textContent = item.name;
+            const catElem = document.getElementById('scannedItemCategory');
+            if (catElem) catElem.textContent = item.category;
+            const codeElem = document.getElementById('scannedItemCode');
+            if (codeElem) codeElem.textContent = `รหัสสินค้า: ${item.code}`;
+            const locElem = document.getElementById('scannedItemLocation');
+            if (locElem) locElem.textContent = item.location || 'คลังกลาง';
+            const stockElem = document.getElementById('scannedItemStock');
+            if (stockElem) stockElem.textContent = `${item.quantity} ${item.unit}`;
+
+            const inDocItem = (selectedTransItems || []).find(x => x.id === item.id);
+            const inDocQty = inDocItem ? inDocItem.qty : 1;
+            const lastItemText = document.getElementById('continuousScanLastItemText');
+            if (lastItemText) {
+              lastItemText.innerHTML = '';
+            }
+
+            const contBadge = document.getElementById('continuousScanCartCountBadge');
+            if (contBadge) contBadge.textContent = selectedTransItems.length;
+            const contFooterCount = document.getElementById('continuousScanFooterCount');
+            if (contFooterCount) contFooterCount.textContent = selectedTransItems.length;
+
+            if (typeof window.updateScannerEquipmentListUI === 'function') {
+              window.updateScannerEquipmentListUI();
+            }
+
+            if (foundCard) {
+              foundCard.classList.remove('border-warning');
+              foundCard.classList.add('border-success', 'shadow-lg');
+              setTimeout(() => {
+                foundCard.classList.remove('shadow-lg');
+              }, 400);
+            }
+          }
+          return;
+        }
+
+        // 2. Non-continuous scan (e.g. opened from catalog): auto-select and open transaction
+        if (!isScannerModalOpen && (isAutoSelect || (typeof selectedTransItems !== 'undefined' && selectedTransItems.length > 0))) {
+          stopHtml5Scanner();
+          const modalElem = document.getElementById('barcodeQrScannerModal');
+          if (modalElem) {
+            const modalInst = bootstrap.Modal.getInstance(modalElem);
+            if (modalInst) modalInst.hide();
+          }
+          window.addEquipmentDirectlyToCart(item, 1, { fromScanner: true });
+          return;
+        }
+
+        if (empCard) empCard.classList.add('d-none');
         if (notFoundCard) notFoundCard.classList.add('d-none');
         if (foundCard) foundCard.classList.remove('d-none');
 
-        document.getElementById('scannedItemImg').src = item.imageUrl || DEFAULT_EQUIPMENT_IMAGE;
-        document.getElementById('scannedItemName').textContent = item.name;
-        document.getElementById('scannedItemCategory').textContent = item.category;
-        document.getElementById('scannedItemCode').textContent = `รหัสสินค้า: ${item.code}`;
-        document.getElementById('scannedItemLocation').textContent = item.location || 'คลังกลาง';
-        document.getElementById('scannedItemStock').textContent = `${item.quantity} ${item.unit}`;
+        const imgElem = document.getElementById('scannedItemImg');
+        if (imgElem) imgElem.src = item.imageUrl || DEFAULT_EQUIPMENT_IMAGE;
+        const nameElem = document.getElementById('scannedItemName');
+        if (nameElem) nameElem.textContent = item.name;
+        const catElem = document.getElementById('scannedItemCategory');
+        if (catElem) catElem.textContent = item.category;
+        const codeElem = document.getElementById('scannedItemCode');
+        if (codeElem) codeElem.textContent = `รหัสสินค้า: ${item.code}`;
+        const locElem = document.getElementById('scannedItemLocation');
+        if (locElem) locElem.textContent = item.location || 'คลังกลาง';
+        const stockElem = document.getElementById('scannedItemStock');
+        if (stockElem) stockElem.textContent = `${item.quantity} ${item.unit}`;
 
-        showToast(`📷 สแกนพบสินค้า: "${item.name}" (สต็อก: ${item.quantity} ${item.unit})`);
+        showToast(`📷 สแกนพบอุปกรณ์: "${item.name}" (สต็อก: ${item.quantity} ${item.unit})`);
+      } else if (emp) {
+        if (typeof playScanBeep === 'function') {
+          playScanBeep();
+        }
+        if (currentScannerModalMode === 'FOCUS_CARD') {
+          showToast(`ℹ️ สแกนพบบัตรผู้ทำรายการ (${typeof formatEmpName === 'function' ? formatEmpName(emp) : emp.name}) หากต้องการทำรายการเบิกด่วน กรุณาใช้ปุ่ม "สแกนเบิก" ด้านบน`);
+        }
+
+        const transModal = document.getElementById('transactionModal');
+        const isTransModalActive = transModal && transModal.classList.contains('show');
+
+        // Continuous scanning mode for employee badge
+        if (window.isContinuousCartScanning || isTransModalActive || isScannerModalOpen) {
+          if (typeof selectEmployeeToFormDirectly === 'function') {
+            selectEmployeeToFormDirectly(emp);
+          } else if (typeof selectEmployeeForTransaction === 'function') {
+            selectEmployeeForTransaction(emp.id);
+          } else {
+            const searchInput = document.getElementById('transEmpSearchInput');
+            if (searchInput) {
+              searchInput.value = emp.name;
+            }
+            const select = document.getElementById('empSelect');
+            if (select) select.value = emp.id;
+          }
+          const empBox = document.getElementById('transEmpSearchResultsBox');
+          if (empBox) {
+            empBox.classList.add('d-none');
+            empBox.innerHTML = '';
+          }
+          if (typeof window.updateScannerOperatorUI === 'function') {
+            window.updateScannerOperatorUI(emp);
+          }
+          const lastItemText = document.getElementById('continuousScanLastItemText');
+          if (lastItemText) {
+            lastItemText.innerHTML = '';
+          }
+          const contBanner = document.getElementById('continuousScanBanner');
+          if (contBanner) contBanner.classList.add('d-none');
+          if (empCard) empCard.classList.add('d-none');
+          return;
+        }
+
+        activeScannerDetectedEmpId = emp.id;
+        activeScannedItemId = null;
+        if (typeof window.updateScannerOperatorUI === 'function') {
+          window.updateScannerOperatorUI(emp);
+        }
+        if (foundCard) foundCard.classList.add('d-none');
+        if (notFoundCard) notFoundCard.classList.add('d-none');
+        if (empCard) empCard.classList.remove('d-none');
+
+        const isStaff = emp.role === 'STAFF';
+        const roleLabel = isStaff ? 'เจ้าหน้าที่สำนักงาน (Staff)' : 'พนักงานทำเกษตร (Worker)';
+        const roleBadgeClass = isStaff ? 'bg-primary' : 'bg-success';
+
+        const empImg = document.getElementById('scannedModalEmpImg');
+        if (empImg) empImg.src = emp.photoUrl || DEFAULT_EMP_PHOTO || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80';
+        const empName = document.getElementById('scannedModalEmpName');
+        if (empName) empName.textContent = typeof formatEmpName === 'function' ? formatEmpName(emp) : emp.name;
+        const roleElem = document.getElementById('scannedModalEmpRoleBadge');
+        if (roleElem) {
+          roleElem.textContent = roleLabel;
+          roleElem.className = `badge ${roleBadgeClass} fs-8 mb-1`;
+        }
+        const idElem = document.getElementById('scannedModalEmpIdCode');
+        if (idElem) idElem.textContent = `รหัสประจำตัว: ${emp.id}`;
+        const deptElem = document.getElementById('scannedModalEmpDept');
+        if (deptElem) deptElem.textContent = emp.department || 'ทั่วไป';
+        const phoneElem = document.getElementById('scannedModalEmpPhone');
+        if (phoneElem) phoneElem.textContent = emp.phone || '-';
+        const posElem = document.getElementById('scannedModalEmpPosition');
+        if (posElem) posElem.textContent = emp.position || '-';
+
+        showToast(`👤 สแกนพบผู้ทำรายการ: "${typeof formatEmpName === 'function' ? formatEmpName(emp) : emp.name}" [${emp.id}]`);
 
         const autoSelectCheck = document.getElementById('autoSelectBarcodeScannerCheckbox');
-        if (autoSelectCheck && autoSelectCheck.checked) {
-          selectFromScannerToForm();
+        if (!isScannerModalOpen && (!autoSelectCheck || autoSelectCheck.checked) && currentScannerModalMode !== 'FOCUS_CARD') {
+          selectScannedEmpToFormAndOpenTransaction();
         }
       } else {
+        if (typeof window.playHardwareScanErrorSound === 'function') {
+          window.playHardwareScanErrorSound();
+        }
         activeScannedUnknownCode = cleanCode;
+        activeScannedItemId = null;
+        activeScannerDetectedEmpId = null;
         if (foundCard) foundCard.classList.add('d-none');
+        if (empCard) empCard.classList.add('d-none');
         if (notFoundCard) notFoundCard.classList.remove('d-none');
-        document.getElementById('scannedUnknownCodeText').textContent = cleanCode;
+        const unkElem = document.getElementById('scannedUnknownCodeText');
+        if (unkElem) unkElem.textContent = cleanCode;
       }
     };
 
@@ -9400,13 +16178,73 @@
 
     window.selectFromScannerToForm = function() {
       if (activeScannedItemId) {
-        const item = equipmentList.find(x => x.id === activeScannedItemId);
-        quickSelectTransaction(activeScannedItemId);
+        const item = (equipmentList || []).find(x => x.id === activeScannedItemId);
+        stopHtml5Scanner();
+        const modalElem = document.getElementById('barcodeQrScannerModal');
+        if (modalElem) {
+          const modalInst = bootstrap.Modal.getInstance(modalElem);
+          if (modalInst) modalInst.hide();
+        }
+        if (item) {
+          window.addEquipmentDirectlyToCart(item, 1);
+        }
+      }
+    };
+
+    window.addScannedItemToCart = function() {
+      if (activeScannedItemId) {
+        const item = (equipmentList || []).find(x => x.id === activeScannedItemId);
+        stopHtml5Scanner();
+        const modalElem = document.getElementById('barcodeQrScannerModal');
+        if (modalElem) {
+          const modalInst = bootstrap.Modal.getInstance(modalElem);
+          if (modalInst) modalInst.hide();
+        }
+        if (item) {
+          window.addEquipmentDirectlyToCart(item, 1);
+        }
+      }
+    };
+
+    window.selectScannedEmpToFormAndOpenTransaction = function() {
+      if (activeScannerDetectedEmpId) {
+        const emp = (employeeList || []).find(x => x.id === activeScannerDetectedEmpId);
+        if (emp) {
+          if (typeof selectEmployeeForTransaction === 'function') {
+            selectEmployeeForTransaction(emp.id);
+          } else if (typeof selectEmployeeToFormDirectly === 'function') {
+            selectEmployeeToFormDirectly(emp);
+          } else {
+            const searchInput = document.getElementById('transEmpSearchInput');
+            if (searchInput) {
+              searchInput.value = emp.name;
+            }
+            const select = document.getElementById('empSelect');
+            if (select) select.value = emp.id;
+          }
+          const empBox = document.getElementById('transEmpSearchResultsBox');
+          if (empBox) {
+            empBox.classList.add('d-none');
+            empBox.innerHTML = '';
+          }
+          stopHtml5Scanner();
+          const modalElem = document.getElementById('barcodeQrScannerModal');
+          const modalInst = bootstrap.Modal.getInstance(modalElem);
+          if (modalInst) modalInst.hide();
+          window.openTransactionModal();
+          showToast(`👤 สแกนพบผู้ทำรายการ "${typeof formatEmpName === 'function' ? formatEmpName(emp) : emp.name}" พร้อมเปิดหน้าต่างเบิก-รับเข้า-ยืม-คืน เรียบร้อยแล้ว`);
+        }
+      }
+    };
+
+    window.openEmpBorrowHistoryFromScannerModal = function() {
+      if (activeScannerDetectedEmpId) {
+        const empId = activeScannerDetectedEmpId;
         stopHtml5Scanner();
         const modalElem = document.getElementById('barcodeQrScannerModal');
         const modalInst = bootstrap.Modal.getInstance(modalElem);
         if (modalInst) modalInst.hide();
-        if (item) showToast(`⚡ เลือกอุปกรณ์ "${item.name}" [${item.code}] ลงฟอร์มทำรายการเรียบร้อยแล้ว`);
+        openEmployeeBorrowHistoryModalFromScanner(empId);
       }
     };
 
@@ -9434,15 +16272,551 @@
     };
 
     // ==========================================
+    // FAST CHECKOUT SCANNER (สแกนเบิกด่วน 2 ขั้นตอน: ผู้ทำรายการ + อุปกรณ์)
+    // ==========================================
+    let fastCheckoutEmp = null;
+    let fastCheckoutEquip = null;
+    let fastCheckoutHtml5Scanner = null;
+    let isFastCheckoutScannerActive = false;
+    let fastCheckoutLastScanCode = '';
+    let fastCheckoutLastScanTime = 0;
+
+    window.isEquipmentBorrowType = function(item) {
+      if (!item) return false;
+      if (item.isBorrowable === true) return true;
+      const cat = (item.category || '').toLowerCase();
+      if (cat.includes('ยืมใช้') || cat.includes('ยืม')) return true;
+      const name = (item.name || '').toLowerCase();
+      if (name.includes('ยืมใช้')) return true;
+      const prefix = (item.prefix || '').toUpperCase();
+      if (prefix === 'AG') return true;
+      const code = (item.code || '').toUpperCase();
+      if (code.startsWith('SL-') || code.startsWith('AG-')) return true;
+      return false;
+    };
+
+    window.getEmployeeActiveBorrowingRecord = function(equipId, empIdOrName) {
+      if (!equipId || !empIdOrName) return null;
+      const item = (equipmentList || []).find(x => x.id === equipId || x.code === equipId);
+      if (!item) return null;
+
+      const targetId = (item.id || '').toString().toLowerCase();
+      const targetCode = (item.code || '').toString().toLowerCase();
+      const targetName = (item.name || '').toString().toLowerCase();
+
+      function isMatchingEquip(eqId, eqCode, eqName) {
+        const idStr = (eqId || '').toString().toLowerCase();
+        const codeStr = (eqCode || '').toString().toLowerCase();
+        const nameStr = (eqName || '').toString().toLowerCase();
+        return (targetId && idStr === targetId) ||
+               (targetCode && codeStr === targetCode) ||
+               (targetCode && idStr === targetCode) ||
+               (targetName && nameStr.length > 0 && nameStr.includes(targetName));
+      }
+
+      const sortedTxs = [...(transactionHistory || [])].sort((a, b) => {
+        const tA = (a.rawTimestamp || (a.timestamp ? new Date(a.timestamp).getTime() : 0));
+        const tB = (b.rawTimestamp || (b.timestamp ? new Date(b.timestamp).getTime() : 0));
+        return tA - tB;
+      });
+
+      const borrowerMap = {};
+      sortedTxs.forEach(tx => {
+        if (!tx) return;
+        const type = tx.type || '';
+        if (type !== 'ยืมอุปกรณ์' && type !== 'คืนอุปกรณ์') return;
+
+        let qtyInTx = 0;
+        if (Array.isArray(tx.items) && tx.items.length > 0) {
+          tx.items.forEach(it => {
+            if (isMatchingEquip(it.equipmentId, it.equipmentCode, it.equipmentName)) {
+              qtyInTx += Number(it.quantity || 0);
+            }
+          });
+        } else {
+          if (isMatchingEquip(tx.equipmentId, tx.equipmentCode, tx.equipmentName)) {
+            qtyInTx += Number(tx.quantity || 0);
+          }
+        }
+        if (qtyInTx <= 0) return;
+
+        const empId = tx.employeeId || 'unknown';
+        const empObj = (employeeList || []).find(e => e.id === empId || (e.name && tx.employeeName && tx.employeeName.includes(e.name)));
+        const empName = empObj ? empObj.name : (tx.employeeName || 'พนักงานไม่ระบุชื่อ');
+        const key = empObj ? empObj.id : empName;
+
+        if (!borrowerMap[key]) {
+          borrowerMap[key] = {
+            employeeId: empObj ? empObj.id : null,
+            employeeName: empName,
+            empObj: empObj,
+            borrowedQty: 0,
+            lastBorrowTime: tx.timestamp || '-',
+            dueDateStr: tx.dueDateStr || null,
+            dueDate: tx.dueDate || null,
+            lastTxId: tx.id || null
+          };
+        }
+
+        if (type === 'ยืมอุปกรณ์') {
+          borrowerMap[key].borrowedQty += qtyInTx;
+          borrowerMap[key].lastBorrowTime = tx.timestamp || borrowerMap[key].lastBorrowTime;
+        } else if (type === 'คืนอุปกรณ์') {
+          borrowerMap[key].borrowedQty = Math.max(0, borrowerMap[key].borrowedQty - qtyInTx);
+        }
+      });
+
+      const matchId = (typeof empIdOrName === 'object' && empIdOrName.id) ? String(empIdOrName.id).toLowerCase() : String(empIdOrName).toLowerCase();
+      const matchName = (typeof empIdOrName === 'object' && empIdOrName.name) ? String(empIdOrName.name).toLowerCase() : String(empIdOrName).toLowerCase();
+      const matchCode = (typeof empIdOrName === 'object' && empIdOrName.code) ? String(empIdOrName.code).toLowerCase() : '';
+
+      for (const b of Object.values(borrowerMap)) {
+        if (b.borrowedQty > 0) {
+          const bId = (b.employeeId || '').toLowerCase();
+          const bName = (b.employeeName || '').toLowerCase();
+          const bCode = (b.empObj && b.empObj.employeeCode ? b.empObj.employeeCode : '').toLowerCase();
+          if ((bId && bId === matchId) || 
+              (matchCode && bCode && bCode === matchCode) || 
+              (matchName && (bName === matchName || bName.includes(matchName) || matchName.includes(bName))) ||
+              (b.empObj && b.empObj.id && b.empObj.id.toLowerCase() === matchId)) {
+            return b;
+          }
+        }
+      }
+      return null;
+    };
+
+    window.openFastCheckoutScannerModal = function() {
+      const modalElem = document.getElementById('fastCheckoutScannerModal');
+      if (!modalElem) return;
+      const modalInst = bootstrap.Modal.getOrCreateInstance(modalElem);
+      modalInst.show();
+
+      updateFastScanUI();
+
+      setTimeout(() => {
+        startFastCheckoutScanner();
+      }, 300);
+    };
+
+    window.stopFastCheckoutScanner = function() {
+      if (fastCheckoutHtml5Scanner && isFastCheckoutScannerActive) {
+        fastCheckoutHtml5Scanner.stop().then(() => {
+          isFastCheckoutScannerActive = false;
+        }).catch(err => console.warn("Stop fast checkout scanner:", err));
+      }
+    };
+
+    window.restartFastCheckoutScanner = function() {
+      stopFastCheckoutScanner();
+      setTimeout(() => {
+        startFastCheckoutScanner();
+      }, 300);
+    };
+
+    function startFastCheckoutScanner() {
+      if (isFastCheckoutScannerActive) return;
+
+      const loadingElem = document.getElementById('fastCheckoutScannerLoading');
+      if (loadingElem) loadingElem.classList.remove('d-none');
+
+      try {
+        const config = { 
+          fps: 15, 
+          qrbox: (viewfinderWidth, viewfinderHeight) => {
+            const minEdge = Math.min(viewfinderWidth, viewfinderHeight);
+            return {
+              width: Math.max(220, Math.floor(viewfinderWidth * 0.85)),
+              height: Math.max(160, Math.floor(minEdge * 0.75))
+            };
+          },
+          aspectRatio: 1.0
+        };
+
+        fastCheckoutHtml5Scanner = new Html5Qrcode("fastCheckoutScannerReaderContainer");
+        
+        fastCheckoutHtml5Scanner.start(
+          { facingMode: "environment" },
+          config,
+          (decodedText) => {
+            handleFastCheckoutScannedCode(decodedText);
+          },
+          (errorMessage) => {
+            // ignore frame decode errors
+          }
+        ).then(() => {
+          isFastCheckoutScannerActive = true;
+          if (loadingElem) loadingElem.classList.add('d-none');
+        }).catch(err => {
+          console.warn("Fast checkout camera access error:", err);
+          if (loadingElem) {
+            loadingElem.innerHTML = `
+              <div class="alert alert-warning fs-8 m-2 text-start">
+                <i class="bi bi-exclamation-triangle-fill me-1"></i> ไม่สามารถเปิดกล้องได้ คุณสามารถพิมพ์ค้นหาหรือยิงบาร์โค้ดในช่องด้านล่างแทนได้
+              </div>`;
+          }
+        });
+      } catch (e) {
+        console.warn("Fast checkout scanner init error:", e);
+      }
+    }
+
+    window.handleManualFastCheckoutSearch = function() {
+      const input = document.getElementById('manualFastCheckoutInput');
+      if (input && input.value.trim()) {
+        handleFastCheckoutScannedCode(input.value.trim());
+        input.value = '';
+      }
+    };
+
+    window.handleFastCheckoutScannedCode = function(rawCode) {
+      if (!rawCode) return;
+      const cleanCode = String(rawCode).trim();
+      if (!cleanCode) return;
+
+      const now = Date.now();
+      if (cleanCode === fastCheckoutLastScanCode && (now - fastCheckoutLastScanTime) < 1200) {
+        return;
+      }
+      fastCheckoutLastScanCode = cleanCode;
+      fastCheckoutLastScanTime = now;
+
+      // Resolve entity using existing resolveScannedCodeEntity or fallback
+      let res = (typeof resolveScannedCodeEntity === 'function') 
+        ? resolveScannedCodeEntity(cleanCode) 
+        : null;
+
+      let item = null;
+      let emp = null;
+
+      if (res && res.type === 'EMPLOYEE' && res.entity) {
+        emp = res.entity;
+      } else if (res && res.type === 'EQUIPMENT' && res.entity) {
+        item = res.entity;
+      } else {
+        let lookupCode = cleanCode;
+        if (/^(EQUIPMENT|EQ|TOOL|ASSET)\s*[:=\-_\/]\s*/i.test(lookupCode)) {
+          lookupCode = lookupCode.replace(/^(EQUIPMENT|EQ|TOOL|ASSET)\s*[:=\-_\/]\s*/i, '').trim();
+        }
+        if (/^(EMPLOYEE|EMP|STAFF|PERSON)\s*[:=\-_\/]\s*/i.test(lookupCode)) {
+          lookupCode = lookupCode.replace(/^(EMPLOYEE|EMP|STAFF|PERSON)\s*[:=\-_\/]\s*/i, '').trim();
+        }
+
+        const lower = lookupCode.toLowerCase();
+        item = (equipmentList || []).find(x => 
+          (x.code && x.code.toLowerCase() === lower) || 
+          (x.id && x.id.toLowerCase() === lower) ||
+          (x.name && x.name.toLowerCase().includes(lower))
+        );
+
+        if (!item) {
+          emp = (employeeList || []).find(e => 
+            (e.id && e.id.toLowerCase() === lower) || 
+            (e.code && e.code.toLowerCase() === lower) ||
+            (e.name && e.name.toLowerCase().includes(lower)) ||
+            (e.phone && e.phone.replace(/[^0-9]/g, '') === lookupCode.replace(/[^0-9]/g, '') && lookupCode.length >= 9)
+          );
+        }
+      }
+
+      if (emp) {
+        playScanBeep();
+        fastCheckoutEmp = emp;
+        updateFastScanUI();
+
+        if (!fastCheckoutEquip) {
+          // Scanned employee first! Show status banner and keep scanning!
+          const empNameStr = typeof formatEmpName === 'function' ? formatEmpName(emp) : emp.name;
+          showFastScanBanner(
+            'warning',
+            `👤 บันทึกผู้ทำรายการ: "${empNameStr}" เรียบร้อย (ขั้นตอนที่ 1 จาก 2) → กรุณาสแกนอุปกรณ์ต่อ...`
+          );
+          showToast(`👤 บันทึกผู้ทำรายการคุณ "${empNameStr}" แล้ว กรุณาสแกนอุปกรณ์ต่อ`);
+        } else {
+          // BOTH ARE READY!
+          triggerFinishFastCheckout();
+        }
+      } else if (item) {
+        playScanBeep();
+        fastCheckoutEquip = item;
+        updateFastScanUI();
+
+        if (!fastCheckoutEmp) {
+          // Scanned equipment first! Show status banner and keep scanning!
+          const isBorrow = (typeof isEquipmentBorrowType === 'function') && isEquipmentBorrowType(item);
+          showFastScanBanner(
+            'warning',
+            `📦 บันทึกอุปกรณ์: "${item.name}" [${item.code}] (${isBorrow ? 'อุปกรณ์ยืมใช้' : 'อุปกรณ์ทั่วไป'}) เรียบร้อย (ขั้นตอนที่ 1 จาก 2) → กรุณาสแกนบัตรหรือชื่อผู้ทำรายการต่อ...`
+          );
+          showToast(`📦 บันทึกอุปกรณ์ "${item.name}" (${isBorrow ? 'อุปกรณ์ยืมใช้' : 'ทั่วไป'}) แล้ว กรุณาสแกนบัตรผู้ทำรายการต่อ`);
+        } else {
+          // BOTH ARE READY!
+          triggerFinishFastCheckout();
+        }
+      } else {
+        // Unknown code
+        playHardwareScanErrorSound();
+        showFastScanBanner(
+          'danger',
+          `⚠️ ไม่พบข้อมูลสำหรับรหัส: "${cleanCode}" กรุณาตรวจสอบและสแกนใหม่อีกครั้ง`
+        );
+        showToast(`⚠️ ไม่พบข้อมูลสำหรับรหัส: "${cleanCode}"`);
+      }
+    };
+
+    function showFastScanBanner(type, message) {
+      const banner = document.getElementById('fastScanStatusBanner');
+      const textElem = document.getElementById('fastScanStatusText');
+      if (banner && textElem) {
+        banner.className = `alert alert-${type} border-0 rounded-3 py-2 px-3 fs-8 mb-0 d-flex align-items-center gap-2`;
+        textElem.innerHTML = message;
+      }
+    }
+
+    function updateFastScanUI() {
+      // Update Employee card
+      const empCard = document.getElementById('fastScanEmpCard');
+      const empBadge = document.getElementById('fastScanEmpStatusBadge');
+      const empPhoto = document.getElementById('fastScanEmpPhoto');
+      const empName = document.getElementById('fastScanEmpName');
+      const empDetail = document.getElementById('fastScanEmpDetail');
+      const btnResetEmp = document.getElementById('btnResetFastScanEmp');
+
+      if (fastCheckoutEmp) {
+        if (empCard) {
+          empCard.classList.remove('border-secondary', 'border-opacity-25');
+          empCard.classList.add('border-success', 'bg-success', 'bg-opacity-10');
+        }
+        if (empBadge) {
+          empBadge.className = 'badge bg-success text-white fs-9';
+          empBadge.innerHTML = '<i class="bi bi-check-circle-fill me-0.5"></i> สแกนแล้ว';
+        }
+        if (empPhoto) {
+          empPhoto.src = fastCheckoutEmp.photoUrl || DEFAULT_EMP_PHOTO || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80';
+          empPhoto.classList.remove('d-none');
+        }
+        if (empName) empName.textContent = typeof formatEmpName === 'function' ? formatEmpName(fastCheckoutEmp) : fastCheckoutEmp.name;
+        if (empDetail) empDetail.textContent = `รหัส ${fastCheckoutEmp.id} • ${fastCheckoutEmp.department || 'ทั่วไป'}`;
+        if (btnResetEmp) btnResetEmp.classList.remove('d-none');
+      } else {
+        if (empCard) {
+          empCard.classList.remove('border-success', 'bg-success', 'bg-opacity-10');
+          empCard.classList.add('border-secondary', 'border-opacity-25');
+        }
+        if (empBadge) {
+          empBadge.className = 'badge bg-light text-muted border fs-9';
+          empBadge.innerHTML = '<i class="bi bi-hourglass-split me-0.5"></i> รอสแกน';
+        }
+        if (empPhoto) empPhoto.classList.add('d-none');
+        if (empName) empName.textContent = 'ยังไม่ได้สแกนบัตรผู้ทำรายการ';
+        if (empDetail) empDetail.textContent = '';
+        if (btnResetEmp) btnResetEmp.classList.add('d-none');
+      }
+
+      // Update Equipment card
+      const equipCard = document.getElementById('fastScanEquipCard');
+      const equipBadge = document.getElementById('fastScanEquipStatusBadge');
+      const equipPhoto = document.getElementById('fastScanEquipPhoto');
+      const equipName = document.getElementById('fastScanEquipName');
+      const equipDetail = document.getElementById('fastScanEquipDetail');
+      const btnResetEquip = document.getElementById('btnResetFastScanEquip');
+
+      if (fastCheckoutEquip) {
+        if (equipCard) {
+          equipCard.classList.remove('border-secondary', 'border-opacity-25');
+          equipCard.classList.add('border-success', 'bg-success', 'bg-opacity-10');
+        }
+        if (equipBadge) {
+          equipBadge.className = 'badge bg-success text-white fs-9';
+          equipBadge.innerHTML = '<i class="bi bi-check-circle-fill me-0.5"></i> สแกนแล้ว';
+        }
+        if (equipPhoto) {
+          equipPhoto.src = fastCheckoutEquip.imageUrl || DEFAULT_EQUIPMENT_IMAGE;
+          equipPhoto.classList.remove('d-none');
+        }
+        if (equipName) equipName.textContent = fastCheckoutEquip.name;
+        if (equipDetail) equipDetail.textContent = `รหัส ${fastCheckoutEquip.code} • สต๊อก ${fastCheckoutEquip.quantity} ${fastCheckoutEquip.unit}`;
+        if (btnResetEquip) btnResetEquip.classList.remove('d-none');
+      } else {
+        if (equipCard) {
+          equipCard.classList.remove('border-success', 'bg-success', 'bg-opacity-10');
+          equipCard.classList.add('border-secondary', 'border-opacity-25');
+        }
+        if (equipBadge) {
+          equipBadge.className = 'badge bg-light text-muted border fs-9';
+          equipBadge.innerHTML = '<i class="bi bi-hourglass-split me-0.5"></i> รอสแกน';
+        }
+        if (equipPhoto) equipPhoto.classList.add('d-none');
+        if (equipName) equipName.textContent = 'ยังไม่ได้สแกนบาร์โค้ดอุปกรณ์';
+        if (equipDetail) equipDetail.textContent = '';
+        if (btnResetEquip) btnResetEquip.classList.add('d-none');
+      }
+    }
+
+    window.resetFastScanEmp = function() {
+      fastCheckoutEmp = null;
+      updateFastScanUI();
+      hideFastScanBanner();
+    };
+
+    window.resetFastScanEquip = function() {
+      fastCheckoutEquip = null;
+      updateFastScanUI();
+      hideFastScanBanner();
+    };
+
+    window.resetAllFastScan = function() {
+      fastCheckoutEmp = null;
+      fastCheckoutEquip = null;
+      updateFastScanUI();
+      hideFastScanBanner();
+    };
+
+    function triggerFinishFastCheckout() {
+      const savedEmp = fastCheckoutEmp;
+      const savedEquip = fastCheckoutEquip;
+
+      // Stop scanner & close modal
+      stopFastCheckoutScanner();
+      const modalElem = document.getElementById('fastCheckoutScannerModal');
+      if (modalElem) {
+        const modalInst = bootstrap.Modal.getInstance(modalElem);
+        if (modalInst) modalInst.hide();
+      }
+
+      // Reset state for next session
+      fastCheckoutEmp = null;
+      fastCheckoutEquip = null;
+
+      const empNameStr = typeof formatEmpName === 'function' ? formatEmpName(savedEmp) : (savedEmp ? savedEmp.name : 'พนักงาน');
+
+      // 1. ตรวจสอบว่าผู้ทำรายการกำลังยืมอุปกรณ์นี้อยู่หรือไม่ ("เมื่อสแกนอีกครั้งผู้ที่ทำรายการกับอุปกรณ์ตรงกับที่ยืม")
+      const activeBorrowRecord = (typeof getEmployeeActiveBorrowingRecord === 'function' && savedEquip && savedEmp)
+        ? getEmployeeActiveBorrowingRecord(savedEquip.id, savedEmp)
+        : null;
+
+      if (activeBorrowRecord && activeBorrowRecord.borrowedQty > 0) {
+        // เมื่อสแกนอีกครั้งผู้ที่ทำรายการกับอุปกรณ์ตรงกับที่ยืม ก็ให้แสดงหน้าต่างรายชื่อผู้ยืมอุปกรณ์การเกษตร พร้อมกับกรองเฉพาะชื่อคนที่มาคืนทันที
+        playHardwareScanSuccessSound();
+        showToast(`🔄 ตรวจพบคุณ "${empNameStr}" กำลังยืม "${savedEquip.name}" อยู่ (${activeBorrowRecord.borrowedQty} ${savedEquip.unit || 'ชิ้น'}) เปิดหน้าต่างรายชื่อผู้ยืมและกรองเฉพาะผู้ที่มาคืนทันที`);
+
+        setTimeout(() => {
+          if (typeof showEquipmentBorrowersModal === 'function') {
+            showEquipmentBorrowersModal(savedEquip.id, savedEmp.id || savedEmp.name);
+          }
+        }, 350);
+        return;
+      }
+
+      // 2. ถ้าไม่ได้ยืมอยู่: ตรวจสอบว่าเป็นอุปกรณ์ยืมใช้หรือไม่ ("ถ้าสแกนเบิก อุปกรณ์ยืมใช้ เมื่อเปิดหน้าต่างเบิก-รับเข้า-ยืม-คืน ก็ให้เลือกยืมอุปกรณ์ทันที")
+      const isBorrowType = (typeof isEquipmentBorrowType === 'function')
+        ? isEquipmentBorrowType(savedEquip)
+        : false;
+
+      showFastScanBanner('success', '🎉 สแกนครบทั้ง 2 รายการเรียบร้อย! กำลังเปิดหน้าต่างทำรายการ...');
+      playHardwareScanSuccessSound();
+
+      // Execute transaction form opening
+      setTimeout(() => {
+        // 1. Select employee to form automatically
+        if (typeof selectEmployeeForTransaction === 'function') {
+          selectEmployeeForTransaction(savedEmp.id);
+        } else if (typeof selectEmployeeToFormDirectly === 'function') {
+          selectEmployeeToFormDirectly(savedEmp);
+        }
+
+        // 2. Select equipment to form automatically
+        if (typeof selectEquipmentForTransaction === 'function') {
+          selectEquipmentForTransaction(savedEquip.id);
+        }
+        if (typeof quickSelectTransaction === 'function') {
+          quickSelectTransaction(savedEquip.id, { hideResultsBox: true });
+        } else if (typeof openTransactionModal === 'function') {
+          openTransactionModal(savedEquip.id);
+        }
+
+        // Close any search popup lists so they don't cover the screen
+        const empResultsBox = document.getElementById('transEmpSearchResultsBox');
+        if (empResultsBox) {
+          empResultsBox.classList.add('d-none');
+          empResultsBox.innerHTML = '';
+        }
+        const equipResultsBox = document.getElementById('transEquipSearchResultsBox');
+        if (equipResultsBox) {
+          equipResultsBox.classList.add('d-none');
+          equipResultsBox.innerHTML = '';
+        }
+
+        // 3. ถ้าเป็นอุปกรณ์ยืมใช้ ให้เลือก "ยืมอุปกรณ์" ทันที ถ้าเป็นทั่วไปให้เลือก "เบิกจ่าย"
+        if (isBorrowType) {
+          const borrowRadio = document.getElementById('typeBorrow');
+          if (borrowRadio) {
+            borrowRadio.checked = true;
+            if (typeof toggleTransTypeUI === 'function') {
+              toggleTransTypeUI();
+            }
+          }
+        } else {
+          const issueRadio = document.getElementById('typeIssue');
+          if (issueRadio && !issueRadio.checked) {
+            issueRadio.checked = true;
+            if (typeof toggleTransTypeUI === 'function') {
+              toggleTransTypeUI();
+            }
+          }
+        }
+
+        // 4. Focus and scroll to: 4. ระบุจำนวน เบิก/ยืม/คืน/รับเข้า
+        setTimeout(() => {
+          const qtyInput = document.getElementById('transQty');
+          const qtyLabel = document.getElementById('transQtyLabel');
+          if (qtyLabel) {
+            qtyLabel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+          if (qtyInput) {
+            qtyInput.focus();
+            qtyInput.select();
+            qtyInput.classList.add('border-warning', 'shadow');
+            setTimeout(() => {
+              qtyInput.classList.remove('border-warning', 'shadow');
+            }, 2500);
+          }
+        }, 300);
+
+        if (isBorrowType) {
+          showToast(`⚡ สแกนเบิกอุปกรณ์ประเภทยืมใช้! ระบบเลือก "ยืมอุปกรณ์" ให้ทันที (คุณ ${empNameStr} • "${savedEquip.name}") พร้อมระบุจำนวน`);
+        } else {
+          showToast(`⚡ สแกนเบิกด่วนสำเร็จ! ผู้ทำรายการ: คุณ ${empNameStr} | อุปกรณ์: "${savedEquip.name}" พร้อมระบุจำนวนได้ทันที`);
+        }
+      }, 350);
+    }
+
+    // ==========================================
     // PRINTABLE BARCODE & QR CODE LABEL GENERATOR
     // ==========================================
     window.openPrintLabelModal = function(equipId = 'ALL') {
+      const catSelect = document.getElementById('labelCategoryFilterSelect');
+      if (catSelect) {
+        const categories = [...new Set(equipmentList.map(item => item.category).filter(Boolean))].sort((a,b) => a.localeCompare(b, 'th'));
+        let catOptions = '<option value="ALL">🏷️ ทุกหมวดหมู่อุปกรณ์</option>';
+        categories.forEach(cat => {
+          const count = equipmentList.filter(item => item.category === cat).length;
+          catOptions += `<option value="${cat}">🏷️ ${cat} (${count} รายการ)</option>`;
+        });
+        catSelect.innerHTML = catOptions;
+        catSelect.value = 'ALL';
+      }
+
       const select = document.getElementById('labelItemSelect');
       if (select) {
-        select.innerHTML = `
+        let optionsHtml = `
           <option value="ALL">📦 ทุกรายการในคลังอุปกรณ์ (${equipmentList.length} รายการ)</option>
           <option value="LOW_STOCK">🔴 รายการสต๊อกต่ำเท่านั้น (≤ 5)</option>
         `;
+        if (window.selectedStaffItemIds && window.selectedStaffItemIds.size > 0) {
+          optionsHtml += `<option value="SELECTED">✨ รายการที่เลือกในตาราง (${window.selectedStaffItemIds.size} รายการ)</option>`;
+        }
+        select.innerHTML = optionsHtml;
         equipmentList.forEach(item => {
           const opt = document.createElement('option');
           opt.value = item.id;
@@ -9450,7 +16824,9 @@
           if (equipId && equipId === item.id) opt.selected = true;
           select.appendChild(opt);
         });
-        if (equipId && equipId !== 'ALL') {
+        if (equipId === 'SELECTED' && window.selectedStaffItemIds && window.selectedStaffItemIds.size > 0) {
+          select.value = 'SELECTED';
+        } else if (equipId && equipId !== 'ALL') {
           select.value = equipId;
         } else {
           select.value = 'ALL';
@@ -9464,43 +16840,209 @@
       modalInst.show();
     };
 
+    window.adjustLabelCopies = function(delta) {
+      const input = document.getElementById('labelCopiesInput');
+      if (!input) return;
+      let val = parseInt(input.value, 10) || 1;
+      val = Math.max(1, Math.min(100, val + delta));
+      input.value = val;
+      if (typeof renderPrintableLabelsPreview === 'function') {
+        renderPrintableLabelsPreview();
+      }
+    };
+
     window.renderPrintableLabelsPreview = function() {
       const selectElem = document.getElementById('labelItemSelect');
       const selectedScope = selectElem ? selectElem.value : 'ALL';
-      const cols = parseInt(document.getElementById('labelColsSelect').value) || 3;
-      const copiesCount = parseInt(document.getElementById('labelCopiesInput').value) || 1;
+      const catSelect = document.getElementById('labelCategoryFilterSelect');
+      const selectedCat = catSelect ? catSelect.value : 'ALL';
+      const cols = parseInt(document.getElementById('labelColsSelect')?.value) || 3;
+      const rows = parseInt(document.getElementById('labelRowsSelect')?.value) || 7;
+      const copiesCount = parseInt(document.getElementById('labelCopiesInput')?.value) || 1;
 
-      const showBarcode = document.getElementById('chkShowBarcode').checked;
-      const showQr = document.getElementById('chkShowQr').checked;
-      const showName = document.getElementById('chkShowName').checked;
-      const showDetails = document.getElementById('chkShowDetails').checked;
+      // Update dimension badge info
+      const approxWidthCm = (19.4 / cols).toFixed(1);
+      const approxHeightCm = (27.8 / rows).toFixed(1);
+      const totalPerSheet = cols * rows;
+      const badgeElem = document.getElementById('labelDimensionInfoBadge');
+      if (badgeElem) {
+        badgeElem.textContent = `${cols} x ${rows} = ${totalPerSheet} ดวง/แผ่น (~${approxWidthCm} x ${approxHeightCm} ซม.)`;
+      }
+
+      const showBarcode = document.getElementById('chkShowBarcode')?.checked ?? true;
+      const showQr = document.getElementById('chkShowQr')?.checked ?? true;
+      const showName = document.getElementById('chkShowName')?.checked ?? true;
+      const showDetails = document.getElementById('chkShowDetails')?.checked ?? true;
 
       let itemsToPrint = [];
       if (selectedScope === 'ALL') {
-        itemsToPrint = [...equipmentList];
+        itemsToPrint = selectedCat === 'ALL'
+          ? [...equipmentList]
+          : equipmentList.filter(x => x.category === selectedCat);
       } else if (selectedScope === 'LOW_STOCK') {
-        itemsToPrint = equipmentList.filter(x => x.quantity <= (x.minQuantity !== undefined ? x.minQuantity : 3));
+        itemsToPrint = equipmentList.filter(x => {
+          const matchesCat = selectedCat === 'ALL' || x.category === selectedCat;
+          return matchesCat && x.quantity <= (x.minQuantity !== undefined ? x.minQuantity : 3);
+        });
+      } else if (selectedScope === 'SELECTED') {
+        itemsToPrint = equipmentList.filter(x => {
+          const matchesCat = selectedCat === 'ALL' || x.category === selectedCat;
+          return matchesCat && window.selectedStaffItemIds && window.selectedStaffItemIds.has(x.id);
+        });
       } else {
         const found = equipmentList.find(x => x.id === selectedScope);
-        if (found) itemsToPrint = [found];
+        if (found) {
+          if (selectedCat === 'ALL' || found.category === selectedCat) {
+            itemsToPrint = [found];
+          }
+        }
       }
 
       const container = document.getElementById('labelSheetPreviewContainer');
       const printSheet = document.getElementById('printableLabelSheet');
 
       if (itemsToPrint.length === 0) {
-        if (container) container.innerHTML = `<div class="text-center py-5 text-muted"><i class="bi bi-tag display-4 d-block mb-2"></i>ไม่พบรายการอุปกรณ์สำหรับพิมพ์ฉลาก</div>`;
+        if (container) container.innerHTML = `<div class="text-center py-5 text-muted"><i class="bi bi-tag display-4 d-block mb-2"></i>ไม่พบรายการอุปกรณ์สำหรับพิมพ์ฉลาก${selectedCat !== 'ALL' ? ` ในหมวดหมู่ "${selectedCat}"` : ''}</div>`;
         if (printSheet) printSheet.innerHTML = '';
         return;
       }
 
       let gridClass = 'col-4';
-      if (cols === 2) gridClass = 'col-6';
+      if (cols === 1) gridClass = 'col-12';
+      else if (cols === 2) gridClass = 'col-6';
       else if (cols === 3) gridClass = 'col-4';
       else if (cols === 4) gridClass = 'col-3';
 
+      // Dynamic typography & sizing based on rows (2..10) & cols (1..4)
+      let nameFontSize = '12px';
+      let titleFontSize = '10px';
+      let badgeFontSize = '9.5px';
+      let detailFontSize = '9px';
+      let bcHeight = 24;
+      let bcWidth = 1.1;
+      let boxPadding = '6px';
+      let previewMinHeight = 130;
+      let printHeightMm = ((280 / rows) - 1.8).toFixed(1);
+
+      if (rows === 2) {
+        previewMinHeight = 280;
+        boxPadding = '12px';
+        titleFontSize = cols === 1 ? '16px' : (cols === 2 ? '14px' : '13px');
+        badgeFontSize = cols === 1 ? '15px' : (cols === 2 ? '13px' : '12px');
+        detailFontSize = cols === 1 ? '15px' : (cols === 2 ? '13px' : '12px');
+        nameFontSize = cols === 1 ? '22px' : (cols === 2 ? '18px' : (cols === 3 ? '16px' : '14px'));
+        bcHeight = cols === 1 ? 58 : (cols === 2 ? 48 : 42);
+        bcWidth = cols === 1 ? 2.2 : (cols === 2 ? 1.7 : 1.3);
+      } else if (rows === 3) {
+        previewMinHeight = 210;
+        boxPadding = '10px';
+        titleFontSize = cols === 1 ? '14.5px' : (cols === 2 ? '13px' : '12px');
+        badgeFontSize = cols === 1 ? '14px' : (cols === 2 ? '12px' : '11px');
+        detailFontSize = cols === 1 ? '13.5px' : (cols === 2 ? '12px' : '11px');
+        nameFontSize = cols === 1 ? '19px' : (cols === 2 ? '16px' : (cols === 3 ? '14px' : '12.5px'));
+        bcHeight = cols === 1 ? 50 : (cols === 2 ? 40 : 34);
+        bcWidth = cols === 1 ? 2.0 : (cols === 2 ? 1.5 : 1.2);
+      } else if (rows === 4) {
+        previewMinHeight = 165;
+        boxPadding = '8px';
+        titleFontSize = cols <= 2 ? '12.5px' : '11px';
+        badgeFontSize = cols <= 2 ? '11.5px' : '10.5px';
+        detailFontSize = cols <= 2 ? '11.5px' : '10px';
+        nameFontSize = cols === 1 ? '17px' : (cols === 2 ? '14.5px' : (cols === 3 ? '13px' : '11.5px'));
+        bcHeight = cols === 1 ? 42 : (cols === 2 ? 34 : 28);
+        bcWidth = cols === 1 ? 1.8 : (cols === 2 ? 1.4 : 1.1);
+      } else if (rows === 5) {
+        previewMinHeight = 145;
+        boxPadding = '7px';
+        titleFontSize = cols <= 2 ? '11.5px' : '10.5px';
+        badgeFontSize = cols <= 2 ? '11px' : '10px';
+        detailFontSize = cols <= 2 ? '11px' : '9.5px';
+        nameFontSize = cols === 1 ? '15.5px' : (cols === 2 ? '13.5px' : (cols === 3 ? '12px' : '10.5px'));
+        bcHeight = cols === 1 ? 36 : (cols === 2 ? 30 : 25);
+        bcWidth = cols === 1 ? 1.6 : (cols === 2 ? 1.3 : 1.05);
+      } else if (rows === 6) {
+        previewMinHeight = 125;
+        boxPadding = '6px';
+        titleFontSize = cols <= 2 ? '11px' : '9.5px';
+        badgeFontSize = cols <= 2 ? '10px' : '9px';
+        detailFontSize = cols <= 2 ? '10px' : '9px';
+        nameFontSize = cols === 1 ? '14px' : (cols === 2 ? '12.5px' : (cols === 3 ? '11px' : '9.5px'));
+        bcHeight = cols === 1 ? 30 : (cols === 2 ? 26 : 22);
+        bcWidth = cols === 1 ? 1.5 : (cols === 2 ? 1.2 : 1.0);
+      } else if (rows === 7) {
+        previewMinHeight = 112;
+        boxPadding = '5px';
+        titleFontSize = cols <= 2 ? '10.5px' : '9px';
+        badgeFontSize = cols <= 2 ? '9.5px' : '8.5px';
+        detailFontSize = cols <= 2 ? '9.5px' : '8.5px';
+        nameFontSize = cols === 1 ? '13px' : (cols === 2 ? '11.5px' : (cols === 3 ? '10.5px' : '9px'));
+        bcHeight = cols === 1 ? 24 : (cols === 2 ? 20 : 17);
+        bcWidth = cols === 1 ? 1.3 : (cols === 2 ? 1.1 : 0.95);
+      } else if (rows === 8) {
+        previewMinHeight = 98;
+        boxPadding = '4px';
+        titleFontSize = cols <= 2 ? '9.5px' : '8.5px';
+        badgeFontSize = cols <= 2 ? '9px' : '8px';
+        detailFontSize = cols <= 2 ? '9px' : '8px';
+        nameFontSize = cols === 1 ? '12px' : (cols === 2 ? '10.5px' : (cols === 3 ? '9.5px' : '8.5px'));
+        bcHeight = cols === 1 ? 20 : (cols === 2 ? 18 : 15);
+        bcWidth = cols === 1 ? 1.2 : (cols === 2 ? 1.0 : 0.9);
+      } else if (rows === 9) {
+        previewMinHeight = 88;
+        boxPadding = '3.5px';
+        titleFontSize = cols <= 2 ? '9px' : '8px';
+        badgeFontSize = cols <= 2 ? '8.5px' : '7.5px';
+        detailFontSize = cols <= 2 ? '8.5px' : '7.5px';
+        nameFontSize = cols === 1 ? '11px' : (cols === 2 ? '10px' : (cols === 3 ? '9px' : '8px'));
+        bcHeight = cols === 1 ? 18 : (cols === 2 ? 15 : 13);
+        bcWidth = cols === 1 ? 1.1 : (cols === 2 ? 0.95 : 0.85);
+      } else {
+        // rows === 10 (จิ๋ว)
+        previewMinHeight = 80;
+        boxPadding = '3px';
+        titleFontSize = cols <= 2 ? '8.5px' : '7.5px';
+        badgeFontSize = cols <= 2 ? '8px' : '7px';
+        detailFontSize = cols <= 2 ? '8px' : '7px';
+        nameFontSize = cols === 1 ? '10.5px' : (cols === 2 ? '9.5px' : (cols === 3 ? '8.5px' : '7.5px'));
+        bcHeight = cols === 1 ? 15 : (cols === 2 ? 13 : 11);
+        bcWidth = cols === 1 ? 1.0 : (cols === 2 ? 0.9 : 0.8);
+      }
+
+      // Dynamic calculation of QR code dimensions based on label box width and height
+      // Print mode: in millimeters
+      const printHeaderFooterMm = rows <= 3 ? 18 : (rows <= 5 ? 14 : 11);
+      const printMiddleHeightMm = Math.max(14, parseFloat(printHeightMm) - printHeaderFooterMm);
+      const printLabelWidthMm = Math.max(20, (196 / cols) - (rows <= 3 ? 10 : 6));
+      const printVerticalMarginMm = rows <= 3 ? 4.5 : (rows <= 5 ? 3.0 : 2.0);
+      const printTargetMiddleHeightMm = Math.max(12, printMiddleHeightMm - (printVerticalMarginMm * 2));
+
+      let printQrMm = 22;
+      if (!showBarcode) {
+        // Full label available for QR Code
+        printQrMm = Math.round(Math.min(printTargetMiddleHeightMm, printLabelWidthMm - 8));
+      } else {
+        // Shared with barcode
+        const maxQrWidthMm = printLabelWidthMm * (cols === 1 ? 0.35 : (cols === 2 ? 0.40 : 0.44));
+        printQrMm = Math.round(Math.min(printTargetMiddleHeightMm, maxQrWidthMm));
+      }
+      printQrMm = Math.max(14, printQrMm);
+
+      // Preview mode: in pixels
+      const prevHeaderFooterPx = rows <= 3 ? 60 : (rows <= 5 ? 46 : 38);
+      const prevMiddleHeightPx = Math.max(45, previewMinHeight - prevHeaderFooterPx);
+      const prevVerticalMarginPx = rows <= 3 ? 14 : (rows <= 5 ? 10 : 6);
+      const prevTargetMiddleHeightPx = Math.max(36, prevMiddleHeightPx - (prevVerticalMarginPx * 2));
+
+      let previewQrPx = 48;
+      if (!showBarcode) {
+        previewQrPx = Math.round(prevTargetMiddleHeightPx * 0.94);
+      } else {
+        previewQrPx = Math.round(prevTargetMiddleHeightPx * 0.85);
+      }
+      previewQrPx = Math.max(38, previewQrPx);
+
       let previewHtml = `<div class="row g-2">`;
-      let printHtml = `<div class="row g-2">`;
+      let printHtml = `<div class="row g-1">`;
       const renderTasks = [];
 
       itemsToPrint.forEach((item, itemIdx) => {
@@ -9510,43 +17052,57 @@
           const prBcId = `pr-bc-${itemIdx}-${c}`;
           const prQrId = `pr-qr-${itemIdx}-${c}`;
 
-          const labelTemplate = (bcId, qrId) => `
+          const labelTemplate = (bcId, qrId, isPrint = false) => {
+            const heightStyle = isPrint 
+              ? `height: ${printHeightMm}mm !important; max-height: ${printHeightMm}mm !important;` 
+              : `min-height: ${previewMinHeight}px; height: 100%;`;
+            const currentPadding = isPrint ? (rows >= 7 ? '2.5px 3.5px' : '4px 6px') : boxPadding;
+            const currentQrDim = isPrint ? `${printQrMm}mm` : `${previewQrPx}px`;
+            const middleMarginStyle = isPrint 
+              ? `margin-top: ${printVerticalMarginMm}mm !important; margin-bottom: ${printVerticalMarginMm}mm !important;` 
+              : `margin-top: ${prevVerticalMarginPx}px !important; margin-bottom: ${prevVerticalMarginPx}px !important;`;
+
+            return `
             <div class="${gridClass}">
-              <div class="sticker-label-box p-2 border rounded-3 bg-white text-dark h-100 position-relative" style="font-size: 0.8rem; page-break-inside: avoid; break-inside: avoid;">
-                <div class="d-flex align-items-center justify-content-between mb-1 border-bottom pb-1">
-                  <div class="fw-bold text-success text-truncate fs-8"><i class="bi bi-flower1 me-1"></i>${item.category}</div>
-                  <span class="badge bg-dark font-monospace">${item.code}</span>
+              <div class="sticker-label-box border rounded-2 bg-white text-dark d-flex flex-column justify-content-between position-relative" style="${heightStyle} font-size: ${detailFontSize}; padding: ${currentPadding}; page-break-inside: avoid; break-inside: avoid; overflow: hidden; box-sizing: border-box;">
+                <div>
+                  <div class="d-flex align-items-center justify-content-between mb-0.5 border-bottom pb-0.5" style="font-size: ${titleFontSize}; line-height: 1.1;">
+                    <div class="fw-bold text-success text-truncate"><i class="bi bi-flower1 me-1"></i>${item.category}</div>
+                    <span class="badge bg-dark font-monospace" style="font-size: ${badgeFontSize};">${item.code}</span>
+                  </div>
+
+                  ${showName ? `<div class="fw-bold text-dark text-truncate" style="font-size: ${nameFontSize}; line-height: 1.15; padding-bottom: 1px;" title="${item.name}">${item.name}</div>` : ''}
                 </div>
 
-                ${showName ? `<div class="fw-bold fs-7 text-dark mb-1 text-truncate" title="${item.name}">${item.name}</div>` : ''}
-
-                <div class="d-flex align-items-center justify-content-center gap-2 my-1">
+                <div class="d-flex align-items-center justify-content-center gap-2 overflow-hidden w-100 flex-grow-1" style="${middleMarginStyle} min-height: 0;">
                   ${showBarcode ? `
-                    <div class="text-center flex-grow-1 overflow-hidden" style="max-height: 52px;">
-                      <svg id="${bcId}"></svg>
+                    <div class="text-center ${showQr ? 'flex-grow-1' : 'w-100'} d-flex align-items-center justify-content-center overflow-hidden" style="max-height: 100%;">
+                      <svg id="${bcId}" style="max-width: 100%; height: ${bcHeight + 6}px; display: block; margin: 0 auto;"></svg>
                     </div>
                   ` : ''}
                   ${showQr ? `
-                    <div class="text-center flex-shrink-0">
-                      <canvas id="${qrId}" style="width: 52px; height: 52px;"></canvas>
+                    <div class="text-center ${showBarcode ? 'flex-shrink-0' : 'w-100'} d-flex align-items-center justify-content-center" style="width: ${currentQrDim}; height: ${currentQrDim}; max-height: 100%; max-width: 100%;">
+                      <canvas id="${qrId}" style="width: ${currentQrDim}; height: ${currentQrDim}; max-width: 100%; max-height: 100%; aspect-ratio: 1/1; display: block; margin: 0 auto; object-fit: contain;"></canvas>
+                      <img id="${qrId}-img" style="width: ${currentQrDim}; height: ${currentQrDim}; max-width: 100%; max-height: 100%; display: none; margin: 0 auto; object-fit: contain;" alt="QR" />
                     </div>
                   ` : ''}
                 </div>
 
                 ${showDetails ? `
-                  <div class="d-flex justify-content-between align-items-center fs-8 text-muted mt-1 border-top pt-1">
-                    <div><i class="bi bi-geo-alt me-1 text-danger"></i>${item.location || 'คลังกลาง'}</div>
-                    <div class="font-monospace text-dark fw-bold"><i class="bi bi-tag-fill me-1 text-success"></i>${item.code}</div>
+                  <div class="d-flex justify-content-between align-items-center text-muted border-top pt-1" style="font-size: ${detailFontSize}; line-height: 1.1;">
+                    <div class="text-truncate me-1"><i class="bi bi-geo-alt me-0.5 text-danger"></i>${item.location || 'คลังกลาง'}</div>
+                    <div class="font-monospace text-dark fw-bold text-nowrap"><i class="bi bi-tag-fill me-0.5 text-success"></i>${item.code}</div>
                   </div>
                 ` : ''}
               </div>
             </div>
           `;
+          };
 
-          previewHtml += labelTemplate(prevBcId, prevQrId);
-          printHtml += labelTemplate(prBcId, prQrId);
+          previewHtml += labelTemplate(prevBcId, prevQrId, false);
+          printHtml += labelTemplate(prBcId, prQrId, true);
 
-          renderTasks.push({ item, prevBcId, prevQrId, prBcId, prQrId });
+          renderTasks.push({ item, prevBcId, prevQrId, prBcId, prQrId, previewQrPx, printQrMm, bcWidth, bcHeight, rows, cols, detailFontSize });
         }
       });
 
@@ -9565,11 +17121,11 @@
                 try {
                   JsBarcode(svgElem, task.item.code, {
                     format: "CODE128",
-                    width: 1.4,
-                    height: 32,
-                    displayValue: true,
-                    fontSize: 10,
-                    margin: 2
+                    width: task.bcWidth,
+                    height: task.bcHeight,
+                    displayValue: task.rows <= 6 && task.cols <= 3,
+                    fontSize: Math.max(8, parseInt(task.detailFontSize)),
+                    margin: 1
                   });
                 } catch(e){}
               }
@@ -9577,17 +17133,112 @@
           }
 
           if (showQr) {
-            [task.prevQrId, task.prQrId].forEach(id => {
-              const canvasElem = document.getElementById(id);
-              if (canvasElem && typeof QRCode === 'object' && QRCode.toCanvas) {
-                try {
-                  QRCode.toCanvas(canvasElem, `EQUIPMENT:${task.item.code}`, {
-                    width: 52,
-                    margin: 1
-                  });
-                } catch(e){}
+            const qrText = `EQUIPMENT:${task.item.code || ''}`;
+            const targetPrevPx = task.previewQrPx;
+            const targetPrintMm = task.printQrMm;
+            const renderPx = Math.max(targetPrevPx * 3, Math.round(targetPrintMm * 14), 260);
+
+            // Render Preview Canvas
+            const prevCanvasElem = document.getElementById(task.prevQrId);
+            const prevImgElem = document.getElementById(task.prevQrId + '-img');
+            if (prevCanvasElem && typeof QRCode !== 'undefined' && QRCode.toCanvas) {
+              try {
+                QRCode.toCanvas(prevCanvasElem, qrText, {
+                  width: renderPx,
+                  margin: 1,
+                  color: { dark: '#000000', light: '#ffffff' }
+                }, function(err) {
+                  if (!err) {
+                    prevCanvasElem.style.width = targetPrevPx + 'px';
+                    prevCanvasElem.style.height = targetPrevPx + 'px';
+                    prevCanvasElem.style.maxWidth = '100%';
+                    prevCanvasElem.style.maxHeight = '100%';
+                    prevCanvasElem.style.aspectRatio = '1 / 1';
+                    prevCanvasElem.style.objectFit = 'contain';
+                    prevCanvasElem.style.display = 'block';
+                  } else if (prevImgElem && QRCode.toDataURL) {
+                    QRCode.toDataURL(qrText, { width: renderPx, margin: 1 }, function(err2, url) {
+                      if (!err2 && url) {
+                        prevImgElem.src = url;
+                        prevImgElem.style.width = targetPrevPx + 'px';
+                        prevImgElem.style.height = targetPrevPx + 'px';
+                        prevImgElem.style.maxWidth = '100%';
+                        prevImgElem.style.maxHeight = '100%';
+                        prevImgElem.style.objectFit = 'contain';
+                        prevImgElem.style.display = 'block';
+                        prevCanvasElem.style.display = 'none';
+                      }
+                    });
+                  }
+                });
+                prevCanvasElem.style.width = targetPrevPx + 'px';
+                prevCanvasElem.style.height = targetPrevPx + 'px';
+                prevCanvasElem.style.maxWidth = '100%';
+                prevCanvasElem.style.maxHeight = '100%';
+                prevCanvasElem.style.aspectRatio = '1 / 1';
+                prevCanvasElem.style.objectFit = 'contain';
+              } catch(e) {}
+            }
+
+            // Render Print Canvas
+            const prCanvasElem = document.getElementById(task.prQrId);
+            const prImgElem = document.getElementById(task.prQrId + '-img');
+            if (prCanvasElem && typeof QRCode !== 'undefined' && QRCode.toCanvas) {
+              try {
+                QRCode.toCanvas(prCanvasElem, qrText, {
+                  width: renderPx,
+                  margin: 1,
+                  color: { dark: '#000000', light: '#ffffff' }
+                }, function(err) {
+                  if (!err) {
+                    prCanvasElem.style.width = targetPrintMm + 'mm';
+                    prCanvasElem.style.height = targetPrintMm + 'mm';
+                    prCanvasElem.style.maxWidth = '100%';
+                    prCanvasElem.style.maxHeight = '100%';
+                    prCanvasElem.style.aspectRatio = '1 / 1';
+                    prCanvasElem.style.objectFit = 'contain';
+                    prCanvasElem.style.display = 'block';
+                  } else if (prImgElem && QRCode.toDataURL) {
+                    QRCode.toDataURL(qrText, { width: renderPx, margin: 1 }, function(err2, url) {
+                      if (!err2 && url) {
+                        prImgElem.src = url;
+                        prImgElem.style.width = targetPrintMm + 'mm';
+                        prImgElem.style.height = targetPrintMm + 'mm';
+                        prImgElem.style.maxWidth = '100%';
+                        prImgElem.style.maxHeight = '100%';
+                        prImgElem.style.objectFit = 'contain';
+                        prImgElem.style.display = 'block';
+                        prCanvasElem.style.display = 'none';
+                      }
+                    });
+                  }
+                });
+                prCanvasElem.style.width = targetPrintMm + 'mm';
+                prCanvasElem.style.height = targetPrintMm + 'mm';
+                prCanvasElem.style.maxWidth = '100%';
+                prCanvasElem.style.maxHeight = '100%';
+                prCanvasElem.style.aspectRatio = '1 / 1';
+                prCanvasElem.style.objectFit = 'contain';
+              } catch(e) {}
+            }
+
+            // Fallback if QRCode library missing
+            if (typeof QRCode === 'undefined') {
+              if (prevImgElem) {
+                prevImgElem.src = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=EQUIPMENT:${encodeURIComponent(task.item.code || '')}`;
+                prevImgElem.style.width = targetPrevPx + 'px';
+                prevImgElem.style.height = targetPrevPx + 'px';
+                prevImgElem.style.display = 'block';
+                if (prevCanvasElem) prevCanvasElem.style.display = 'none';
               }
-            });
+              if (prImgElem) {
+                prImgElem.src = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=EQUIPMENT:${encodeURIComponent(task.item.code || '')}`;
+                prImgElem.style.width = targetPrintMm + 'mm';
+                prImgElem.style.height = targetPrintMm + 'mm';
+                prImgElem.style.display = 'block';
+                if (prCanvasElem) prCanvasElem.style.display = 'none';
+              }
+            }
           }
         });
       }, 80);
@@ -9603,8 +17254,8 @@
           window.print();
           setTimeout(() => {
             printSheet.classList.add('d-none');
-          }, 1000);
-        }, 200);
+          }, 1500);
+        }, 350);
       } else {
         window.print();
       }
@@ -9617,28 +17268,62 @@
 
     window.openPrintEmployeeBadgeModal = function(empId = 'ALL') {
       activePrintEmpId = empId;
-      const select = document.getElementById('badgeEmpSelect');
-      if (select) {
-        select.innerHTML = `
-          <option value="ALL">👥 บุคลากรทั้งหมดในระบบ (${employeeList.length} ท่าน)</option>
-          <option value="WORKER">👨‍🌾 เฉพาะพนักงานทำเกษตร (Worker)</option>
-          <option value="STAFF">💼 เฉพาะเจ้าหน้าที่สำนักงาน (Staff)</option>
-        `;
-        employeeList.forEach(emp => {
-          const opt = document.createElement('option');
-          opt.value = emp.id;
-          opt.textContent = `🪪 [${emp.id}] ${emp.name} (${emp.department})`;
-          if (empId && empId === emp.id) opt.selected = true;
-          select.appendChild(opt);
-        });
-        if (empId) select.value = empId;
+      
+      const deptSelect = document.getElementById('badgeQuickDeptSelect');
+      if (deptSelect) {
+        const depts = [...new Set(employeeList.map(e => e.department).filter(Boolean))].sort((a,b) => a.localeCompare(b, 'th'));
+        deptSelect.innerHTML = '<option value="ALL">ทุกแผนก</option>' + depts.map(d => `<option value="${d}">${d}</option>`).join('');
+        deptSelect.value = 'ALL';
       }
+      const searchInput = document.getElementById('badgeQuickSearchInput');
+      if (searchInput) searchInput.value = '';
+
+      filterBadgeEmployeeSelectOptions();
 
       renderPrintableEmployeeBadgesPreview();
 
       const modalElem = document.getElementById('printableEmployeeBadgeModal');
       const modalInst = new bootstrap.Modal(modalElem);
       modalInst.show();
+    };
+
+    window.filterBadgeEmployeeSelectOptions = function() {
+      const select = document.getElementById('badgeEmpSelect');
+      if (!select) return;
+
+      const q = (document.getElementById('badgeQuickSearchInput')?.value || '').trim().toLowerCase();
+      const dept = document.getElementById('badgeQuickDeptSelect')?.value || 'ALL';
+
+      const filtered = employeeList.filter(e => {
+        const hay = [e.name, e.nickname, e.id, e.code, e.department, e.role].join(' ').toLowerCase();
+        const matchQ = !q || hay.includes(q);
+        const matchDept = dept === 'ALL' || e.department === dept;
+        return matchQ && matchDept;
+      });
+
+      const currentVal = select.value || activePrintEmpId || 'ALL';
+
+      select.innerHTML = `
+        <option value="ALL">👥 บุคลากรตามผลค้นหา/กรองทั้งหมด (${filtered.length} ท่าน)</option>
+        <option value="WORKER">👨‍🌾 เฉพาะพนักงานทำเกษตร (Worker)</option>
+        <option value="STAFF">💼 เฉพาะเจ้าหน้าที่สำนักงาน (Staff)</option>
+      `;
+
+      filtered.forEach(emp => {
+        const opt = document.createElement('option');
+        opt.value = emp.id;
+        const nick = emp.nickname ? ` (${emp.nickname})` : '';
+        opt.textContent = `🪪 [${emp.id}] ${emp.name}${nick} - ${emp.department || '-'}`;
+        select.appendChild(opt);
+      });
+
+      if (filtered.some(e => e.id === currentVal) || currentVal === 'ALL' || currentVal === 'WORKER' || currentVal === 'STAFF') {
+        select.value = currentVal;
+      } else {
+        select.value = 'ALL';
+      }
+
+      renderPrintableEmployeeBadgesPreview();
     };
 
     window.updateBadgeMarginTopDisplay = function() {
@@ -9759,12 +17444,25 @@
       const showDetails = document.getElementById('chkEmpShowDetails')?.checked;
 
       let employeesToPrint = [];
+      const q = (document.getElementById('badgeQuickSearchInput')?.value || '').trim().toLowerCase();
+      const dept = document.getElementById('badgeQuickDeptSelect')?.value || 'ALL';
+
+      let baseList = employeeList;
+      if (q || dept !== 'ALL') {
+        baseList = employeeList.filter(e => {
+          const hay = [e.name, e.nickname, e.id, e.code, e.department, e.role].join(' ').toLowerCase();
+          const matchQ = !q || hay.includes(q);
+          const matchDept = dept === 'ALL' || e.department === dept;
+          return matchQ && matchDept;
+        });
+      }
+
       if (selectedScope === 'ALL') {
-        employeesToPrint = [...employeeList];
+        employeesToPrint = [...baseList];
       } else if (selectedScope === 'WORKER') {
-        employeesToPrint = employeeList.filter(x => x.role === 'WORKER');
+        employeesToPrint = baseList.filter(x => x.role === 'WORKER');
       } else if (selectedScope === 'STAFF') {
-        employeesToPrint = employeeList.filter(x => x.role === 'STAFF');
+        employeesToPrint = baseList.filter(x => x.role === 'STAFF');
       } else {
         const found = employeeList.find(x => x.id === selectedScope);
         if (found) employeesToPrint = [found];
@@ -10173,6 +17871,10 @@
 
     window.handleDirectBadgeClockInFromResult = function() {
       if (!activeScannedEmpId) return;
+      if (MAIN_STOCK_ONLY_MODE) {
+        showToast("การลงเวลาถูกย้ายไปที่ศูนย์ผังโครงสร้างและจัดการบุคลากร");
+        return;
+      }
       const emp = employeeList.find(x => x.id === activeScannedEmpId);
       if (!emp) return;
 
@@ -10211,15 +17913,24 @@
       if (!emp) return;
 
       // Filter & Select Employee in Transaction Form
-      const searchInput = document.getElementById('transEmpSearchInput');
-      if (searchInput) {
-        searchInput.value = emp.name;
-        filterTransEmployeeSelect(emp.name);
+      if (typeof selectEmployeeForTransaction === 'function') {
+        selectEmployeeForTransaction(emp.id);
+      } else {
+        const searchInput = document.getElementById('transEmpSearchInput');
+        if (searchInput) {
+          searchInput.value = emp.name;
+          filterTransEmployeeSelect(emp.name, { hideResultsBox: true });
+        }
+        const select = document.getElementById('empSelect');
+        if (select) {
+          select.value = emp.id;
+        }
       }
 
-      const select = document.getElementById('empSelect');
-      if (select) {
-        select.value = emp.id;
+      const resultsBox = document.getElementById('transEmpSearchResultsBox');
+      if (resultsBox) {
+        resultsBox.classList.add('d-none');
+        resultsBox.innerHTML = '';
       }
 
       // Filter & Select Employee in Attendance Form
@@ -10252,6 +17963,10 @@
     };
 
     window.openAddEmployeeModalFromScanner = function() {
+      if (MAIN_PERSONNEL_READ_ONLY) {
+        stopEmpQrScanner();
+        return blockMainPersonnelMutation('เพิ่มข้อมูลบุคลากร');
+      }
       stopEmpQrScanner();
       const modalElem = document.getElementById('scanEmpBadgeModal');
       const modalInst = bootstrap.Modal.getInstance(modalElem);
@@ -10261,6 +17976,7 @@
     };
 
     window.openAddEmployeeModal = function() {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('เพิ่มข้อมูลบุคลากร');
       const form = document.getElementById('addEmployeeForm');
       if (form) form.reset();
       document.getElementById('editEmpIdHidden').value = '';
@@ -10274,6 +17990,7 @@
       if (document.getElementById('empDetailsInput')) document.getElementById('empDetailsInput').value = '';
       document.getElementById('empModalTitle').innerHTML = '<i class="bi bi-person-plus-fill me-2"></i>เพิ่มข้อมูลพนักงานใหม่';
       populateDepartmentDropdowns();
+      populatePositionDropdowns();
       const box = document.getElementById('empPhotoPreviewBox');
       if (box) box.classList.add('d-none');
       const modal = new bootstrap.Modal(document.getElementById('addEmployeeModal'));
@@ -10281,6 +17998,7 @@
     };
 
     window.openEditEmployeeModal = function(empId) {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('แก้ไขข้อมูลบุคลากร');
       const emp = employeeList.find(x => x.id === empId);
       if (!emp) return;
 
@@ -10298,7 +18016,7 @@
       document.getElementById('empCodeInput').value = emp.code || emp.id;
       if (document.getElementById('empRoleSelect')) document.getElementById('empRoleSelect').value = emp.role;
       populateDepartmentDropdowns(emp.department);
-      if (document.getElementById('empPositionSelect')) document.getElementById('empPositionSelect').value = emp.position || '';
+      populatePositionDropdowns(emp.position, emp.department);
       if (document.getElementById('empDetailsInput')) document.getElementById('empDetailsInput').value = emp.details || '';
       document.getElementById('empPhoneInput').value = emp.phone;
       document.getElementById('empPhotoUrlInput').value = emp.photoUrl || '';
@@ -10535,38 +18253,108 @@
       }
     };
 
+    function getDepartmentDropdownGroups(deptList = departmentsList) {
+      const groups = {
+        central: { label: '🏢 สายงานส่วนกลาง (1)', items: [] },
+        rose: { label: '🌹 สายงานกุหลาบและงานทดลอง (2)', items: [] },
+        ratana: { label: '🪷 สายงานรัตนบุปผา (3)', items: [] },
+        dhamma: { label: '🌾 สายงานธรรมยาตรา (4)', items: [] },
+        admin: { label: '👑 ฝ่ายบริหารและอำนวยการ', items: [] },
+        academic: { label: '🔬 สายวิชาการและเทคนิคการผลิต', items: [] },
+        other: { label: '📁 แผนกทั่วไป / อื่นๆ', items: [] }
+      };
+
+      const sourceList = (deptList && deptList.length)
+        ? deptList
+        : (typeof window.getFloraOrgDepartments === 'function' ? window.getFloraOrgDepartments() : defaultDepartmentsList);
+
+      sourceList.forEach((d, idx) => {
+        const id = typeof d === 'object' ? (d.id || d.nodeId || `dept-${idx}`) : `dept-${idx}`;
+        const code = typeof d === 'object' ? (d.code || '') : '';
+        const rawName = typeof d === 'object' ? (d.display || d.label || d.name || '') : String(d);
+        const cleanName = typeof d === 'object' ? (d.cleanName || d.name || rawName) : rawName;
+        const grp = typeof d === 'object' ? (d.group || '') : '';
+
+        const item = {
+          id,
+          code,
+          name: rawName,
+          displayName: rawName,
+          cleanName: cleanName.replace(/^\s*\d+(?:\.\d+)*\s*/, '').trim(),
+          nodeId: id,
+          group: grp
+        };
+
+        if (grp.includes('ส่วนกลาง') || code.startsWith('1.') || id.includes('dept-1') || id === 'division-1') {
+          groups.central.items.push(item);
+        } else if (grp.includes('กุหลาบ') || grp.includes('ทดลอง') || code.startsWith('2.') || id.includes('dept-2') || id === 'division-2') {
+          groups.rose.items.push(item);
+        } else if (grp.includes('รัตนบุปผา') || code.startsWith('3.') || id.includes('dept-3') || id === 'division-3') {
+          groups.ratana.items.push(item);
+        } else if (grp.includes('ธรรมยาตรา') || (code.startsWith('4.') && !code.startsWith('4.5')) || id.includes('dept-4') || id === 'division-4') {
+          groups.dhamma.items.push(item);
+        } else if (id === 'academic' || id === 'pos-academic' || grp.includes('วิชาการ') || code.startsWith('4.5') || rawName.includes('วิชาการ')) {
+          groups.academic.items.push(item);
+        } else if (id === 'executive-admin' || grp.includes('บริหาร') || rawName.includes('บริหาร') || rawName.includes('ประธาน')) {
+          groups.admin.items.push(item);
+        } else {
+          groups.other.items.push(item);
+        }
+      });
+
+      return groups;
+    }
+    window.getDepartmentDropdownGroups = getDepartmentDropdownGroups;
+
     function populateDepartmentDropdowns(selectedValue = null) {
       const select = document.getElementById('empDeptSelect');
       if (!select) return;
 
-      const currentVal = selectedValue || select.value;
+      const currentVal = selectedValue !== null && selectedValue !== undefined ? selectedValue : select.value;
 
-      select.innerHTML = '<option value="">-- กรุณาเลือกแผนก --</option>';
+      select.innerHTML = '<option value="">-- กรุณาเลือกแผนก / สายงาน --</option>';
 
       let hasSelected = false;
+      const groups = getDepartmentDropdownGroups(departmentsList);
 
-      departmentsList.forEach(deptName => {
-        const opt = document.createElement('option');
-        opt.value = deptName;
-        opt.textContent = deptName;
-        if (deptName === currentVal) {
-          opt.selected = true;
-          hasSelected = true;
+      for (const [key, grp] of Object.entries(groups)) {
+        if (grp && Array.isArray(grp.items) && grp.items.length > 0) {
+          const optGroup = document.createElement('optgroup');
+          optGroup.label = grp.label;
+
+          grp.items.forEach(dept => {
+            const opt = document.createElement('option');
+            opt.value = dept.name;
+            opt.textContent = dept.displayName;
+            if (dept.code) opt.dataset.code = dept.code;
+            if (dept.nodeId) opt.dataset.nodeId = dept.nodeId;
+
+            if (dept.name === currentVal || dept.displayName === currentVal || dept.cleanName === currentVal) {
+              opt.selected = true;
+              hasSelected = true;
+            }
+            optGroup.appendChild(opt);
+          });
+
+          select.appendChild(optGroup);
         }
-        select.appendChild(opt);
-      });
+      }
 
       if (currentVal && !hasSelected) {
+        const legacyGroup = document.createElement('optgroup');
+        legacyGroup.label = 'แผนกเดิม / นอกโครงสร้าง';
         const opt = document.createElement('option');
         opt.value = currentVal;
         opt.textContent = `${currentVal} (แผนกเดิม)`;
         opt.selected = true;
-        select.appendChild(opt);
+        legacyGroup.appendChild(opt);
+        select.appendChild(legacyGroup);
       }
     }
     window.populateDepartmentDropdowns = populateDepartmentDropdowns;
 
     window.openManageDepartmentsModal = function() {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('จัดการโครงสร้างหน่วยงาน');
       renderDepartmentsListModal();
       const input = document.getElementById('newDeptNameInput');
       if (input) input.value = '';
@@ -10589,11 +18377,12 @@
       let html = '';
       departmentsList.forEach((deptName, idx) => {
         const empCount = employeeList.filter(e => e.department === deptName).length;
+        const deptCode = `DEP-${String(idx + 1).padStart(3, '0')}`;
 
         html += `
           <div class="list-group-item d-flex align-items-center justify-content-between p-2.5 border-bottom gap-2">
             <div class="d-flex align-items-center gap-2 overflow-hidden">
-              <span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 rounded-pill fs-8">#${idx + 1}</span>
+              <span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 font-monospace fs-8 px-2 py-1">${deptCode}</span>
               <div>
                 <div class="fw-bold text-dark fs-7 text-truncate" title="${deptName}">${deptName}</div>
                 <div class="fs-8 text-muted"><i class="bi bi-people me-1"></i> มีพนักงานในแผนก: <span class="fw-semibold text-success">${empCount} คน</span></div>
@@ -10616,6 +18405,7 @@
     };
 
     window.addNewDepartmentFromModal = async function() {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('เพิ่มหน่วยงานในแท็บจัดการโครงสร้าง');
       const input = document.getElementById('newDeptNameInput');
       if (!input) return;
 
@@ -10635,8 +18425,18 @@
 
       if (isFirebaseReady && db) {
         try {
-          const deptId = 'dept_' + Date.now();
-          await setDoc(doc(db, "departments", deptId), { id: deptId, name: newName });
+          const qSnap = await getDocs(collection(db, "departments"));
+          let maxNum = 0;
+          qSnap.forEach(dSnap => {
+            const match = dSnap.id.match(/^DEP-(\d+)$/i) || dSnap.id.match(/^dept_v3_(\d+)$/);
+            if (match) {
+              const n = parseInt(match[1], 10);
+              if (n > maxNum) maxNum = n;
+            }
+          });
+          const nextIndex = maxNum > 0 ? maxNum + 1 : (departmentsList.length || 1);
+          const deptId = `DEP-${String(nextIndex).padStart(3, '0')}`;
+          await setDoc(doc(db, "departments", deptId), { id: deptId, code: deptId, name: newName });
         } catch (err) {
           console.warn("Firestore add department notice:", err);
         }
@@ -10646,10 +18446,15 @@
       renderDepartmentsListModal();
       populateDepartmentDropdowns(newName);
 
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('แผนก/สวน', 'เพิ่ม', `เพิ่มแผนก/สวน "${newName}" เข้าสู่ระบบ`, newName);
+      }
+
       showToast(`เพิ่มแผนก/สวน "${newName}" เข้าสู่ระบบเรียบร้อยแล้ว`);
     };
 
     window.editDepartmentName = async function(encodedOldName) {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('แก้ไขหน่วยงานในแท็บจัดการโครงสร้าง');
       const oldName = decodeURIComponent(encodedOldName);
       const newName = prompt(`แก้ไขชื่อแผนก:`, oldName);
 
@@ -10698,12 +18503,21 @@
           qSnap.forEach(async (dSnap) => {
             if (dSnap.data().name === oldName) {
               updated = true;
-              await setDoc(doc(db, "departments", dSnap.id), { name: trimmed }, { merge: true });
+              await setDoc(doc(db, "departments", dSnap.id), { name: trimmed, code: dSnap.data().code || dSnap.id }, { merge: true });
             }
           });
           if (!updated) {
-            const deptId = 'dept_' + Date.now();
-            await setDoc(doc(db, "departments", deptId), { id: deptId, name: trimmed });
+            let maxNum = 0;
+            qSnap.forEach(dSnap => {
+              const match = dSnap.id.match(/^DEP-(\d+)$/i) || dSnap.id.match(/^dept_v3_(\d+)$/);
+              if (match) {
+                const n = parseInt(match[1], 10);
+                if (n > maxNum) maxNum = n;
+              }
+            });
+            const nextIndex = maxNum > 0 ? maxNum + 1 : (departmentsList.length || 1);
+            const deptId = `DEP-${String(nextIndex).padStart(3, '0')}`;
+            await setDoc(doc(db, "departments", deptId), { id: deptId, code: deptId, name: trimmed });
           }
         } catch(err) {
           console.warn("Firestore edit department notice:", err);
@@ -10719,18 +18533,21 @@
     };
 
     window.deleteDepartmentName = async function(encodedDeptName) {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('ลบหน่วยงานในแท็บจัดการโครงสร้าง');
       const deptName = decodeURIComponent(encodedDeptName);
       const empCount = employeeList.filter(e => e.department === deptName).length;
 
-      if (empCount > 0) {
-        if (!confirm(`มีพนักงานในแผนก "${deptName}" จำนวน ${empCount} คน\n\nคุณแน่ใจหรือไม่ที่จะลบแผนกนี้ออกจากรายการ? (ข้อมูลแผนกของพนักงานจะยังคงเป็นชื่อเดิมจนกว่าจะแก้ไข)`)) {
-          return;
-        }
-      } else {
-        if (!confirm(`คุณต้องการลบแผนก/สวน "${deptName}" ออกจากรายการหรือไม่?`)) {
-          return;
-        }
-      }
+      const confirmMsg = empCount > 0 
+        ? `มีพนักงานในแผนกนี้ ${empCount} คน ต้องการลบแผนก "${deptName}" ออกจากรายการหรือไม่?` 
+        : `ต้องการลบแผนก/สวน "${deptName}" หรือไม่?`;
+
+      const ok = await window.showConfirmDialog({
+        title: "ลบแผนก/สวน",
+        message: confirmMsg,
+        type: "danger",
+        confirmText: "ลบแผนก"
+      });
+      if (!ok) return;
 
       departmentsList = departmentsList.filter(d => d !== deptName);
       saveToLocalStorage();
@@ -10756,6 +18573,391 @@
       }
 
       showToast(`ลบแผนก/สวน "${deptName}" ออกจากระบบเรียบร้อยแล้ว`);
+    };
+
+    // ==================== POSITIONS LIST MANAGEMENT ====================
+    function populatePositionDropdowns(selectedValue = null, selectedDept = null) {
+      const select = document.getElementById('empPositionSelect');
+      if (!select) return;
+
+      const deptSelect = document.getElementById('empDeptSelect');
+      const currentDept = selectedDept !== null && selectedDept !== undefined ? selectedDept : (deptSelect?.value || '');
+      const currentVal = selectedValue !== null && selectedValue !== undefined ? selectedValue : select.value;
+
+      if (!currentDept) {
+        select.innerHTML = '<option value="">-- กรุณาเลือกแผนกก่อน --</option>';
+        return;
+      }
+
+      select.innerHTML = '<option value="">-- กรุณาเลือกตำแหน่ง --</option>';
+
+      let hasSelected = false;
+      const cleanDept = (typeof stripStructureCode === 'function' ? stripStructureCode(currentDept) : currentDept).toLowerCase();
+      const codeMatch = currentDept.match(/^(\d+\.\d+|\d+)/);
+      const deptCode = codeMatch ? codeMatch[1] : '';
+
+      const groups = {
+        leader: { label: '👑 ระดับหัวหน้า', items: [] },
+        worker: { label: '👷 ระดับพนักงาน / ปฏิบัติการ', items: [] }
+      };
+
+      if (currentDept.includes('บริหาร') || currentDept.includes('อำนวยการ')) {
+        groups.leader.label = '👑 ระดับบริหารและประสานงาน';
+        (positionsList || []).forEach(p => {
+          const pName = typeof p === 'string' ? p : p.name;
+          if (pName.includes('ประธาน') || pName.includes('ที่ปรึกษา') || pName.includes('ผู้ประสานงาน')) {
+            groups.leader.items.push(pName);
+          }
+        });
+        groups.worker.items.push('พนักงานปฏิบัติการ');
+      } else if (currentDept.includes('วิชาการ')) {
+        groups.leader.label = '🔬 สายวิชาการ';
+        (positionsList || []).forEach(p => {
+          const pName = typeof p === 'string' ? p : p.name;
+          if (pName.includes('วิชาการ')) {
+            groups.leader.items.push(pName);
+          }
+        });
+        groups.worker.items.push('พนักงานปฏิบัติการ');
+      } else {
+        const departmentKeywordsMap = [
+          { code: '1.1', kw: ['ธุรการ', 'บุคคล'], leaderKw: ['ธุรการ', 'บุคคล'], workerKw: ['ธุรการ'] },
+          { code: '1.2', kw: ['สวัสดิการ'], leaderKw: ['สวัสดิการ'], workerKw: ['สวัสดิการ'] },
+          { code: '1.3', kw: ['ระบบน้ำ'], leaderKw: ['ระบบน้ำ'], workerKw: ['ระบบน้ำ'] },
+          { code: '1.4', kw: ['ตัดหญ้า'], leaderKw: ['ตัดหญ้า'], workerKw: ['ตัดหญ้า'] },
+          { code: '2.1', kw: ['ทดลอง'], leaderKw: ['ทดลอง'], workerKw: ['ทดลอง'] },
+          { code: '2.2', kw: ['กุหลาบ'], leaderKw: ['กุหลาบ'], workerKw: ['กุหลาบ'] },
+          { code: '3.1', kw: ['เจดีย์'], leaderKw: ['เจดีย์'], workerKw: ['เจดีย์'] },
+          { code: '3.2', kw: ['วิหารหลวงปู่'], leaderKw: ['วิหารหลวงปู่'], workerKw: ['วิหารหลวงปู่'] },
+          { code: '3.3', kw: ['ถนนธรรมชัย', 'เฟื่องฟ้า'], leaderKw: ['ถนนธรรมชัย', 'เฟื่องฟ้า'], workerKw: ['ถนนธรรมชัย', 'เฟื่องฟ้า'] },
+          { code: '3.4', kw: ['ผสมแกลบ', 'โต๊ะกลาง'], leaderKw: ['ผสมแกลบ', 'โต๊ะกลาง'], workerKw: ['ผสมแกลบ', 'โต๊ะกลาง'] },
+          { code: '4.1', kw: ['แปลง a', 'แปลง b', 'a / b', 'a/b'], leaderKw: ['แปลง a / b', 'แปลง a/b', 'แปลง a'], workerKw: ['แปลง a/b', 'แปลง a'] },
+          { code: '4.2', kw: ['แปลง e', 'p11', 'e / p11', 'e/p11'], leaderKw: ['แปลง e / p11', 'แปลง e/p11', 'แปลง e'], workerKw: ['แปลง e/p11', 'แปลง e'] },
+          { code: '4.3', kw: ['ไม้กระถาง', 'วิหารคด'], leaderKw: ['ไม้กระถาง', 'วิหารคด'], workerKw: ['ไม้กระถาง'] },
+          { code: '1', kw: ['ส่วนกลาง'], leaderKw: ['ส่วนกลาง'], workerKw: ['ธุรการ'] },
+          { code: '2', kw: ['กุหลาบและงานทดลอง', 'กุหลาบ/งานทดลอง'], leaderKw: ['กุหลาบ/งานทดลอง', 'กุหลาบและงานทดลอง'], workerKw: ['ทดลอง'] },
+          { code: '3', kw: ['รัตนบุปผา'], leaderKw: ['รัตนบุปผา'], workerKw: [] },
+          { code: '4', kw: ['ธรรมยาตรา'], leaderKw: ['ธรรมยาตรา'], workerKw: [] }
+        ];
+
+        const matchedConfig = departmentKeywordsMap.find(cfg => 
+          (deptCode && cfg.code === deptCode) ||
+          cfg.kw.some(k => cleanDept.includes(k) || currentDept.toLowerCase().includes(k))
+        );
+
+        (positionsList || []).forEach(p => {
+          const pName = typeof p === 'string' ? p : p.name;
+          const isLeader = pName.includes('หัวหน้า') || (typeof p === 'object' && (p.category === 'team_leader' || p.category === 'section_head'));
+          if (matchedConfig) {
+            if (isLeader && matchedConfig.leaderKw.some(k => pName.toLowerCase().includes(k.toLowerCase()))) {
+              if (!groups.leader.items.includes(pName)) groups.leader.items.push(pName);
+            } else if (!isLeader && matchedConfig.workerKw.some(k => pName.toLowerCase().includes(k.toLowerCase()))) {
+              if (!groups.worker.items.includes(pName)) groups.worker.items.push(pName);
+            }
+          }
+        });
+
+        if (groups.leader && Array.isArray(groups.leader.items) && groups.leader.items.length === 0) {
+          const cleanName = typeof stripStructureCode === 'function' ? stripStructureCode(currentDept) : currentDept;
+          groups.leader.items.push(`หัวหน้า${cleanName}`);
+        }
+        if (groups.worker && Array.isArray(groups.worker.items) && !groups.worker.items.includes('พนักงานปฏิบัติการ')) {
+          groups.worker.items.push('พนักงานปฏิบัติการ');
+        }
+      }
+
+      for (const [key, grp] of Object.entries(groups)) {
+        if (grp && Array.isArray(grp.items) && grp.items.length > 0) {
+          const optGroup = document.createElement('optgroup');
+          optGroup.label = grp.label;
+          grp.items.forEach(posName => {
+            const opt = document.createElement('option');
+            opt.value = posName;
+            opt.textContent = typeof stripStructureCode === 'function' ? stripStructureCode(posName) : posName;
+            if (posName === currentVal || (typeof stripStructureCode === 'function' && stripStructureCode(posName) === stripStructureCode(currentVal))) {
+              opt.selected = true;
+              hasSelected = true;
+            }
+            optGroup.appendChild(opt);
+          });
+          select.appendChild(optGroup);
+        }
+      }
+
+      if (currentVal && !hasSelected) {
+        const legacyGroup = document.createElement('optgroup');
+        legacyGroup.label = '📌 ตำแหน่งเดิมที่ระบุไว้';
+        const opt = document.createElement('option');
+        opt.value = currentVal;
+        opt.textContent = typeof stripStructureCode === 'function' ? stripStructureCode(currentVal) : currentVal;
+        opt.selected = true;
+        legacyGroup.appendChild(opt);
+        select.appendChild(legacyGroup);
+      }
+    }
+    window.populatePositionDropdowns = populatePositionDropdowns;
+
+    window.openManagePositionsModal = function() {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('จัดการตำแหน่งในแท็บจัดการโครงสร้าง');
+      renderPositionsListModal();
+      const input = document.getElementById('newPosNameInput');
+      if (input) input.value = '';
+      const modalElem = document.getElementById('managePositionsModal');
+      if (modalElem) {
+        const modal = bootstrap.Modal.getInstance(modalElem) || new bootstrap.Modal(modalElem);
+        modal.show();
+      }
+    };
+
+    window.renderPositionsListModal = function() {
+      const container = document.getElementById('positionsListContainer');
+      const badge = document.getElementById('posCountBadge');
+      if (!container) return;
+
+      const normalizedPositions = (positionsList || []).map((p, idx) => {
+        if (typeof p === 'string') {
+          return { id: `POS-${String(idx + 1).padStart(3, '0')}`, code: `POS-${String(idx + 1).padStart(3, '0')}`, name: p, group: 'ตำแหน่งทั่วไป', order: idx + 1 };
+        }
+        return p;
+      });
+
+      if (badge) badge.textContent = `ทั้งหมด ${normalizedPositions.length} รายการ`;
+
+      if (normalizedPositions.length === 0) {
+        container.innerHTML = `<div class="text-center py-4 text-muted fs-7"><i class="bi bi-inbox display-6 d-block mb-2 text-secondary"></i>ยังไม่มีรายการตำแหน่งในระบบ</div>`;
+        return;
+      }
+
+      let html = '';
+      normalizedPositions.forEach((pos, idx) => {
+        const posName = pos.name || pos.id;
+        const posCode = pos.code || pos.id || `POS-${String(idx + 1).padStart(3, '0')}`;
+        const posGroup = pos.group || 'ตำแหน่งทั่วไป';
+        const empCount = employeeList.filter(e => e.position === posName).length;
+
+        let groupBadgeColor = 'bg-secondary';
+        if (posGroup.includes('บริหาร') || posGroup.includes('ประสานงาน')) groupBadgeColor = 'bg-danger';
+        else if (posGroup.includes('หัวหน้างานฝ่ายหลัก')) groupBadgeColor = 'bg-warning text-dark';
+        else if (posGroup.includes('วิชาการ')) groupBadgeColor = 'bg-info text-dark';
+        else if (posGroup.includes('หัวหน้าแผนก')) groupBadgeColor = 'bg-primary';
+        else if (posGroup.includes('เจ้าหน้าที่') || posGroup.includes('พนักงาน')) groupBadgeColor = 'bg-success';
+
+        html += `
+          <div class="list-group-item d-flex align-items-center justify-content-between p-2.5 border-bottom gap-2">
+            <div class="d-flex align-items-center gap-2 overflow-hidden">
+              <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 font-monospace fs-8 px-2 py-1">${posCode}</span>
+              <div>
+                <div class="d-flex align-items-center gap-1.5 flex-wrap">
+                  <span class="fw-bold text-dark fs-7" title="${posName}">${posName}</span>
+                  <span class="badge ${groupBadgeColor} fs-8 px-1.5 py-0.5">${posGroup}</span>
+                </div>
+                <div class="fs-8 text-muted"><i class="bi bi-person-check me-1"></i> มีพนักงานดำรงตำแหน่งนี้: <span class="fw-semibold text-primary">${empCount} คน</span></div>
+              </div>
+            </div>
+
+            <div class="d-flex align-items-center gap-1 flex-shrink-0">
+              <button type="button" class="btn btn-outline-primary btn-sm rounded-pill px-2 py-1 fs-8 fw-semibold" onclick="editPositionName('${encodeURIComponent(pos.id || posName)}')">
+                <i class="bi bi-pencil me-1"></i> แก้ไข
+              </button>
+              <button type="button" class="btn btn-outline-danger btn-sm rounded-pill px-2 py-1 fs-8 fw-semibold" onclick="deletePositionName('${encodeURIComponent(pos.id || posName)}')">
+                <i class="bi bi-trash me-1"></i> ลบ
+              </button>
+            </div>
+          </div>
+        `;
+      });
+
+      container.innerHTML = html;
+    };
+
+    window.addNewPositionFromModal = async function() {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('เพิ่มตำแหน่งในแท็บจัดการโครงสร้าง');
+      const input = document.getElementById('newPosNameInput');
+      const groupSelect = document.getElementById('newPosGroupSelect');
+      if (!input) return;
+
+      const newName = input.value.trim();
+      const newGroup = groupSelect ? groupSelect.value : 'ตำแหน่งทั่วไป';
+
+      if (!newName) {
+        alert("กรุณาระบุชื่อตำแหน่งงานใหม่");
+        return;
+      }
+
+      const exists = (positionsList || []).some(p => {
+        const name = typeof p === 'string' ? p : p.name;
+        return name === newName;
+      });
+
+      if (exists) {
+        alert(`มีตำแหน่งชื่อ "${newName}" อยู่ในระบบแล้ว`);
+        return;
+      }
+
+      let maxNum = 0;
+      (positionsList || []).forEach(p => {
+        const id = typeof p === 'string' ? '' : (p.id || p.code || '');
+        const match = id.match(/^POS-(\d+)$/i);
+        if (match) {
+          const n = parseInt(match[1], 10);
+          if (n > maxNum) maxNum = n;
+        }
+      });
+
+      const nextIndex = maxNum > 0 ? maxNum + 1 : (positionsList.length + 1);
+      const posId = `POS-${String(nextIndex).padStart(3, '0')}`;
+      const newPosObj = {
+        id: posId,
+        code: posId,
+        name: newName,
+        group: newGroup,
+        order: nextIndex
+      };
+
+      positionsList.push(newPosObj);
+      saveToLocalStorage();
+
+      if (isFirebaseReady && db) {
+        try {
+          await setDoc(doc(db, "positions", posId), newPosObj);
+        } catch (err) {
+          console.warn("Firestore add position notice:", err);
+        }
+      }
+
+      input.value = '';
+      renderPositionsListModal();
+      populatePositionDropdowns(newName);
+
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('ตำแหน่ง', 'เพิ่ม', `เพิ่มตำแหน่ง "${newName}" (${newGroup}) เข้าสู่ระบบ`, newName);
+      }
+
+      showToast(`เพิ่มตำแหน่ง "${newName}" เข้าสู่ระบบเรียบร้อยแล้ว`);
+    };
+
+    window.editPositionName = async function(encodedKey) {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('แก้ไขตำแหน่งในแท็บจัดการโครงสร้าง');
+      const key = decodeURIComponent(encodedKey);
+      const posIndex = (positionsList || []).findIndex(p => {
+        if (typeof p === 'string') return p === key;
+        return p.id === key || p.name === key;
+      });
+
+      if (posIndex === -1) return;
+
+      const currentPos = positionsList[posIndex];
+      const oldName = typeof currentPos === 'string' ? currentPos : (currentPos.name || currentPos.id);
+      const oldGroup = typeof currentPos === 'string' ? 'ตำแหน่งทั่วไป' : (currentPos.group || 'ตำแหน่งทั่วไป');
+      const posId = typeof currentPos === 'string' ? `POS-${String(posIndex + 1).padStart(3, '0')}` : (currentPos.id || `POS-${String(posIndex + 1).padStart(3, '0')}`);
+
+      const newName = prompt(`แก้ไขชื่อตำแหน่งงาน:`, oldName);
+      if (newName === null) return;
+      const trimmed = newName.trim();
+
+      if (!trimmed) {
+        alert("ชื่อตำแหน่งงานต้องไม่เป็นค่าว่าง");
+        return;
+      }
+
+      const duplicate = (positionsList || []).some((p, i) => {
+        if (i === posIndex) return false;
+        const n = typeof p === 'string' ? p : p.name;
+        return n === trimmed;
+      });
+
+      if (duplicate) {
+        alert(`ชื่อตำแหน่ง "${trimmed}" มีอยู่ในระบบแล้ว`);
+        return;
+      }
+
+      const updatedPosObj = {
+        id: posId,
+        code: posId,
+        name: trimmed,
+        group: oldGroup,
+        order: typeof currentPos === 'object' && currentPos.order ? currentPos.order : posIndex + 1
+      };
+
+      positionsList[posIndex] = updatedPosObj;
+
+      let updatedCount = 0;
+      (employeeList || []).forEach(emp => {
+        if (emp.position === oldName) {
+          emp.position = trimmed;
+          updatedCount++;
+
+          if (isFirebaseReady && db) {
+            try {
+              updateDoc(doc(db, "employees", emp.id), { position: trimmed });
+            } catch(e){}
+          }
+        }
+      });
+
+      saveToLocalStorage();
+
+      if (isFirebaseReady && db) {
+        try {
+          await setDoc(doc(db, "positions", posId), updatedPosObj, { merge: true });
+        } catch(err) {
+          console.warn("Firestore edit position notice:", err);
+        }
+      }
+
+      renderPositionsListModal();
+      populatePositionDropdowns(trimmed);
+      renderEmployeeDirectory();
+
+      showToast(`อัปเดตชื่อตำแหน่งเป็น "${trimmed}" เรียบร้อยแล้ว (อัปเดตพนักงาน ${updatedCount} คน)`);
+    };
+
+    window.deletePositionName = async function(encodedKey) {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('ลบตำแหน่งในแท็บจัดการโครงสร้าง');
+      const key = decodeURIComponent(encodedKey);
+      const posIndex = (positionsList || []).findIndex(p => {
+        if (typeof p === 'string') return p === key;
+        return p.id === key || p.name === key;
+      });
+
+      if (posIndex === -1) return;
+
+      const currentPos = positionsList[posIndex];
+      const posName = typeof currentPos === 'string' ? currentPos : (currentPos.name || currentPos.id);
+      const posId = typeof currentPos === 'string' ? `POS-${String(posIndex + 1).padStart(3, '0')}` : (currentPos.id || posName);
+
+      const empCount = (employeeList || []).filter(e => e.position === posName).length;
+      const confirmMsg = empCount > 0 
+        ? `มีพนักงานดำรงตำแหน่งนี้ ${empCount} คน ต้องการลบตำแหน่ง "${posName}" ออกจากระบบหรือไม่?` 
+        : `ต้องการลบตำแหน่ง "${posName}" ออกจากระบบหรือไม่?`;
+
+      const ok = await window.showConfirmDialog({
+        title: "ลบตำแหน่งงาน",
+        message: confirmMsg,
+        type: "danger",
+        confirmText: "ลบตำแหน่ง"
+      });
+      if (!ok) return;
+
+      positionsList.splice(posIndex, 1);
+      saveToLocalStorage();
+
+      if (isFirebaseReady && db) {
+        try {
+          await deleteDoc(doc(db, "positions", posId));
+        } catch(err) {
+          console.warn("Firestore delete position notice:", err);
+        }
+      }
+
+      renderPositionsListModal();
+      populatePositionDropdowns();
+
+      if (typeof logAuditAction === 'function') {
+        logAuditAction('ตำแหน่ง', 'ลบ', `ลบตำแหน่ง "${posName}" ออกจากระบบ`, posName);
+      }
+
+      showToast(`ลบตำแหน่ง "${posName}" ออกจากระบบเรียบร้อยแล้ว`);
     };
 
     // ==================== LOCATIONS LIST MANAGEMENT ====================
@@ -10807,11 +19009,12 @@
       let html = '';
       locationsList.forEach((locName, idx) => {
         const equipCount = (equipmentList || []).filter(e => e.location === locName).length;
+        const locCode = `LOC-${String(idx + 1).padStart(3, '0')}`;
 
         html += `
           <div class="list-group-item d-flex align-items-center justify-content-between p-2.5 border-bottom gap-2">
             <div class="d-flex align-items-center gap-2 overflow-hidden">
-              <span class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25 rounded-pill fs-8">#${idx + 1}</span>
+              <span class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25 font-monospace fs-8 px-2 py-1">${locCode}</span>
               <div>
                 <div class="fw-bold text-dark fs-7 text-truncate" title="${locName}">${locName}</div>
                 <div class="fs-8 text-muted"><i class="bi bi-tools me-1"></i> มีอุปกรณ์จัดเก็บที่นี่: <span class="fw-semibold text-danger">${equipCount} รายการ</span></div>
@@ -10853,8 +19056,18 @@
 
       if (isFirebaseReady && db) {
         try {
-          const locId = 'loc_' + Date.now();
-          await setDoc(doc(db, "locations", locId), { id: locId, name: newName });
+          const qSnap = await getDocs(collection(db, "locations"));
+          let maxNum = 0;
+          qSnap.forEach(lSnap => {
+            const match = lSnap.id.match(/^LOC-(\d+)$/i);
+            if (match) {
+              const n = parseInt(match[1], 10);
+              if (n > maxNum) maxNum = n;
+            }
+          });
+          const nextIndex = maxNum > 0 ? maxNum + 1 : (locationsList.length || 1);
+          const locId = `LOC-${String(nextIndex).padStart(3, '0')}`;
+          await setDoc(doc(db, "locations", locId), { id: locId, code: locId, name: newName });
         } catch (err) {
           console.warn("Firestore add location notice:", err);
         }
@@ -10920,12 +19133,21 @@
           qSnap.forEach(async (lSnap) => {
             if (lSnap.data().name === oldName) {
               updated = true;
-              await setDoc(doc(db, "locations", lSnap.id), { name: trimmed }, { merge: true });
+              await setDoc(doc(db, "locations", lSnap.id), { name: trimmed, code: lSnap.data().code || lSnap.id }, { merge: true });
             }
           });
           if (!updated) {
-            const locId = 'loc_' + Date.now();
-            await setDoc(doc(db, "locations", locId), { id: locId, name: trimmed });
+            let maxNum = 0;
+            qSnap.forEach(lSnap => {
+              const match = lSnap.id.match(/^LOC-(\d+)$/i);
+              if (match) {
+                const n = parseInt(match[1], 10);
+                if (n > maxNum) maxNum = n;
+              }
+            });
+            const nextIndex = maxNum > 0 ? maxNum + 1 : (locationsList.length || 1);
+            const locId = `LOC-${String(nextIndex).padStart(3, '0')}`;
+            await setDoc(doc(db, "locations", locId), { id: locId, code: locId, name: trimmed });
           }
         } catch(err) {
           console.warn("Firestore edit location notice:", err);
@@ -10947,15 +19169,17 @@
       const locName = decodeURIComponent(encodedLocName);
       const equipCount = (equipmentList || []).filter(e => e.location === locName).length;
 
-      if (equipCount > 0) {
-        if (!confirm(`มีอุปกรณ์จัดเก็บในสถานที่ "${locName}" จำนวน ${equipCount} รายการ\n\nคุณแน่ใจหรือไม่ที่จะลบสถานที่นี้ออกจากรายการ?`)) {
-          return;
-        }
-      } else {
-        if (!confirm(`คุณต้องการลบสถานที่จัดเก็บ "${locName}" ออกจากรายการหรือไม่?`)) {
-          return;
-        }
-      }
+      const confirmMsg = equipCount > 0
+        ? `มีอุปกรณ์ในสถานที่นี้ ${equipCount} รายการ ต้องการลบสถานที่ "${locName}" หรือไม่?`
+        : `ต้องการลบสถานที่จัดเก็บ "${locName}" ออกจากรายการหรือไม่?`;
+
+      const ok = await window.showConfirmDialog({
+        title: "ลบสถานที่จัดเก็บ",
+        message: confirmMsg,
+        type: "danger",
+        confirmText: "ลบสถานที่"
+      });
+      if (!ok) return;
 
       locationsList = locationsList.filter(l => l !== locName);
       saveToLocalStorage();
@@ -10984,17 +19208,21 @@
     };
 
     window.deleteEmployee = async function(empId) {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('ลบข้อมูลบุคลากร');
       const emp = employeeList.find(x => x.id === empId);
       if (!emp) return;
 
-      if (confirm(`คุณต้องการลบรายชื่อพนักงาน "${emp.name}" [${emp.id}] หรือไม่?`)) {
+      const ok = await window.showConfirmDialog({
+        title: "ลบข้อมูลพนักงาน",
+        message: `ต้องการลบพนักงาน "${emp.name}" [${emp.id}] หรือไม่?`,
+        type: "danger",
+        confirmText: "ลบพนักงาน"
+      });
+      if (ok) {
         employeeList = employeeList.filter(x => x.id !== empId);
         saveToLocalStorage();
         if (isFirebaseReady && db) {
           try { await deleteDoc(doc(db, "employees", empId)); } catch(e){}
-        }
-        if (emp.photoUrl) {
-          await deleteImageFromFirebaseStorage(emp.photoUrl);
         }
 
         if (typeof logAuditAction === 'function') {
@@ -11008,21 +19236,18 @@
       }
     };
 
-    window.quickSelectTransaction = function(equipId) {
-      const select = document.getElementById('equipSelect');
-      select.value = equipId;
-      select.dispatchEvent(new Event('change'));
-
-      const transTabBtn = new bootstrap.Tab(document.getElementById('transaction-tab'));
-      transTabBtn.show();
-    };
+    // Note: Primary quickSelectTransaction is defined above with cart preservation logic
 
     window.openEditModal = function(id) {
       const item = equipmentList.find(x => x.id === id);
       if (!item) return;
 
       document.getElementById('editEquipId').value = item.id;
-      document.getElementById('equipModalTitle').innerHTML = '<i class="bi bi-pencil-square me-2"></i>แก้ไขรายการอุปกรณ์การเกษตร';
+      document.getElementById('equipModalTitle').innerHTML = '<i class="bi bi-pencil-square me-2"></i>แก้ไขข้อมูลอุปกรณ์';
+      const modalHeader = document.querySelector('#addEquipmentModal .modal-header');
+      if (modalHeader) {
+        modalHeader.className = 'modal-header bg-success bg-gradient text-white p-3 d-flex align-items-center justify-content-between';
+      }
       document.getElementById('equipNameThai').value = item.name;
       document.getElementById('equipCodeInput').value = item.code;
       document.getElementById('equipCategorySelect').value = item.category;
@@ -11042,6 +19267,9 @@
       }
 
       const modal = new bootstrap.Modal(document.getElementById('addEquipmentModal'));
+      if (typeof window.applyEquipmentCodeInputRolePermissions === 'function') {
+        window.applyEquipmentCodeInputRolePermissions();
+      }
       modal.show();
     };
 
@@ -11053,15 +19281,57 @@
     };
 
     window.resetAddModal = function() {
-      document.getElementById('addEquipmentForm').reset();
-      document.getElementById('editEquipId').value = '';
-      document.getElementById('equipCodeInput').value = '';
-      if (document.getElementById('equipMinQtyInput')) document.getElementById('equipMinQtyInput').value = 3;
+      const form = document.getElementById('addEquipmentForm');
+      if (form) form.reset();
+
+      const editIdElem = document.getElementById('editEquipId');
+      if (editIdElem) editIdElem.value = '';
+
+      const nameElem = document.getElementById('equipNameThai');
+      if (nameElem) nameElem.value = '';
+
+      const codeElem = document.getElementById('equipCodeInput');
+      if (codeElem) codeElem.value = '';
+
+      const catElem = document.getElementById('equipCategorySelect');
+      if (catElem) catElem.value = '';
+
+      const qtyElem = document.getElementById('equipQtyInput');
+      if (qtyElem) qtyElem.value = 10;
+
+      const minQtyElem = document.getElementById('equipMinQtyInput');
+      if (minQtyElem) minQtyElem.value = 3;
+
+      const unitElem = document.getElementById('equipUnitInput');
+      if (unitElem) unitElem.value = 'อัน';
+
+      populateLocationDropdowns('');
+      const locElem = document.getElementById('equipLocationInput');
+      if (locElem) locElem.value = '';
+
+      const manualUrlElem = document.getElementById('equipManualImgUrl');
+      if (manualUrlElem) manualUrlElem.value = '';
+
+      const descElem = document.getElementById('equipDescInput');
+      if (descElem) descElem.value = '';
+
+      const fileInput = document.getElementById('equipImageFileInput');
+      if (fileInput) fileInput.value = '';
+
+      const cameraInput = document.getElementById('equipImageCameraInput');
+      if (cameraInput) cameraInput.value = '';
+
       document.getElementById('equipModalTitle').innerHTML = '<i class="bi bi-plus-circle me-2"></i>เพิ่มรายการอุปกรณ์การเกษตรใหม่';
       document.getElementById('autoSearchLoadingOverlay').classList.add('d-none');
-      populateLocationDropdowns();
+
       const box = document.getElementById('equipImgPreviewBox');
       if (box) box.classList.add('d-none');
+      const img = document.getElementById('equipImgPreview');
+      if (img) img.src = '';
+
+      if (typeof window.applyEquipmentCodeInputRolePermissions === 'function') {
+        window.applyEquipmentCodeInputRolePermissions();
+      }
 
       if (typeof updateEquipmentCodeForCategory === 'function') {
         updateEquipmentCodeForCategory();
@@ -11085,9 +19355,13 @@
       const displayCode = item ? (item.code || item.id) : id;
 
       if (!skipConfirm) {
-        if (!confirm(`คุณต้องการลบอุปกรณ์ "${displayName}" [${displayCode}] หรือไม่?`)) {
-          return;
-        }
+        const ok = await window.showConfirmDialog({
+          title: "ลบอุปกรณ์",
+          message: `ต้องการลบอุปกรณ์ "${displayName}" [${displayCode}] หรือไม่?`,
+          type: "danger",
+          confirmText: "ลบอุปกรณ์"
+        });
+        if (!ok) return;
       }
 
       // Filter out matching items from memory
@@ -11138,10 +19412,6 @@
         }
       }
 
-      if (item && item.imageUrl) {
-        await deleteImageFromFirebaseStorage(item.imageUrl);
-      }
-
       if (typeof logAuditAction === 'function') {
         logAuditAction('อุปกรณ์', 'ลบ', `ลบรายการอุปกรณ์ "${displayName}" [${displayCode}]`, id);
       }
@@ -11155,48 +19425,19 @@
       if (typeof renderDbEditorTable === 'function') renderDbEditorTable();
     };
 
-    // Database Inspector Functions
-    window.openDatabaseInspector = function() {
-      document.getElementById('dbCountEmp').textContent = employeeList.length;
-      document.getElementById('dbCountEquip').textContent = equipmentList.length;
-      document.getElementById('dbCountTx').textContent = transactionHistory.length;
-      document.getElementById('dbCountAtt').textContent = attendanceLogs.length;
-
-      document.getElementById('dbEmpJsonCode').textContent = JSON.stringify(employeeList, null, 2);
-      document.getElementById('dbEquipJsonCode').textContent = JSON.stringify(equipmentList, null, 2);
-      document.getElementById('dbTxJsonCode').textContent = JSON.stringify(transactionHistory, null, 2);
-      document.getElementById('dbAttJsonCode').textContent = JSON.stringify(attendanceLogs, null, 2);
-    };
-
-    window.exportDatabaseJson = function() {
-      const fullBackup = {
-        exportedAt: new Date().toISOString(),
-        databaseName: "Flora Garden App Database",
-        collections: {
-          employees: employeeList,
-          equipment: equipmentList,
-          transactions: transactionHistory,
-          attendance: attendanceLogs
-        }
-      };
-      const blob = new Blob([JSON.stringify(fullBackup, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      const timestampStr = typeof window.getThaiDateTimeFilenameString === 'function' ? window.getThaiDateTimeFilenameString() : new Date().toISOString().slice(0,10);
-      a.download = `flora_garden_database_${timestampStr}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      showToast("ส่งออกข้อมูล JSON ของฐานข้อมูลเรียบร้อยแล้ว");
-    };
-
-    window.clearDatabaseCache = function() {
+    window.clearDatabaseCache = async function() {
       if (currentRole !== 'ADMIN') {
-        if (typeof showToast === 'function') showToast("⚠️ เฉพาะผู้ดูแลระบบ (Admin) เท่านั้นที่มีสิทธิ์ล้างแคชและตั้งค่าระบบ");
-        else alert("⚠️ เฉพาะผู้ดูแลระบบ (Admin) เท่านั้นที่มีสิทธิ์ล้างแคชและตั้งค่าระบบ");
+        showToast("⚠️ เฉพาะผู้ดูแลระบบ (Admin) เท่านั้นที่มีสิทธิ์ล้างแคช");
         return;
       }
-      if (confirm("คุณแน่ใจหรือไม่ว่าต้องการล้างแคชฐานข้อมูลท้องถิ่น (Local Cache)?\n\nการล้างแคชจะช่วยแก้ไขปัญหาข้อมูลค้างหรือไม่แสดงผลล่าสุด โดยระบบจะลบข้อมูลที่แคชไว้ในเครื่อง และรีโหลดข้อมูลสดล่าสุดจากเซิร์ฟเวอร์ (Firestore) ทันที")) {
+      const ok = await window.showConfirmDialog({
+        title: "ล้างแคชฐานข้อมูล",
+        message: "ต้องการล้างแคชข้อมูลในเครื่องและโหลดข้อมูลสดจากเซิร์ฟเวอร์ใหม่หรือไม่?",
+        type: "warning",
+        icon: "bi-arrow-clockwise",
+        confirmText: "ล้างแคชและรีโหลด"
+      });
+      if (ok) {
         try {
           localStorage.removeItem('flora_employees');
           localStorage.removeItem('flora_equipment');
@@ -11225,67 +19466,153 @@
       }
     };
 
-    // Function to completely purge/delete all data from LocalStorage, Firestore, and Firebase Storage
-    window.purgeEntireDatabaseAndStorage = async function() {
-      const confirm1 = confirm("⚠️ คำเตือนสูงสุด (Danger Area):\n\nคุณแน่ใจหรือไม่ว่าต้องการ 'ลบฐานข้อมูลและรูปภาพทั้งหมด' ?\n\nการลบนี้จะทำการลบข้อมูลทั้งหมด ได้แก่:\n- รายการอุปกรณ์และเครื่องมือทั้งหมด\n- รายชื่อพนักงานทั้งหมด\n- ประวัติการเบิก-คืน อุปกรณ์\n- ประวัติบันทึกเวลาเข้า-ออกงาน\n- หมวดหมู่และแผนกทั้งหมด\n- รูปภาพทั้งหมดใน Firebase Storage และ Firestore");
-      if (!confirm1) return;
+    // Helper to get friendly Project and Database info for safety displays
+    window.getFriendlyProjectAndDbInfo = function() {
+      const cfg = (typeof firebaseConfig !== 'undefined' ? firebaseConfig : (window.firebaseConfig || {}));
+      const projId = cfg.projectId || 'flora-gaden';
+      const dbId = cfg.firestoreDatabaseId || '(default)';
+      
+      let friendlyName = 'Flora Garden System';
+      const dbLower = (dbId || '').toLowerCase();
+      if (dbLower.includes('floragardentest')) {
+        friendlyName = 'Flora Garden Test';
+      } else if (dbLower.includes('floragardenv2')) {
+        friendlyName = 'Flora Garden V.2';
+      } else if (dbLower.includes('floragardennew')) {
+        friendlyName = 'Flora Garden New';
+      } else if (dbId === '(default)' || !dbId) {
+        friendlyName = 'Flora Garden (Default)';
+      } else {
+        friendlyName = `Flora Garden (${projId})`;
+      }
+      return {
+        projectName: friendlyName,
+        projectId: projId,
+        databaseId: dbId
+      };
+    };
 
-      const confirm2 = confirm("🚨 ยืนยันขั้นตอนสุดท้าย!\n\nข้อมูลและรูปภาพทั้งหมดจะถูกลบทิ้งอย่างถาวรทั้งในเครื่องและบนคลาวด์ (Firebase) ไม่สามารถกู้คืนได้อีก\n\nกด 'OK' เพื่อเริ่มทำการลบทุกอย่างทันที");
-      if (!confirm2) return;
-
-      if (typeof showToast === 'function') {
-        showToast("⏳ กำลังเริ่มประมวลผลลบฐานข้อมูลและรูปภาพทั้งหมดใน Firebase...");
+    // Function to show the custom confirmation modal for database purge (PRESERVING Firebase Storage images)
+    window.purgeEntireDatabaseAndStorage = function() {
+      const modalEl = document.getElementById('confirmPurgeDbModal');
+      const chk = document.getElementById('chkConfirmPurgeDb');
+      const btn = document.getElementById('btnConfirmPurgeDbAction');
+      
+      if (chk) chk.checked = false;
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="bi bi-trash3-fill me-1.5"></i> ยืนยันลบฐานข้อมูลทันที';
       }
 
-      let deletedImagesCount = 0;
+      // Populate dynamic Database ID and Project Name in the confirmation modal
+      const info = (typeof window.getFriendlyProjectAndDbInfo === 'function')
+        ? window.getFriendlyProjectAndDbInfo()
+        : { projectName: 'Flora Garden New', projectId: 'flora-gaden', databaseId: 'ai-studio-floragardennew-077d9b3a-d839-404a-986e-0ab7c5c9be6e' };
+
+      const projNameEl = document.getElementById('purgeTargetProjectName');
+      const dbIdEl = document.getElementById('purgeTargetDbId');
+      const projBadgeEl = document.getElementById('purgeTargetProjectIdBadge');
+
+      if (projNameEl) {
+        projNameEl.innerHTML = `<i class="bi bi-folder2-open text-danger me-1"></i> <span>${info.projectName}</span>`;
+      }
+      if (dbIdEl) {
+        dbIdEl.textContent = info.databaseId;
+      }
+      if (projBadgeEl) {
+        projBadgeEl.textContent = `Project: ${info.projectId}`;
+      }
+
+      // Track if called from backupRestoreModal
+      const backupModalEl = document.getElementById('backupRestoreModal');
+      if (backupModalEl && typeof bootstrap !== 'undefined' && bootstrap.Modal) {
+        if (backupModalEl.classList.contains('show')) {
+          window._purgeOpenedFromBackupModal = true;
+          const brInst = bootstrap.Modal.getInstance(backupModalEl);
+          if (brInst) brInst.hide();
+        } else {
+          window._purgeOpenedFromBackupModal = false;
+        }
+      }
+
+      if (modalEl && typeof bootstrap !== 'undefined' && bootstrap.Modal) {
+        const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+        modal.show();
+      } else {
+        // Fallback confirmation with project and database ID details
+        const c1 = confirm(`⚠️ คำเตือน: คุณแน่ใจหรือไม่ว่าต้องการ 'ลบฐานข้อมูลทั้งหมด' ?\n\n📌 โปรเจ็กต์: ${info.projectName}\n📌 Database ID: ${info.databaseId}\n📌 Firebase Project: ${info.projectId}\n\n*หมายเหตุ: จะไม่ลบไฟล์รูปภาพใน Firebase Storage (รูปภาพจะยังคงอยู่ใน Storage ปลอดภัย 100%)*`);
+        if (c1) {
+          window.executeConfirmedPurgeDatabase();
+        }
+      }
+    };
+
+    // Ensure cancel on confirmPurgeDbModal returns to backupRestoreModal if opened from there
+    const purgeDbModalElement = document.getElementById('confirmPurgeDbModal');
+    if (purgeDbModalElement) {
+      purgeDbModalElement.addEventListener('hidden.bs.modal', () => {
+        if (window._purgeOpenedFromBackupModal) {
+          const brModalEl = document.getElementById('backupRestoreModal');
+          if (brModalEl && typeof bootstrap !== 'undefined' && bootstrap.Modal) {
+            const brInst = bootstrap.Modal.getOrCreateInstance(brModalEl);
+            brInst.show();
+          }
+          window._purgeOpenedFromBackupModal = false;
+        }
+      });
+    }
+
+    // Execute the confirmed database purge (deletes all Firestore docs for equipment and personnel, leaves Firebase Storage 100% untouched)
+    window.executeConfirmedPurgeDatabase = async function() {
+      const modalEl = document.getElementById('confirmPurgeDbModal');
+      const btn = document.getElementById('btnConfirmPurgeDbAction');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1.5" role="status" aria-hidden="true"></span> กำลังลบฐานข้อมูล...';
+      }
+
+      if (typeof showToast === 'function') {
+        showToast("⏳ กำลังเริ่มประมวลผลลบเอกสารฐานข้อมูลทั้งหมดใน Firestore (คงรูปภาพใน Storage ปลอดภัย 100%)...");
+      }
+
       let deletedDocsCount = 0;
 
       try {
-        // 1. Delete images individually from memory list
-        for (const eq of (equipmentList || [])) {
-          if (eq && eq.imageUrl) {
-            try {
-              await deleteImageFromFirebaseStorage(eq.imageUrl);
-              deletedImagesCount++;
-            } catch (e) {}
-          }
-        }
-        for (const emp of (employeeList || [])) {
-          if (emp && emp.photoUrl) {
-            try {
-              await deleteImageFromFirebaseStorage(emp.photoUrl);
-              deletedImagesCount++;
-            } catch (e) {}
-          }
-        }
+        // NOTE: Firebase Storage images are explicitly PRESERVED and NOT deleted!
+        // Storage images remain intact and 100% safe.
 
-        // 2. Purge folders directly in Firebase Storage using listAll if storage ready
-        if (isFirebaseReady && storage) {
-          const folders = ["equipment_images", "employee_photos", "uploads"];
-          for (const folder of folders) {
-            try {
-              const folderRef = ref(storage, folder);
-              const res = await listAll(folderRef);
-              for (const itemRef of res.items) {
-                await deleteObject(itemRef);
-                deletedImagesCount++;
-              }
-            } catch (sErr) {
-              console.warn(`Storage folder purge notice (${folder}):`, sErr.message);
-            }
-          }
-        }
-
-        // 3. Delete all documents in Firestore collections if Firestore ready
+        // 1. Delete all documents in Firestore collections for both equipment and personnel
         if (isFirebaseReady && db) {
-          const collectionsToPurge = ["equipment", "employees", "transactions", "attendance", "categories", "departments", "system_metadata"];
+          const collectionsToPurge = [
+            "equipment",
+            "employees",
+            "deleted_employees",
+            "transactions",
+            "attendance",
+            "categories",
+            "departments",
+            "locations",
+            "positions",
+            "system_metadata",
+            "audit_logs",
+            "user_login_logs",
+            "payroll_periods",
+            "payroll_records",
+            "job_applications"
+          ];
           for (const colName of collectionsToPurge) {
             try {
               const colRef = collection(db, colName);
               const qSnap = await getDocs(colRef);
-              for (const dSnap of qSnap.docs) {
-                await deleteDoc(dSnap.ref);
-                deletedDocsCount++;
+              if (!qSnap.empty) {
+                const batchSize = 400;
+                for (let i = 0; i < qSnap.docs.length; i += batchSize) {
+                  const chunk = qSnap.docs.slice(i, i + batchSize);
+                  const batch = writeBatch(db);
+                  chunk.forEach(docSnap => batch.delete(docSnap.ref));
+                  await batch.commit();
+                  deletedDocsCount += chunk.length;
+                }
               }
             } catch (fErr) {
               console.warn(`Firestore collection purge notice (${colName}):`, fErr.message);
@@ -11293,48 +19620,203 @@
           }
         }
 
-        // 4. Clear local memory arrays
+        // 2. Clear local memory arrays
         equipmentList = [];
+        window.equipmentList = [];
         employeeList = [];
+        window.employeeList = [];
+        window.employees = [];
         transactionHistory = [];
+        window.transactionHistory = [];
         attendanceLogs = [];
+        window.attendanceLogs = [];
+        auditLogs = [];
+        window.auditLogs = [];
         categoriesList = [];
+        window.categoriesList = [];
+        departmentsList = [];
+        window.departmentsList = [];
+        locationsList = [];
+        window.locationsList = [];
+        positionsList = [];
+        window.positionsList = [];
 
-        // 5. Clear LocalStorage keys
-        localStorage.removeItem('flora_employees');
-        localStorage.removeItem('flora_equipment');
-        localStorage.removeItem('flora_transactions');
-        localStorage.removeItem('flora_attendance');
-        localStorage.removeItem('flora_categories');
-        localStorage.removeItem('flora_departments');
-        localStorage.removeItem('flora_db_initialized');
-        localStorage.removeItem('flora_fs_seeded_employees');
-        localStorage.removeItem('flora_fs_seeded_attendance');
-        localStorage.removeItem('flora_fs_seeded_categories');
-        localStorage.removeItem('flora_fs_seeded_equipment');
+        // 3. Clear LocalStorage keys (both base and scoped)
+        const baseKeysToRemove = [
+          'flora_employees',
+          'flora_equipment',
+          'flora_transactions',
+          'flora_attendance',
+          'flora_audit_logs',
+          'flora_user_login_logs',
+          'flora_categories',
+          'flora_departments',
+          'flora_locations',
+          'flora_positions',
+          'flora_deleted_employees',
+          'flora_db_initialized',
+          'flora_fs_seeded_employees',
+          'flora_fs_seeded_attendance',
+          'flora_fs_seeded_categories',
+          'flora_fs_seeded_equipment',
+          'flora_fs_seeded_locations'
+        ];
+        baseKeysToRemove.forEach(k => {
+          localStorage.removeItem(k);
+          if (typeof getScopedStorageKey === 'function') {
+            localStorage.removeItem(getScopedStorageKey(k));
+          }
+        });
 
-        saveToLocalStorage();
+        if (typeof saveToLocalStorage === 'function') saveToLocalStorage();
 
-        // 6. Refresh UI components
-        renderCatalogGrid();
-        renderStaffTable();
-        renderHistoryTable();
-        renderEmployeeDirectory();
-        renderAttendanceTable();
-        populateEmployeeDropdowns();
-        populateEquipmentDropdown();
-        populateQuickScanDropdown();
-        updateStats();
-
+        // 4. Refresh UI components
+        if (typeof renderCatalogGrid === 'function') renderCatalogGrid();
+        if (typeof renderStaffTable === 'function') renderStaffTable();
+        if (typeof renderHistoryTable === 'function') renderHistoryTable();
+        if (typeof renderEmployeeDirectory === 'function') renderEmployeeDirectory();
+        if (typeof renderAttendanceTable === 'function') renderAttendanceTable();
+        if (typeof populateEmployeeDropdowns === 'function') populateEmployeeDropdowns();
+        if (typeof populateEquipmentDropdown === 'function') populateEquipmentDropdown();
+        if (typeof populateQuickScanDropdown === 'function') populateQuickScanDropdown();
+        if (typeof populateLocationDropdowns === 'function') populateLocationDropdowns();
+        if (typeof populateDepartmentDropdowns === 'function') populateDepartmentDropdowns();
+        if (typeof renderLocationsListModal === 'function') renderLocationsListModal();
+        if (typeof renderDepartmentsListModal === 'function') renderDepartmentsListModal();
+        if (typeof renderCategoryManagementList === 'function') renderCategoryManagementList();
+        if (typeof renderAuditLogsTable === 'function') renderAuditLogsTable();
+        if (typeof updateStats === 'function') updateStats();
         if (typeof renderDbEditorTable === 'function') renderDbEditorTable();
-        if (typeof openDatabaseInspector === 'function') openDatabaseInspector();
+        if (typeof window.refreshBackupModalLiveStats === 'function') window.refreshBackupModalLiveStats();
+        if (typeof refreshEquipmentBackupModalStats === 'function') refreshEquipmentBackupModalStats();
 
-        const successMsg = `🔥 ลบฐานข้อมูลและรูปภาพทั้งหมดสำเร็จแล้ว!\n\n• ลบไฟล์รูปภาพใน Firebase Storage: ${deletedImagesCount} ไฟล์\n• ลบเอกสารข้อมูลใน Firestore: ${deletedDocsCount} รายการ\n• เคลียร์ LocalStorage และข้อมูลในระบบเรียบร้อยแล้วครับ`;
-        alert(successMsg);
-        showToast("🔥 ลบฐานข้อมูลและรูปภาพทั้งหมดเรียบร้อยแล้ว!");
+        // Prevent reopening backup modal automatically on execute
+        window._purgeOpenedFromBackupModal = false;
+
+        // Hide confirmation modal
+        if (modalEl && typeof bootstrap !== 'undefined' && bootstrap.Modal) {
+          const modalInstance = bootstrap.Modal.getInstance(modalEl);
+          if (modalInstance) modalInstance.hide();
+        }
+
+        if (typeof showToast === 'function') {
+          showToast(`🗑️ ลบฐานข้อมูลทั้งหมดสำเร็จแล้ว (${deletedDocsCount} รายการ) ทั้งพัสดุและบุคลากร (รูปภาพใน Storage ปลอดภัย 100%)`);
+        } else {
+          alert(`ลบฐานข้อมูลทั้งหมดสำเร็จแล้ว (${deletedDocsCount} รายการ) รูปภาพใน Storage ปลอดภัย 100%`);
+        }
       } catch (err) {
         console.error("Purge error:", err);
-        alert("เกิดข้อผิดพลาดขณะลบฐานข้อมูล: " + err.message);
+        if (typeof showToast === 'function') {
+          showToast("❌ เกิดข้อผิดพลาดขณะลบฐานข้อมูล: " + err.message);
+        } else {
+          alert("เกิดข้อผิดพลาดขณะลบฐานข้อมูล: " + err.message);
+        }
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '<i class="bi bi-trash3-fill me-1.5"></i> ยืนยันลบฐานข้อมูลทันที';
+        }
+      }
+    };
+
+    // Function to scan and purge only orphaned/unused images from Firebase Storage
+    window.scanAndCleanupOrphanedStorageImages = async function() {
+      if (!isFirebaseReady || !storage) {
+        showToast("⚠️ Firebase Storage ยังไม่พร้อมใช้งาน กรุณาตรวจสอบการเชื่อมต่อระบบคลาวด์");
+        return;
+      }
+
+      showToast("🔍 กำลังสแกนตรวจสอบไฟล์รูปภาพขยะใน Firebase Storage...");
+
+      try {
+        // 1. Gather all active image URLs / paths in use
+        const activeImagePaths = new Set();
+        (equipmentList || []).forEach(eq => {
+          if (eq && eq.imageUrl) activeImagePaths.add(String(eq.imageUrl));
+        });
+        (employeeList || []).forEach(emp => {
+          if (emp && emp.photoUrl) activeImagePaths.add(String(emp.photoUrl));
+        });
+
+        // Convert URLs into readable decoded strings for matching
+        const decodedActiveStrings = new Set();
+        activeImagePaths.forEach(urlStr => {
+          try {
+            decodedActiveStrings.add(decodeURIComponent(urlStr));
+          } catch (e) {
+            decodedActiveStrings.add(urlStr);
+          }
+        });
+
+        // 2. Scan Storage folders
+        const folders = ["equipment_images", "employee_photos", "uploads"];
+        let totalFilesScanned = 0;
+        const orphanedItems = [];
+
+        for (const folder of folders) {
+          try {
+            const folderRef = ref(storage, folder);
+            const res = await listAll(folderRef);
+            totalFilesScanned += res.items.length;
+
+            for (const itemRef of res.items) {
+              const fullPath = itemRef.fullPath; // e.g. "equipment_images/item1.jpeg"
+              const fileName = itemRef.name;     // e.g. "item1.jpeg"
+
+              let isUsed = false;
+              for (const activeStr of decodedActiveStrings) {
+                if (activeStr.includes(fullPath) || activeStr.includes(fileName)) {
+                  isUsed = true;
+                  break;
+                }
+              }
+
+              if (!isUsed) {
+                orphanedItems.push(itemRef);
+              }
+            }
+          } catch (folderErr) {
+            console.warn(`Storage folder scan notice (${folder}):`, folderErr.message);
+          }
+        }
+
+        if (orphanedItems.length === 0) {
+          showToast(`✅ ไม่พบไฟล์รูปภาพขยะใน Storage (${totalFilesScanned} ไฟล์ใช้งานปกติ)`);
+          return;
+        }
+
+        // 3. Prompt user for deletion
+        const ok = await window.showConfirmDialog({
+          title: "ลบไฟล์รูปภาพขยะ",
+          message: `พบรูปภาพตกค้างไม่ได้ใช้ ${orphanedItems.length} ไฟล์ ต้องการลบเพื่อคืนพื้นที่ Storage หรือไม่?`,
+          type: "danger",
+          icon: "bi-trash3-fill",
+          confirmText: `ลบ ${orphanedItems.length} ไฟล์`
+        });
+        if (!ok) return;
+
+        showToast(`⏳ กำลังลบไฟล์รูปภาพขยะ ${orphanedItems.length} ไฟล์ ออกจาก Firebase Storage...`);
+
+        let deletedCount = 0;
+        for (const itemRef of orphanedItems) {
+          try {
+            await deleteObject(itemRef);
+            deletedCount++;
+          } catch (delErr) {
+            console.warn(`Failed to delete orphaned storage item ${itemRef.fullPath}:`, delErr);
+          }
+        }
+
+        if (typeof logAuditAction === 'function') {
+          logAuditAction('STORAGE_CLEANUP', currentUser ? currentUser.displayName || currentUser.email : 'Admin', `สแกนและลบไฟล์รูปภาพขยะใน Firebase Storage จำนวน ${deletedCount} ไฟล์`);
+        }
+
+        alert(`🎉 ลบไฟล์รูปภาพขยะใน Firebase Storage เรียบร้อยแล้ว!\n\n• ลบไฟล์ขยะตกค้างสำเร็จ: ${deletedCount} ไฟล์\n• คืนพื้นที่ Storage ให้ระบบเรียบร้อยแล้วครับ`);
+        showToast(`🧹 ลบรูปภาพขยะ ${deletedCount} ไฟล์ เรียบร้อยแล้ว!`);
+
+      } catch (err) {
+        console.error("scanAndCleanupOrphanedStorageImages error:", err);
+        alert("เกิดข้อผิดพลาดในการสแกนไฟล์รูปภาพขยะ: " + err.message);
       }
     };
 
@@ -11400,28 +19882,38 @@
       if (!tbody) return;
 
       if (!categoriesList || categoriesList.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-3">ยังไม่มีหมวดหมู่อุปกรณ์</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="text-center text-muted py-3">ยังไม่มีหมวดหมู่อุปกรณ์</td></tr>`;
         return;
       }
 
       let html = '';
-      categoriesList.forEach(cat => {
+      categoriesList.forEach((cat, idx) => {
         const itemCount = equipmentList.filter(eq => eq.category === cat.name).length;
+        const catCode = cat.code || (cat.id && cat.id.startsWith('CAT-') ? cat.id : `CAT-${String(idx + 1).padStart(3, '0')}`);
+        const safeName = typeof escapeHtml === 'function' ? escapeHtml(cat.name || '') : (cat.name || '');
+        const safeLabel = typeof escapeHtml === 'function' ? escapeHtml(cat.label || '-') : (cat.label || '-');
+        const safePrefix = cat.prefix ? String(cat.prefix).toUpperCase() : '-';
 
         html += `
-          <tr>
-            <td class="text-center fs-5">${cat.icon || '📦'}</td>
-            <td class="fw-bold text-dark">${cat.name}</td>
-            <td class="text-secondary">${cat.label || '-'}</td>
-            <td class="text-center"><span class="badge bg-light text-dark border">${itemCount} รายการ</span></td>
-            <td class="text-end pe-3">
-              <button class="btn btn-sm btn-outline-primary rounded-circle me-1" title="แก้ไขหมวดหมู่" onclick="editCategory('${cat.id}')">
+          <tr id="category-row-${idx}">
+            <td class="text-center">
+              <button type="button" class="btn btn-sm btn-outline-primary rounded-circle me-1" title="แก้ไขหมวดหมู่" onclick="editCategoryByIndex(${idx})">
                 <i class="bi bi-pencil-fill"></i>
               </button>
-              <button class="btn btn-sm btn-outline-danger rounded-circle" title="ลบหมวดหมู่" onclick="deleteCategory('${cat.id}')">
+              <button type="button" class="btn btn-sm btn-outline-danger rounded-circle" title="ลบหมวดหมู่" onclick="deleteCategoryByIndex(${idx})">
                 <i class="bi bi-trash-fill"></i>
               </button>
             </td>
+            <td class="text-center fs-5">${cat.icon || '📦'}</td>
+            <td class="fw-bold text-dark">${safeName}</td>
+            <td class="text-center">
+              <span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 font-monospace fw-bold fs-7 px-2.5 py-1">
+                ${safePrefix}
+              </span>
+            </td>
+            <td class="text-secondary">${safeLabel}</td>
+            <td class="text-center"><span class="badge bg-light text-dark border">${itemCount} รายการ</span></td>
+            <td class="text-center"><span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 font-monospace fs-8 px-2 py-1">${catCode}</span></td>
           </tr>
         `;
       });
@@ -11432,51 +19924,172 @@
     window.handleSaveCategory = async function(e) {
       if (e) e.preventDefault();
 
-      const editId = document.getElementById('editCatId').value;
-      const name = document.getElementById('catNameInput').value.trim();
-      const icon = document.getElementById('catIconInput').value.trim();
-      const label = document.getElementById('catLabelInput').value.trim();
+      const editId = (document.getElementById('editCatId')?.value || '').trim();
+      const name = (document.getElementById('catNameInput')?.value || '').trim();
+      let prefix = (document.getElementById('catPrefixInput')?.value || '').trim().toUpperCase();
+      const icon = (document.getElementById('catIconInput')?.value || '').trim();
+      const label = (document.getElementById('catLabelInput')?.value || '').trim();
 
       if (!name) {
         showToast("กรุณาระบุชื่อหมวดหมู่");
         return;
       }
 
-      const existingIndex = categoriesList.findIndex(c => c.name.toLowerCase() === name.toLowerCase() && c.id !== editId);
+      const existingIndex = categoriesList.findIndex(c => 
+        c && c.name && c.name.toLowerCase() === name.toLowerCase() && 
+        c.id !== editId && c.code !== editId && c.name !== editId
+      );
       if (existingIndex !== -1) {
         showToast("ชื่อหมวดหมู่นี้มีอยู่แล้วในระบบ");
         return;
       }
 
+      // If prefix is empty, auto-generate guaranteed unique prefix
+      if (!prefix) {
+        prefix = window.generateUniqueCategoryPrefix(name, editId);
+      }
+      prefix = prefix.replace(/[^A-Z0-9]/g, '').slice(0, 4);
+      if (!prefix) prefix = 'EQ';
+
+      // Validate prefix uniqueness across categories (Must NOT duplicate)
+      const prefixConflict = categoriesList.find(c => 
+        c && c.prefix && c.prefix.toUpperCase() === prefix && 
+        c.id !== editId && c.code !== editId && c.name !== editId
+      );
+      if (prefixConflict) {
+        showToast(`⚠️ ตัวย่อรหัส "${prefix}" ถูกใช้งานแล้วในหมวดหมู่ "${prefixConflict.name}" กรุณาระบุตัวย่ออื่น`);
+        const prefixInputElem = document.getElementById('catPrefixInput');
+        if (prefixInputElem) {
+          prefixInputElem.focus();
+          prefixInputElem.select();
+        }
+        return;
+      }
+
       let oldName = null;
+      let targetCatId = editId;
+      let equipCodeUpdateCount = 0;
+
       if (editId) {
-        const catIdx = categoriesList.findIndex(c => c.id === editId);
+        const catIdx = categoriesList.findIndex(c => c && (c.id === editId || c.code === editId || c.name === editId));
         if (catIdx !== -1) {
           oldName = categoriesList[catIdx].name;
-          const catPrefix = getCategoryPrefix(name);
+          const oldPrefix = (categoriesList[catIdx].prefix || '').trim().toUpperCase();
+          const code = categoriesList[catIdx].code || (editId.startsWith('CAT-') ? editId : `CAT-${String(catIdx + 1).padStart(3, '0')}`);
+          const finalId = categoriesList[catIdx].id || code || editId;
+          targetCatId = finalId;
           categoriesList[catIdx] = {
             ...categoriesList[catIdx],
+            id: finalId,
+            code,
             name,
-            prefix: catPrefix,
+            prefix: prefix,
             icon: icon || '📦',
             label: label || name
           };
 
+          // 1. If Category Name changed, cascade update to equipment category fields
           if (oldName && oldName !== name) {
-            equipmentList.forEach(item => {
-              if (item.category === oldName) {
+            (equipmentList || []).forEach(item => {
+              if (item && item.category === oldName) {
                 item.category = name;
+                item.updatedAt = new Date().toISOString();
               }
             });
           }
+
+          // 2. If Category Prefix changed, cascade update all equipment item codes in this category
+          if (oldPrefix && prefix && oldPrefix !== prefix) {
+            const targetCategoryName = name;
+            const matchedEquipItems = (equipmentList || []).filter(item => 
+              item && (item.category === targetCategoryName || (oldName && item.category === oldName))
+            );
+
+            // Sort matched items to preserve sequence order
+            matchedEquipItems.sort((a, b) => {
+              const codeA = a.code ? String(a.code).trim().toUpperCase() : '';
+              const codeB = b.code ? String(b.code).trim().toUpperCase() : '';
+              const matchA = codeA.match(new RegExp(`^${oldPrefix}-(\\d+)$`, 'i'));
+              const matchB = codeB.match(new RegExp(`^${oldPrefix}-(\\d+)$`, 'i'));
+              const numA = matchA ? parseInt(matchA[1], 10) : null;
+              const numB = matchB ? parseInt(matchB[1], 10) : null;
+              if (numA !== null && numB !== null) return numA - numB;
+              if (numA !== null) return -1;
+              if (numB !== null) return 1;
+              return 0;
+            });
+
+            for (let i = 0; i < matchedEquipItems.length; i++) {
+              const item = matchedEquipItems[i];
+              const oldCode = item.code;
+              const oldItemId = item.id;
+
+              let numSuffix = String(i + 1).padStart(3, '0');
+              if (oldCode) {
+                const matchOld = String(oldCode).trim().match(new RegExp(`^${oldPrefix}-(\\d+)$`, 'i'));
+                if (matchOld) {
+                  numSuffix = matchOld[1].padStart(3, '0');
+                }
+              }
+
+              const newCode = `${prefix}-${numSuffix}`;
+              if (oldCode !== newCode || oldItemId !== newCode) {
+                item.code = newCode;
+                item.id = newCode;
+                item.updatedAt = new Date().toISOString();
+                equipCodeUpdateCount++;
+
+                // Cascade update transaction history references
+                if (Array.isArray(transactionHistory) && oldCode) {
+                  transactionHistory.forEach(tx => {
+                    if (tx && (tx.equipmentCode === oldCode || tx.equipmentId === oldItemId)) {
+                      tx.equipmentCode = newCode;
+                      tx.equipmentId = newCode;
+                    }
+                  });
+                }
+
+                // Sync Firestore equipment docs
+                if (isFirebaseReady && db) {
+                  try {
+                    if (oldItemId && oldItemId !== newCode) {
+                      await deleteDoc(doc(db, "equipment", oldItemId));
+                    }
+                    if (oldCode && oldCode !== newCode && oldCode !== oldItemId) {
+                      await deleteDoc(doc(db, "equipment", oldCode));
+                    }
+                    await setDoc(doc(db, "equipment", newCode), item, { merge: true });
+                  } catch (dbErr) {
+                    console.warn("Firestore equipment code fix error:", dbErr);
+                  }
+                }
+              }
+            }
+          }
         }
-        showToast("แก้ไขหมวดหมู่อุปกรณ์เรียบร้อยแล้ว");
+
+        if (equipCodeUpdateCount > 0) {
+          showToast(`✅ แก้ไขหมวดหมู่สำเร็จ และปรับปรุงรหัสอุปกรณ์ในหมวดนี้ทั้งหมด ${equipCodeUpdateCount} รายการเรียบร้อยแล้ว`);
+        } else {
+          showToast("แก้ไขหมวดหมู่อุปกรณ์เรียบร้อยแล้ว");
+        }
       } else {
-        const catPrefix = getCategoryPrefix(name);
+        let maxNum = 0;
+        categoriesList.forEach(c => {
+          const match = (c.code || c.id || '').match(/^CAT-(\d+)$/i);
+          if (match) {
+            const n = parseInt(match[1], 10);
+            if (n > maxNum) maxNum = n;
+          }
+        });
+        const nextNum = maxNum > 0 ? maxNum + 1 : (categoriesList.length + 1);
+        const catCode = `CAT-${String(nextNum).padStart(3, '0')}`;
+        targetCatId = catCode;
         const newCat = {
-          id: 'cat-' + Date.now(),
+          id: catCode,
+          code: catCode,
           name,
-          prefix: catPrefix,
+          prefix: prefix,
           icon: icon || '📦',
           label: label || name
         };
@@ -11488,11 +20101,19 @@
 
       if (isFirebaseReady && db) {
         try {
-          const catPrefix = getCategoryPrefix(name);
           if (editId) {
-            await setDoc(doc(db, "categories", editId), { id: editId, name, prefix: catPrefix, icon: icon || '📦', label: label || name }, { merge: true });
+            const found = categoriesList.find(c => c && (c.id === editId || c.code === editId || c.name === editId)) || {};
+            const saveDocId = targetCatId || editId;
+            await setDoc(doc(db, "categories", saveDocId), {
+              id: saveDocId,
+              code: found.code || saveDocId,
+              name,
+              prefix: prefix,
+              icon: icon || '📦',
+              label: label || name
+            }, { merge: true });
           } else {
-            const newCat = categoriesList[categoriesList.length - 1];
+            const newCat = categoriesList.find(c => c.id === targetCatId) || categoriesList[categoriesList.length - 1];
             if (newCat && newCat.id) {
               await setDoc(doc(db, "categories", newCat.id), newCat);
             }
@@ -11504,53 +20125,139 @@
 
       if (typeof logAuditAction === 'function') {
         const actionType = editId ? 'แก้ไข' : 'เพิ่ม';
-        const detailsText = editId ? `แก้ไขหมวดหมู่อุปกรณ์ "${name}"` : `เพิ่มหมวดหมู่อุปกรณ์ใหม่ "${name}"`;
-        logAuditAction('หมวดหมู่', actionType, detailsText, editId || (categoriesList[categoriesList.length - 1]?.id || ''));
+        const detailsText = editId ? `แก้ไขหมวดหมู่อุปกรณ์ "${name}" [ตัวย่อ: ${prefix}]` : `เพิ่มหมวดหมู่อุปกรณ์ใหม่ "${name}" [ตัวย่อ: ${prefix}]`;
+        logAuditAction('หมวดหมู่', actionType, detailsText, targetCatId || (categoriesList[categoriesList.length - 1]?.id || ''));
       }
 
       renderCategoryDropdowns();
       renderCategoryManagementList();
       renderCatalogGrid();
       renderStaffTable();
+      populateEquipmentDropdown();
+      populateQuickScanDropdown();
+      if (typeof updateStats === 'function') updateStats();
       resetCategoryForm();
     };
 
-    window.editCategory = function(catId) {
-      const cat = categoriesList.find(c => c.id === catId);
-      if (!cat) return;
+    window.editCategory = function(catId, index) {
+      let cat = null;
+      if (typeof index === 'number' && categoriesList[index]) {
+        cat = categoriesList[index];
+      } else if (catId) {
+        cat = categoriesList.find(c => c && (c.id === catId || c.code === catId || c.name === catId));
+      }
+      if (!cat) {
+        showToast("ไม่พบข้อมูลหมวดหมู่อุปกรณ์ที่ต้องการแก้ไข");
+        return;
+      }
 
-      document.getElementById('editCatId').value = cat.id;
-      document.getElementById('catNameInput').value = cat.name;
-      document.getElementById('catIconInput').value = cat.icon || '';
-      document.getElementById('catLabelInput').value = cat.label || '';
+      const activeId = cat.id || cat.code || cat.name;
+      const editCatIdElem = document.getElementById('editCatId');
+      const catNameInputElem = document.getElementById('catNameInput');
+      const catPrefixInputElem = document.getElementById('catPrefixInput');
+      const catIconInputElem = document.getElementById('catIconInput');
+      const catLabelInputElem = document.getElementById('catLabelInput');
 
-      document.getElementById('catFormHeader').innerHTML = '<i class="bi bi-pencil-square me-1"></i> แก้ไขหมวดหมู่อุปกรณ์';
-      document.getElementById('btnSaveCat').innerHTML = '<i class="bi bi-check-lg me-1"></i> บันทึกการแก้ไข';
-      document.getElementById('btnCancelEditCat').classList.remove('d-none');
+      if (editCatIdElem) editCatIdElem.value = activeId;
+      if (catNameInputElem) catNameInputElem.value = cat.name || '';
+      if (catPrefixInputElem) {
+        catPrefixInputElem.value = cat.prefix || '';
+        delete catPrefixInputElem.dataset.autoGenerated;
+      }
+      if (catIconInputElem) catIconInputElem.value = cat.icon || '';
+      if (catLabelInputElem) catLabelInputElem.value = cat.label || '';
+
+      const headerElem = document.getElementById('catFormHeader');
+      if (headerElem) {
+        const safeName = typeof escapeHtml === 'function' ? escapeHtml(cat.name) : cat.name;
+        headerElem.innerHTML = `<i class="bi bi-pencil-square text-primary me-1"></i> แก้ไขหมวดหมู่: <span class="text-primary fw-bold">${safeName}</span>`;
+      }
+      const saveBtn = document.getElementById('btnSaveCat');
+      if (saveBtn) {
+        saveBtn.innerHTML = '<i class="bi bi-check-lg me-1"></i> บันทึก';
+      }
+
+      // Highlight active row in table
+      document.querySelectorAll('#categoryTableBody tr').forEach(r => r.classList.remove('table-warning'));
+      const activeRow = (typeof index === 'number') ? document.getElementById(`category-row-${index}`) : null;
+      if (activeRow) {
+        activeRow.classList.add('table-warning');
+      }
+
+      // Smooth scroll to form and focus input
+      const formCard = document.getElementById('categoryForm')?.closest('.card') || document.getElementById('categoryForm');
+      if (formCard) {
+        formCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        formCard.classList.add('border-primary', 'shadow');
+        setTimeout(() => {
+          formCard.classList.remove('border-primary', 'shadow');
+        }, 1500);
+      }
+
+      if (catNameInputElem) {
+        catNameInputElem.focus();
+        catNameInputElem.select();
+      }
+
+      showToast(`✏️ ดึงข้อมูลหมวดหมู่ "${cat.name}" เรียบร้อยแล้ว กรุณาแก้ไขข้อมูลด้านบนแล้วกดบันทึก`, {
+        title: "แก้ไขด้านบน",
+        type: "primary",
+        icon: "bi-pencil-square"
+      });
+    };
+
+    window.editCategoryByIndex = function(idx) {
+      editCategory(null, idx);
     };
 
     window.resetCategoryForm = function() {
-      document.getElementById('editCatId').value = '';
-      document.getElementById('catNameInput').value = '';
-      document.getElementById('catIconInput').value = '';
-      document.getElementById('catLabelInput').value = '';
+      const editCatIdElem = document.getElementById('editCatId');
+      const catNameInputElem = document.getElementById('catNameInput');
+      const catPrefixInputElem = document.getElementById('catPrefixInput');
+      const catIconInputElem = document.getElementById('catIconInput');
+      const catLabelInputElem = document.getElementById('catLabelInput');
 
-      document.getElementById('catFormHeader').innerHTML = '<i class="bi bi-plus-circle me-1"></i> เพิ่มหมวดหมู่อุปกรณ์ใหม่';
-      document.getElementById('btnSaveCat').innerHTML = '<i class="bi bi-check-lg me-1"></i> บันทึก';
-      document.getElementById('btnCancelEditCat').classList.add('d-none');
+      if (editCatIdElem) editCatIdElem.value = '';
+      if (catNameInputElem) catNameInputElem.value = '';
+      if (catPrefixInputElem) {
+        catPrefixInputElem.value = '';
+        delete catPrefixInputElem.dataset.autoGenerated;
+      }
+      if (catIconInputElem) catIconInputElem.value = '';
+      if (catLabelInputElem) catLabelInputElem.value = '';
+
+      const headerElem = document.getElementById('catFormHeader');
+      if (headerElem) {
+        headerElem.innerHTML = '<i class="bi bi-plus-circle me-1"></i> เพิ่มหมวดหมู่อุปกรณ์ใหม่';
+      }
+      const saveBtn = document.getElementById('btnSaveCat');
+      if (saveBtn) {
+        saveBtn.innerHTML = '<i class="bi bi-check-lg me-1"></i> บันทึก';
+      }
+      document.querySelectorAll('#categoryTableBody tr').forEach(r => r.classList.remove('table-warning'));
     };
 
-    window.deleteCategory = async function(catId) {
-      const cat = categoriesList.find(c => c.id === catId);
+    window.deleteCategory = async function(catId, index) {
+      let cat = null;
+      if (typeof index === 'number' && categoriesList[index]) {
+        cat = categoriesList[index];
+      } else if (catId) {
+        cat = categoriesList.find(c => c && (c.id === catId || c.code === catId || c.name === catId));
+      }
       if (!cat) return;
 
       const affectedItems = equipmentList.filter(eq => eq.category === cat.name);
-      let confirmMsg = `คุณต้องการลบหมวดหมู่ "${cat.name}" ใช่หรือไม่?`;
-      if (affectedItems.length > 0) {
-        confirmMsg += `\n\n(มีอุปกรณ์ ${affectedItems.length} รายการที่ใช้หมวดหมู่นี้ อุปกรณ์ทั้งหมดจะถูกเปลี่ยนหมวดหมู่เป็น 'อุปกรณ์เซฟตี้และทั่วไป')`;
-      }
+      let confirmMsg = affectedItems.length > 0
+        ? `ต้องการลบหมวดหมู่ "${cat.name}" หรือไม่? (อุปกรณ์ ${affectedItems.length} รายการจะถูกย้ายไปหมวดทั่วไป)`
+        : `ต้องการลบหมวดหมู่อุปกรณ์ "${cat.name}" ใช่หรือไม่?`;
 
-      if (!confirm(confirmMsg)) return;
+      const ok = await window.showConfirmDialog({
+        title: "ลบหมวดหมู่อุปกรณ์",
+        message: confirmMsg,
+        type: "danger",
+        confirmText: "ลบหมวดหมู่"
+      });
+      if (!ok) return;
 
       if (affectedItems.length > 0) {
         const fallbackCategory = categoriesList.find(c => c.name !== cat.name)?.name || 'อุปกรณ์เซฟตี้และทั่วไป';
@@ -11561,19 +20268,20 @@
         });
       }
 
-      categoriesList = categoriesList.filter(c => c.id !== catId);
+      const targetDeleteId = cat.id || cat.code || cat.name;
+      categoriesList = categoriesList.filter(c => c !== cat && c.id !== targetDeleteId && c.name !== cat.name);
       saveToLocalStorage();
 
       if (isFirebaseReady && db) {
         try {
-          await deleteDoc(doc(db, "categories", catId));
+          await deleteDoc(doc(db, "categories", targetDeleteId));
         } catch (err) {
           console.warn("Firestore category delete error:", err);
         }
       }
 
       if (typeof logAuditAction === 'function') {
-        logAuditAction('หมวดหมู่', 'ลบ', `ลบหมวดหมู่อุปกรณ์ "${cat.name}"`, catId);
+        logAuditAction('หมวดหมู่', 'ลบ', `ลบหมวดหมู่อุปกรณ์ "${cat.name}"`, targetDeleteId);
       }
 
       showToast(`ลบหมวดหมู่ "${cat.name}" เรียบร้อยแล้ว`);
@@ -11584,18 +20292,24 @@
       resetCategoryForm();
     };
 
+    window.deleteCategoryByIndex = function(idx) {
+      deleteCategory(null, idx);
+    };
+
     // ==========================================
     // DATABASE MANAGER & INSPECTOR LOGIC
     // ==========================================
     let currentDbCollection = 'equipment';
 
     window.canAccessDatabaseEditor = function() {
-      const isRoleAdmin = (typeof currentRole !== 'undefined' && currentRole === 'ADMIN');
+      if (typeof window.isThammaSrithongAdminStrict === 'function') {
+        return window.isThammaSrithongAdminStrict();
+      }
       const email = ((typeof currentAuthUser !== 'undefined' && currentAuthUser?.email) || (typeof currentUserProfile !== 'undefined' && currentUserProfile?.email) || '').trim().toLowerCase();
-      
-      if (isRoleAdmin) return true;
-      if (email === 'jaru072@gmail.com') return true;
-      return false;
+      const displayName = ((typeof currentAuthUser !== 'undefined' && currentAuthUser?.displayName) || (typeof currentUserProfile !== 'undefined' && currentUserProfile?.displayName) || '').trim().toLowerCase();
+      const isEmailMatch = email === 'jaru072@gmail.com';
+      const isNameMatch = displayName.includes('thamma') || displayName.includes('srithong') || displayName.includes('ธรรมะ') || displayName.includes('ศรีทอง');
+      return isEmailMatch || (isNameMatch && (typeof currentRole !== 'undefined' && currentRole === 'ADMIN'));
     };
 
     window.updateDbEditorMenuVisibility = function() {
@@ -11684,6 +20398,11 @@
       currentDbCollection = coll;
       updateDbBadges();
 
+      const addRecordButton = document.getElementById('dbAddRecordButton');
+      if (addRecordButton) {
+        addRecordButton.classList.toggle('d-none', coll === 'employees');
+      }
+
       ['equipment', 'employees', 'transactions', 'attendance', 'categories'].forEach(c => {
         const pill = document.getElementById(`pill-${c}`);
         if (pill) {
@@ -11746,7 +20465,7 @@
           rowsHtml += `
             <tr>
               <td class="ps-3 font-monospace fw-bold"><span class="badge bg-dark">${eq.code || eq.id}</span></td>
-              <td><img src="${eq.imageUrl || 'https://images.unsplash.com/photo-1416879595882-3373a0480b5b?w=100&auto=format&fit=crop&q=80'}" class="rounded-3 border shadow-sm" style="width: 42px; height: 42px; object-fit: cover;" /></td>
+              <td><img src="${eq.imageUrl || 'https://images.unsplash.com/photo-1416879595882-3373a0480b5b?w=100&auto=format&fit=crop&q=80'}" loading="lazy" class="rounded-3 border shadow-sm" style="width: 42px; height: 42px; object-fit: cover;" /></td>
               <td>
                 <div class="fw-bold text-dark">${eq.name}</div>
                 <div class="fs-8 text-muted">${eq.description || 'ไม่มีคำอธิบาย'}</div>
@@ -11786,7 +20505,7 @@
           <th>แผนก / ตำแหน่ง</th>
           <th>สิทธิ์ใช้งาน</th>
           <th>เบอร์โทรศัพท์</th>
-          <th class="text-end pe-3">จัดการ</th>
+          <th class="text-end pe-3">สถานะ</th>
         `;
 
         items.forEach(emp => {
@@ -11796,7 +20515,7 @@
           rowsHtml += `
             <tr>
               <td class="ps-3 font-monospace fw-bold"><span class="badge bg-dark">${emp.id}</span></td>
-              <td><img src="${emp.photoUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80'}" class="rounded-circle border shadow-sm" style="width: 40px; height: 40px; object-fit: cover;" /></td>
+              <td><img src="${emp.photoUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80'}" loading="lazy" class="rounded-circle border shadow-sm" style="width: 40px; height: 40px; object-fit: cover;" /></td>
               <td>
                 <div class="fw-bold text-dark">${formatEmpName(emp)}</div>
                 <div class="fs-8 text-muted">${emp.email || '-'}</div>
@@ -11808,12 +20527,9 @@
               <td>${roleBadge}</td>
               <td class="fs-8 text-muted">${emp.phone || '-'}</td>
               <td class="text-end pe-3">
-                <button class="btn btn-sm btn-outline-primary rounded-pill px-2.5 py-1 fw-semibold me-1 fs-8" onclick="openDbRecordEditModal('employees', '${emp.id}')">
-                  <i class="bi bi-pencil-square me-1"></i>แก้ไข
-                </button>
-                <button class="btn btn-sm btn-outline-danger rounded-pill px-2 py-1 fs-8" onclick="deleteDbRecord('employees', '${emp.id}')" title="ลบพนักงานท่านนี้">
-                  <i class="bi bi-trash"></i>
-                </button>
+                <span class="badge bg-secondary bg-opacity-10 text-secondary border rounded-pill px-2 py-1">
+                  <i class="bi bi-eye me-1"></i>ดูอย่างเดียว
+                </span>
               </td>
             </tr>
           `;
@@ -11965,10 +20681,13 @@
     };
 
     window.openAddNewDbRecordModal = function() {
+      if (MAIN_STOCK_ONLY_MODE && (currentDbCollection === 'employees' || currentDbCollection === 'attendance')) {
+        return blockMainPersonnelMutation(currentDbCollection === 'employees' ? 'เพิ่มข้อมูลบุคลากร' : 'เพิ่มข้อมูลลงเวลา');
+      }
       if (currentDbCollection === 'equipment') {
         openAddEquipmentModal();
       } else if (currentDbCollection === 'employees') {
-        openAddEmployeeModal();
+        return blockMainPersonnelMutation('เพิ่มข้อมูลบุคลากร');
       } else if (currentDbCollection === 'categories') {
         openCategoryModal();
       } else {
@@ -11977,6 +20696,9 @@
     };
 
     window.openDbRecordEditModal = function(coll, recordId) {
+      if (MAIN_STOCK_ONLY_MODE && (coll === 'employees' || coll === 'attendance')) {
+        return blockMainPersonnelMutation(coll === 'employees' ? 'แก้ไขข้อมูลบุคลากร' : 'แก้ไขข้อมูลลงเวลา');
+      }
       document.getElementById('dbEditTargetColl').value = coll;
       document.getElementById('dbEditTargetId').value = recordId;
 
@@ -12058,6 +20780,10 @@
     window.saveDbRecordFromModal = async function() {
       const coll = document.getElementById('dbEditTargetColl').value;
       const recordId = document.getElementById('dbEditTargetId').value;
+
+      if (MAIN_STOCK_ONLY_MODE && (coll === 'employees' || coll === 'attendance')) {
+        return blockMainPersonnelMutation(coll === 'employees' ? 'แก้ไขข้อมูลบุคลากร' : 'แก้ไขข้อมูลลงเวลา');
+      }
 
       const fieldInputs = document.querySelectorAll('.db-edit-field');
       const updatedData = {};
@@ -12149,7 +20875,16 @@
     };
 
     window.deleteDbRecord = async function(coll, recordId) {
-      if (!confirm(`คุณแน่ใจหรือไม่ว่าต้องการลบรายการข้อมูล ID: ${recordId} ออกจากฐานข้อมูล?`)) return;
+      if (MAIN_STOCK_ONLY_MODE && (coll === 'employees' || coll === 'attendance')) {
+        return blockMainPersonnelMutation(coll === 'employees' ? 'ลบข้อมูลบุคลากร' : 'ลบข้อมูลลงเวลา');
+      }
+      const ok = await window.showConfirmDialog({
+        title: "ลบข้อมูลจากฐานข้อมูล",
+        message: `ต้องการลบข้อมูล ID: "${recordId}" ออกจากระบบใช่หรือไม่?`,
+        type: "danger",
+        confirmText: "ลบข้อมูล"
+      });
+      if (!ok) return;
 
       if (coll === 'equipment') {
         await window.deleteEquipment(recordId, true);
@@ -12191,6 +20926,26 @@
         if (typeof logAuditAction === 'function') {
           logAuditAction('หมวดหมู่', 'ลบ', `ลบหมวดหมู่อุปกรณ์ "${catName}" [${recordId}] จากหน้าจัดการฐานข้อมูล`, recordId);
         }
+      } else if (coll === 'departments') {
+        const dObj = (departmentsList || []).find((d) => (typeof d === 'string' ? d === recordId : d.id === recordId));
+        const dName = typeof dObj === 'string' ? dObj : (dObj ? dObj.name : recordId);
+        departmentsList = (departmentsList || []).filter(d => (typeof d === 'string' ? d !== dName && d !== recordId : d.id !== recordId && d.name !== dName));
+        if (isFirebaseReady && db) { try { await deleteDoc(doc(db, "departments", recordId)); } catch(e){} }
+        populateDepartmentDropdowns();
+        if (typeof renderDepartmentsListModal === 'function') renderDepartmentsListModal();
+        if (typeof logAuditAction === 'function') {
+          logAuditAction('แผนก', 'ลบ', `ลบแผนก "${dName}" [${recordId}] จากหน้าจัดการฐานข้อมูล`, recordId);
+        }
+      } else if (coll === 'locations') {
+        const lObj = (locationsList || []).find((l) => (typeof l === 'string' ? l === recordId : l.id === recordId));
+        const lName = typeof lObj === 'string' ? lObj : (lObj ? lObj.name : recordId);
+        locationsList = (locationsList || []).filter(l => (typeof l === 'string' ? l !== lName && l !== recordId : l.id !== recordId && l.name !== lName));
+        if (isFirebaseReady && db) { try { await deleteDoc(doc(db, "locations", recordId)); } catch(e){} }
+        populateLocationDropdowns();
+        if (typeof renderLocationsListModal === 'function') renderLocationsListModal();
+        if (typeof logAuditAction === 'function') {
+          logAuditAction('สถานที่จัดเก็บ', 'ลบ', `ลบสถานที่จัดเก็บ "${lName}" [${recordId}] จากหน้าจัดการฐานข้อมูล`, recordId);
+        }
       }
 
       saveToLocalStorage();
@@ -12200,24 +20955,48 @@
     };
 
     async function seedCollectionIfEmpty(collName, list) {
-      if (!isFirebaseReady || !db || !Array.isArray(list) || list.length === 0) return;
-      try {
-        for (const item of list) {
-          if (item && item.id) {
-            await setDoc(doc(db, collName, item.id), item, { merge: true });
-          }
-        }
-      } catch (e) {
-        console.warn(`Seeding ${collName} notice:`, e);
-      }
+      // Safe no-op: Automatic background database seeding is disabled to prevent overwriting cloud records.
+      return;
     }
 
-    async function setupFirestoreListeners() {
-      if (!isFirebaseReady || !db) return;
+    let isInitialFetchCompleted = false;
+    let isListenersAttached = false;
 
+    async function fetchInitialFirestoreData(isRetry = false) {
+      if (!isFirebaseReady || !db) return;
       try {
-        onSnapshot(collection(db, "employees"), async (snapshot) => {
-          if (window.isRestoringDatabase) return;
+        // 0. Ensure system_settings & Admin profile exist in Firestore
+        try {
+          const settingsRef = doc(db, "system_settings", "general");
+          const setSnap = await getDoc(settingsRef);
+          if (!setSnap.exists()) {
+            await setDoc(settingsRef, {
+              organizationName: "โครงการรัตนบุปผา และผลิตดอกไม้ธรรมยาตรา",
+              projectName: "โครงการรัตนบุปผา และผลิตดอกไม้ธรรมยาตรา",
+              projectTitle: "โครงการรัตนบุปผา และผลิตดอกไม้ธรรมยาตรา",
+              updatedAt: new Date().toISOString()
+            }, { merge: true });
+          }
+        } catch (eSet) {
+          console.warn("System settings auto-seed notice:", eSet);
+        }
+        if (typeof window.ensureAdminUserInUsersCollection === 'function') {
+          window.ensureAdminUserInUsersCollection();
+        }
+
+        const [empSnap, catSnap, eqSnap, txSnap, deptSnap, locSnap, posSnap] = await Promise.allSettled([
+          getDocs(collection(db, "employees")),
+          getDocs(collection(db, "categories")),
+          getDocs(collection(db, "equipment")),
+          getDocs(collection(db, "transactions")),
+          getDocs(collection(db, "departments")),
+          getDocs(collection(db, "locations")),
+          getDocs(collection(db, "positions"))
+        ]);
+
+        let hasData = false;
+
+        if (empSnap.status === 'fulfilled' && !empSnap.value.empty) {
           const deptMap = {
             "เจ้าหน้าที่สำนักงาน (Staff)": "แผนกงานธุรการ",
             "แผนกเรือนกระจกและเพาะชำ": "แผนกงานทดลอง",
@@ -12228,21 +21007,246 @@
             "แผนกดูแลไม้ดอก (Rose & Tulip)": "แผนกทีมกุหลาบ",
             "แผนกไม้ประดับใบ (Indoor Flora)": "แผนกงานทดลอง"
           };
-
-          if (snapshot.empty) {
-            employeeList = [];
-          } else {
-            employeeList = snapshot.docs.map(d => {
-              const data = d.data();
-              let updatedDept = data.department;
-              if (deptMap[data.department]) {
-                updatedDept = deptMap[data.department];
-                try { updateDoc(doc(db, "employees", d.id), { department: updatedDept }); } catch(e){}
-              }
-              return { id: d.id, ...data, department: updatedDept };
-            });
+          employeeList = empSnap.value.docs.map(d => {
+            const data = d.data();
+            let updatedDept = data.department;
+            if (deptMap[data.department]) {
+              updatedDept = deptMap[data.department];
+            }
+            return { id: d.id, ...data, department: updatedDept };
+          });
+          renderEmployeeDirectory();
+          populateEmployeeDropdowns();
+          renderStaffTable();
+          hasData = true;
+        } else if (empSnap.status === 'fulfilled' && empSnap.value.empty) {
+          if (!employeeList || employeeList.length === 0) {
+            const savedEmps = getScopedLocalStorageItem('flora_employees') || localStorage.getItem('flora_employees');
+            if (savedEmps) {
+              try {
+                const parsed = JSON.parse(savedEmps);
+                if (Array.isArray(parsed) && parsed.length > 0) employeeList = parsed;
+              } catch(e){}
+            }
           }
+          renderEmployeeDirectory();
+          populateEmployeeDropdowns();
+          renderStaffTable();
+          hasData = true;
+        }
+
+        if (catSnap.status === 'fulfilled' && !catSnap.value.empty) {
+          const fsCatsMap = new Map();
+          for (const d of catSnap.value.docs) {
+            const data = d.data() || {};
+            const officialCode = (data.code || data.id || d.id || '').trim();
+            const catName = (data.name || '').trim();
+            const item = { ...data, id: officialCode || d.id, code: officialCode || d.id, name: catName || officialCode };
+            const mapKey = (item.code || item.id || item.name).toLowerCase();
+            if (!fsCatsMap.has(mapKey)) {
+              fsCatsMap.set(mapKey, item);
+            }
+          }
+          const fsCats = Array.from(fsCatsMap.values());
+          fsCats.sort((a, b) => {
+            const numA = parseInt(((a.code || a.id || '').match(/^CAT-(\d+)$/i) || [0, 999999])[1], 10);
+            const numB = parseInt(((b.code || b.id || '').match(/^CAT-(\d+)$/i) || [0, 999999])[1], 10);
+            if (numA !== numB) return numA - numB;
+            return (a.name || '').localeCompare(b.name || '', 'th');
+          });
+          categoriesList = fsCats;
+          renderCategoryDropdowns();
+          renderCategoryManagementList();
+          hasData = true;
+        } else if (catSnap.status === 'fulfilled' && catSnap.value.empty) {
+          categoriesList = [];
+          renderCategoryDropdowns();
+          renderCategoryManagementList();
+          hasData = true;
+        }
+
+        if (eqSnap.status === 'fulfilled' && !eqSnap.value.empty) {
+          const fsEquipMap = new Map();
+          for (const d of eqSnap.value.docs) {
+            const data = d.data() || {};
+            const expectedCode = (data.code || d.id || '').trim();
+            const item = { ...data, id: expectedCode || d.id, code: expectedCode || d.id };
+            if (item.minQuantity === undefined || item.minQuantity === null) {
+              item.minQuantity = 3;
+            }
+            const mapKey = (item.code || item.id).toLowerCase();
+            if (!fsEquipMap.has(mapKey)) {
+              fsEquipMap.set(mapKey, item);
+            }
+          }
+          const fsEquip = Array.from(fsEquipMap.values());
+          fsEquip.sort((a, b) => {
+            const codeA = (a.code || a.id || '').toString();
+            const codeB = (b.code || b.id || '').toString();
+            return codeA.localeCompare(codeB, undefined, { numeric: true, sensitivity: 'base' });
+          });
+          equipmentList = fsEquip;
+          renderCatalogGrid();
+          renderStaffTable();
+          populateEquipmentDropdown();
+          populateQuickScanDropdown();
+          hasData = true;
+        } else if (eqSnap.status === 'fulfilled' && eqSnap.value.empty) {
+          equipmentList = [];
+          renderCatalogGrid();
+          renderStaffTable();
+          populateEquipmentDropdown();
+          populateQuickScanDropdown();
+          hasData = true;
+        }
+
+        if (txSnap.status === 'fulfilled' && !txSnap.value.empty) {
+          const list = txSnap.value.docs.map(d => ({ id: d.id, ...d.data() }));
+          list.sort((a, b) => {
+            const timeA = getRecordTimestampMs(a);
+            const timeB = getRecordTimestampMs(b);
+            return timeB - timeA;
+          });
+          transactionHistory = list;
+          renderHistoryTable();
+          hasData = true;
+        }
+
+        if (deptSnap.status === 'fulfilled' && !deptSnap.value.empty) {
+          const deptMap = new Map();
+          for (const dSnap of deptSnap.value.docs) {
+            const data = dSnap.data() || {};
+            const name = (data.name || dSnap.id || '').trim();
+            const officialCode = (data.code || data.id || dSnap.id || '').trim();
+            if (name) {
+              const key = name.toLowerCase();
+              if (!deptMap.has(key)) {
+                deptMap.set(key, { id: officialCode || dSnap.id, code: officialCode || dSnap.id, name });
+              }
+            }
+          }
+          const validDocs = Array.from(deptMap.values());
+          validDocs.sort((a, b) => {
+            const numA = parseInt(((a.code || a.id).match(/^DEP-(\d+)$/i) || [0, 999999])[1], 10);
+            const numB = parseInt(((b.code || b.id).match(/^DEP-(\d+)$/i) || [0, 999999])[1], 10);
+            if (numA !== numB) return numA - numB;
+            return a.name.localeCompare(b.name, 'th');
+          });
+          departmentsList = validDocs.map(d => d.name);
+          populateDepartmentDropdowns();
+          hasData = true;
+        } else if (deptSnap.status === 'fulfilled' && deptSnap.value.empty) {
+          departmentsList = [];
+          populateDepartmentDropdowns();
+          hasData = true;
+        }
+
+        if (locSnap.status === 'fulfilled' && !locSnap.value.empty) {
+          const locMap = new Map();
+          for (const dSnap of locSnap.value.docs) {
+            const data = dSnap.data() || {};
+            const name = (data.name || dSnap.id || '').trim();
+            const officialCode = (data.code || data.id || dSnap.id || '').trim();
+            if (name) {
+              const key = name.toLowerCase();
+              if (!locMap.has(key)) {
+                locMap.set(key, { id: officialCode || dSnap.id, code: officialCode || dSnap.id, name });
+              }
+            }
+          }
+          const locDocs = Array.from(locMap.values());
+          locDocs.sort((a, b) => {
+            const numA = parseInt(((a.code || a.id || '').match(/^LOC-(\d+)$/i) || [0, 999999])[1], 10);
+            const numB = parseInt(((b.code || b.id || '').match(/^LOC-(\d+)$/i) || [0, 999999])[1], 10);
+            if (numA !== numB) return numA - numB;
+            return (a.name || a.id).localeCompare((b.name || b.id), 'th');
+          });
+          locationsList = locDocs.map(d => (d.name || d.id)).filter(Boolean);
+          populateLocationDropdowns();
+          hasData = true;
+        } else if (locSnap.status === 'fulfilled' && locSnap.value.empty) {
+          locationsList = [];
+          populateLocationDropdowns();
+          hasData = true;
+        }
+
+        if (posSnap.status === 'fulfilled') {
+          if (!posSnap.value.empty) {
+            const posMap = new Map();
+            defaultPositionsList.forEach(p => posMap.set(p.name.toLowerCase(), p));
+            for (const dSnap of posSnap.value.docs) {
+              const data = dSnap.data() || {};
+              const name = (data.name || dSnap.id || '').trim();
+              const officialCode = (data.code || data.id || dSnap.id || '').trim();
+              const group = data.group || 'ตำแหน่งทั่วไป';
+              const order = data.order || 999;
+              if (name) {
+                const key = name.toLowerCase();
+                posMap.set(key, { id: officialCode || dSnap.id, code: officialCode || dSnap.id, name, group, order });
+              }
+            }
+            const posDocs = Array.from(posMap.values());
+            posDocs.sort((a, b) => {
+              const numA = parseInt(((a.code || a.id || '').match(/^POS-(\d+)$/i) || [0, 999999])[1], 10);
+              const numB = parseInt(((b.code || b.id || '').match(/^POS-(\d+)$/i) || [0, 999999])[1], 10);
+              if (numA !== numB) return numA - numB;
+              return (a.order || 0) - (b.order || 0);
+            });
+            positionsList = posDocs;
+            populatePositionDropdowns();
+            hasData = true;
+          } else {
+            positionsList = [];
+            populatePositionDropdowns();
+            hasData = true;
+          }
+        }
+
+        if (hasData) {
           saveToLocalStorage();
+          updateStats();
+        }
+
+        isInitialFetchCompleted = true;
+      } catch (err) {
+        console.warn("Direct Firestore fetch notice:", err);
+        if (!isRetry) {
+          setTimeout(() => fetchInitialFirestoreData(true), 2000);
+        }
+      }
+    }
+
+    async function setupFirestoreListeners() {
+      if (!isFirebaseReady || !db) return;
+      if (isListenersAttached) return;
+      isListenersAttached = true;
+
+      if (typeof window.floraLogo?.connectGlobalLogoFirestore === 'function' && db) {
+        window.floraLogo.connectGlobalLogoFirestore({ db, doc, setDoc, onSnapshot, getDoc, getDocs, collection, deleteDoc });
+      }
+      if (typeof window.connectOrgTreeFirestore === 'function' && db) {
+        window.connectOrgTreeFirestore({ db, doc, setDoc, onSnapshot, getDoc, getDocs, collection, deleteDoc });
+      }
+
+      // Trigger parallel direct fetch to ensure data lands immediately
+      fetchInitialFirestoreData();
+
+      try {
+        onSnapshot(collection(db, "employees"), (snapshot) => {
+          if (snapshot.empty) {
+            if (!employeeList || employeeList.length === 0) {
+              const savedEmps = getScopedLocalStorageItem('flora_employees') || localStorage.getItem('flora_employees');
+              if (savedEmps) {
+                try {
+                  const parsed = JSON.parse(savedEmps);
+                  if (Array.isArray(parsed) && parsed.length > 0) employeeList = parsed;
+                } catch(e){}
+              }
+            }
+          } else {
+            employeeList = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+            saveToLocalStorage();
+          }
           renderEmployeeDirectory();
           populateEmployeeDropdowns();
           renderStaffTable();
@@ -12251,25 +21255,47 @@
           console.warn("Firestore employees sync notice:", err.message);
         });
 
-        onSnapshot(collection(db, "attendance"), async (snapshot) => {
-          if (window.isRestoringDatabase) return;
-          if (snapshot.empty) {
-            attendanceLogs = [];
-          } else {
-            attendanceLogs = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-          }
-          saveToLocalStorage();
-          renderAttendanceTable();
+        onSnapshot(collection(db, "deleted_employees"), (snapshot) => {
+          deletedEmployees = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
         }, (err) => {
-          console.warn("Firestore attendance sync notice:", err.message);
+          console.warn("Firestore deleted employees sync notice:", err.message);
         });
 
         onSnapshot(collection(db, "categories"), async (snapshot) => {
-          if (window.isRestoringDatabase) return;
           if (snapshot.empty) {
-            categoriesList = [...defaultCategoriesList];
+            categoriesList = [];
           } else {
-            categoriesList = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+            const fsCatsMap = new Map();
+            for (const d of snapshot.docs) {
+              const data = d.data() || {};
+              const officialCode = (data.code || data.id || d.id || '').trim();
+              const catName = (data.name || '').trim();
+              const item = { ...data, id: officialCode || d.id, code: officialCode || d.id, name: catName || officialCode };
+
+              // Auto-migrate legacy Firestore documents where document ID !== category code
+              if (isFirebaseReady && db && officialCode && d.id !== officialCode) {
+                try {
+                  await setDoc(doc(db, "categories", officialCode), item, { merge: true });
+                  await deleteDoc(d.ref);
+                } catch(migErr) {
+                  console.warn("Auto migrate category docId to code notice:", migErr);
+                }
+              }
+
+              const mapKey = (item.code || item.id || item.name).toLowerCase();
+              if (!fsCatsMap.has(mapKey)) {
+                fsCatsMap.set(mapKey, item);
+              }
+            }
+
+            const fsCats = Array.from(fsCatsMap.values());
+            fsCats.sort((a, b) => {
+              const numA = parseInt(((a.code || a.id || '').match(/^CAT-(\d+)$/i) || [0, 999999])[1], 10);
+              const numB = parseInt(((b.code || b.id || '').match(/^CAT-(\d+)$/i) || [0, 999999])[1], 10);
+              if (numA !== numB) return numA - numB;
+              return (a.name || '').localeCompare(b.name || '', 'th');
+            });
+            categoriesList = fsCats;
           }
           saveToLocalStorage();
           renderCategoryDropdowns();
@@ -12280,16 +21306,36 @@
         });
 
         onSnapshot(collection(db, "equipment"), async (snapshot) => {
-          if (window.isRestoringDatabase) return;
           if (snapshot.empty) {
             equipmentList = [];
           } else {
-            const fsEquip = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-            fsEquip.forEach(item => {
+            const fsEquipMap = new Map();
+            for (const d of snapshot.docs) {
+              const data = d.data() || {};
+              const expectedCode = (data.code || d.id || '').trim();
+              const item = { ...data, id: expectedCode || d.id, code: expectedCode || d.id };
               if (item.minQuantity === undefined || item.minQuantity === null) {
                 item.minQuantity = 3;
               }
-            });
+
+              // Auto-migrate legacy Firestore documents where document ID !== equipment code
+              if (isFirebaseReady && db && expectedCode && d.id !== expectedCode) {
+                try {
+                  const newDocData = { ...item, id: expectedCode, code: expectedCode };
+                  await setDoc(doc(db, "equipment", expectedCode), newDocData, { merge: true });
+                  await deleteDoc(d.ref);
+                } catch(migErr) {
+                  console.warn("Auto migrate equipment docId to code notice:", migErr);
+                }
+              }
+
+              const mapKey = (item.code || item.id).toLowerCase();
+              if (!fsEquipMap.has(mapKey)) {
+                fsEquipMap.set(mapKey, item);
+              }
+            }
+
+            const fsEquip = Array.from(fsEquipMap.values());
             fsEquip.sort((a, b) => {
               const codeA = (a.code || a.id || '').toString();
               const codeB = (b.code || b.id || '').toString();
@@ -12308,8 +21354,9 @@
         });
 
         onSnapshot(collection(db, "transactions"), (snapshot) => {
-          if (window.isRestoringDatabase) return;
-          if (!snapshot.empty) {
+          if (snapshot.empty) {
+            transactionHistory = [];
+          } else {
             const list = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
             list.sort((a, b) => {
               const timeA = getRecordTimestampMs(a);
@@ -12317,50 +21364,43 @@
               return timeB - timeA;
             });
             transactionHistory = list;
-            saveToLocalStorage();
-            renderHistoryTable();
-            if (typeof updateStats === 'function') updateStats();
           }
+          saveToLocalStorage();
+          renderHistoryTable();
+          if (typeof updateStats === 'function') updateStats();
         }, (err) => {
           console.warn("Firestore transactions sync notice:", err.message);
         });
 
-        onSnapshot(collection(db, "departments"), async (snapshot) => {
-          if (window.isRestoringDatabase) return;
-          const legacyDepts = [
-            "เจ้าหน้าที่สำนักงาน (Staff)",
-            "แผนกเรือนกระจกและเพาะชำ",
-            "แผนกตกแต่งและตัดแต่งกิ่ง",
-            "แผนกระบบน้ำและบำรุงดิน",
-            "สวนกุหลาบและไม้ดอก",
-            "สวนไม้ผลและไม้ยืนต้น",
-            "แผนกดูแลไม้ดอก (Rose & Tulip)",
-            "แผนกไม้ประดับใบ (Indoor Flora)"
-          ];
-
-          let foundLegacy = false;
-
+        onSnapshot(collection(db, "departments"), (snapshot) => {
+          let fsDepts = [];
           if (!snapshot.empty) {
-            snapshot.docs.forEach(async (dSnap) => {
-              if (legacyDepts.includes(dSnap.data().name)) {
-                foundLegacy = true;
-                try { await deleteDoc(dSnap.ref); } catch(e){}
+            const deptMap = new Map();
+            for (const dSnap of snapshot.docs) {
+              const data = dSnap.data() || {};
+              const name = (data.name || dSnap.id || '').trim();
+              const officialCode = (data.code || data.id || dSnap.id || '').trim();
+
+              if (name) {
+                const key = name.toLowerCase();
+                if (!deptMap.has(key)) {
+                  deptMap.set(key, { id: officialCode || dSnap.id, code: officialCode || dSnap.id, name });
+                }
               }
+            }
+
+            const validDocs = Array.from(deptMap.values());
+            validDocs.sort((a, b) => {
+              const numA = parseInt(((a.code || a.id).match(/^DEP-(\d+)$/i) || a.id.match(/^dept_v3_(\d+)$/) || [0, 999999])[1], 10);
+              const numB = parseInt(((b.code || b.id).match(/^DEP-(\d+)$/i) || b.id.match(/^dept_v3_(\d+)$/) || [0, 999999])[1], 10);
+              if (numA !== numB) return numA - numB;
+              return a.name.localeCompare(b.name, 'th');
             });
 
-            const fsDepts = snapshot.docs
-              .map(d => (d.data().name || d.id))
-              .filter(d => d && !legacyDepts.includes(d));
-
-            departmentsList = Array.from(new Set(fsDepts));
-          }
-
-          if (snapshot.empty || foundLegacy || departmentsList.length === 0) {
-            departmentsList = [...defaultDepartmentsList];
-            if (isFirebaseReady && db) {
-              const deptObjs = defaultDepartmentsList.map((d, i) => ({ id: 'dept_v3_' + (i + 1), name: d }));
-              await seedCollectionIfEmpty("departments", deptObjs);
-            }
+            fsDepts = validDocs.map(d => d.name);
+            departmentsList = fsDepts;
+          } else {
+            departmentsList = [];
           }
 
           saveToLocalStorage();
@@ -12373,20 +21413,46 @@
         });
 
         onSnapshot(collection(db, "locations"), async (snapshot) => {
-          if (window.isRestoringDatabase) return;
+          let fsLocs = [];
           if (!snapshot.empty) {
-            const fsLocs = snapshot.docs
-              .map(d => (d.data().name || d.id))
-              .filter(Boolean);
-            locationsList = Array.from(new Set(fsLocs));
-          }
+            const locMap = new Map();
+            for (const dSnap of snapshot.docs) {
+              const data = dSnap.data() || {};
+              const name = (data.name || dSnap.id || '').trim();
+              const officialCode = (data.code || data.id || dSnap.id || '').trim();
 
-          if (snapshot.empty || locationsList.length === 0) {
-            locationsList = [...defaultLocationsList];
-            if (isFirebaseReady && db) {
-              const locObjs = defaultLocationsList.map((l, i) => ({ id: 'loc_v1_' + (i + 1), name: l }));
-              await seedCollectionIfEmpty("locations", locObjs);
+              if (name) {
+                // Auto-migrate if document ID !== location code
+                if (isFirebaseReady && db && officialCode && dSnap.id !== officialCode) {
+                  try {
+                    await setDoc(doc(db, "locations", officialCode), { id: officialCode, code: officialCode, name }, { merge: true });
+                    await deleteDoc(dSnap.ref);
+                  } catch(migErr) {
+                    console.warn("Auto migrate location docId notice:", migErr);
+                  }
+                }
+
+                const key = name.toLowerCase();
+                if (!locMap.has(key)) {
+                  locMap.set(key, { id: officialCode || dSnap.id, code: officialCode || dSnap.id, name });
+                } else if (dSnap.id !== officialCode) {
+                  // Duplicate document with non-standard ID, delete it
+                  try { await deleteDoc(dSnap.ref); } catch(e){}
+                }
+              }
             }
+
+            const locDocs = Array.from(locMap.values());
+            locDocs.sort((a, b) => {
+              const numA = parseInt(((a.code || a.id || '').match(/^LOC-(\d+)$/i) || [0, 999999])[1], 10);
+              const numB = parseInt(((b.code || b.id || '').match(/^LOC-(\d+)$/i) || [0, 999999])[1], 10);
+              if (numA !== numB) return numA - numB;
+              return (a.name || a.id).localeCompare((b.name || b.id), 'th');
+            });
+            fsLocs = locDocs.map(d => (d.name || d.id)).filter(Boolean);
+            locationsList = fsLocs;
+          } else {
+            locationsList = [];
           }
 
           saveToLocalStorage();
@@ -12398,23 +21464,65 @@
           console.warn("Firestore locations sync notice:", err.message);
         });
 
-        onSnapshot(collection(db, "audit_logs"), (snapshot) => {
-          if (window.isRestoringDatabase) return;
+        onSnapshot(collection(db, "positions"), (snapshot) => {
+          let fsPositions = [];
           if (!snapshot.empty) {
+            const posMap = new Map();
+            for (const dSnap of snapshot.docs) {
+              const data = dSnap.data() || {};
+              const name = (data.name || dSnap.id || '').trim();
+              const officialCode = (data.code || data.id || dSnap.id || '').trim();
+              const group = data.group || 'ตำแหน่งทั่วไป';
+              const order = data.order || 999;
+
+              if (name) {
+                const key = name.toLowerCase();
+                if (!posMap.has(key)) {
+                  posMap.set(key, { id: officialCode || dSnap.id, code: officialCode || dSnap.id, name, group, order });
+                }
+              }
+            }
+
+            const posDocs = Array.from(posMap.values());
+            posDocs.sort((a, b) => {
+              const numA = parseInt(((a.code || a.id || '').match(/^POS-(\d+)$/i) || [0, 999999])[1], 10);
+              const numB = parseInt(((b.code || b.id || '').match(/^POS-(\d+)$/i) || [0, 999999])[1], 10);
+              if (numA !== numB) return numA - numB;
+              return (a.order || 0) - (b.order || 0);
+            });
+
+            fsPositions = posDocs;
+            positionsList = fsPositions;
+          } else {
+            positionsList = [];
+          }
+
+          saveToLocalStorage();
+          populatePositionDropdowns();
+          if (typeof renderPositionsListModal === 'function') {
+            renderPositionsListModal();
+          }
+        }, (err) => {
+          console.warn("Firestore positions sync notice:", err.message);
+        });
+
+        onSnapshot(collection(db, "audit_logs"), (snapshot) => {
+          if (snapshot.empty) {
+            auditLogs = [];
+          } else {
             const list = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
             list.sort((a, b) => getRecordTimestampMs(b) - getRecordTimestampMs(a));
             auditLogs = list;
-            saveToLocalStorage();
-            if (typeof window.renderAuditLogsTable === 'function') {
-              window.renderAuditLogsTable();
-            }
+          }
+          saveToLocalStorage();
+          if (typeof window.renderAuditLogsTable === 'function') {
+            window.renderAuditLogsTable();
           }
         }, (err) => {
           console.warn("Firestore audit_logs sync notice:", err.message);
         });
 
         onSnapshot(collection(db, "user_login_logs"), (snapshot) => {
-          if (window.isRestoringDatabase) return;
           if (!snapshot.empty) {
             const list = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
             userLoginLogs = list;
@@ -12431,7 +21539,6 @@
         }
 
         onSnapshot(collection(db, "users"), (snapshot) => {
-          if (window.isRestoringDatabase) return;
           allUsersList = [];
           snapshot.forEach(docSnap => {
             allUsersList.push({ id: docSnap.id, ...docSnap.data() });
@@ -12546,9 +21653,14 @@
       };
 
       window.batchOptimizeAllStorageImages = async function() {
-        if (!confirm("⚡ ต้องการบีบอัดและปรับขนาดรูปภาพทั้งหมดในระบบเพื่อประหยัดพื้นที่ Storage หรือไม่?\n\nระบบจะตรวจหารูปภาพขนาดใหญ่ แปลงเป็นไฟล์ WebP/JPEG คุณภาพสูงที่ย่อขนาดแล้ว และซิงก์อัปเดตลง Firebase Storage อัตโนมัติ")) {
-          return;
-        }
+        const ok = await window.showConfirmDialog({
+          title: "บีบอัดรูปภาพระบบ",
+          message: "ต้องการบีบอัดและปรับขนาดรูปภาพทั้งหมดเพื่อประหยัดพื้นที่ Storage หรือไม่?",
+          type: "primary",
+          icon: "bi-lightning-charge-fill",
+          confirmText: "เริ่มบีบอัดรูปภาพ"
+        });
+        if (!ok) return;
 
         let totalProcessed = 0;
         let totalSavedBytes = 0;
@@ -12617,18 +21729,275 @@
       };
     }
 
-    function showToast(msg) {
-      document.getElementById('toastMessage').innerHTML = `<i class="bi bi-check-circle-fill fs-5"></i> ${msg}`;
-      const toastEl = document.getElementById('liveToast');
-      const toast = new bootstrap.Toast(toastEl, { delay: 3500 });
-      toast.show();
+    let feedbackTimer = null;
+    window.hideFeedbackPopup = function() {
+      const popup = document.getElementById('globalFeedbackPopup');
+      if (popup) popup.classList.add('d-none');
+      if (feedbackTimer) {
+        clearTimeout(feedbackTimer);
+        feedbackTimer = null;
+      }
+    };
+
+    // Global 3-Second Feedback Popup (Compact, positioned near active target or center-top, disappears in 3s without progress bar, replaces old bottom-right toast)
+    window.showFeedbackPopup = function(options = {}) {
+      if (typeof options === 'string') {
+        options = { message: options };
+      }
+      const title = options.title || 'บันทึก เสร็จแล้ว';
+      let message = options.message || options.text || 'บันทึก เสร็จแล้ว';
+      const type = options.type || 'success'; // 'success', 'primary', 'warning', 'info', 'danger'
+      const duration = typeof options.duration === 'number' ? options.duration : 3000;
+      
+      const iconClass = options.icon || (
+        type === 'success' ? 'bi-check-circle-fill' :
+        type === 'primary' ? 'bi-info-circle-fill' :
+        type === 'warning' ? 'bi-exclamation-triangle-fill' :
+        type === 'danger' ? 'bi-x-circle-fill' : 'bi-bell-fill'
+      );
+
+      const popup = document.getElementById('globalFeedbackPopup');
+      const titleEl = document.getElementById('globalFeedbackTitle');
+      const msgEl = document.getElementById('globalFeedbackMessage');
+      const iconEl = document.getElementById('globalFeedbackIcon');
+      const iconCont = document.getElementById('globalFeedbackIconContainer');
+
+      if (!popup) return;
+
+      if (titleEl) titleEl.textContent = title;
+      if (msgEl) msgEl.innerHTML = message;
+
+      const iconColor = type === 'warning' ? 'text-warning bg-warning' : type === 'primary' ? 'text-primary bg-primary' : type === 'info' ? 'text-info bg-info' : type === 'danger' ? 'text-danger bg-danger' : 'text-success bg-success';
+      if (iconCont) iconCont.className = `p-2 rounded-circle ${iconColor} bg-opacity-10 d-flex align-items-center justify-content-center flex-shrink-0`;
+      if (iconEl) iconEl.className = `bi ${iconClass} fs-5`;
+
+      let target = options.target;
+      if (!target && window.event) {
+        target = window.event.target || window.event.currentTarget;
+      }
+      if (!target) {
+        target = document.activeElement;
+      }
+      if (typeof target === 'string') {
+        target = document.querySelector(target);
+      }
+      if (target && !(target instanceof HTMLElement)) {
+        target = target.target || target.currentTarget || null;
+      }
+
+      popup.classList.remove('d-none');
+      const boxWidth = Math.min(330, window.innerWidth - 24);
+      popup.style.width = `${boxWidth}px`;
+
+      if (target && target instanceof HTMLElement && typeof target.getBoundingClientRect === 'function' && target.tagName !== 'BODY') {
+        const rect = target.getBoundingClientRect();
+        const popupHeight = popup.offsetHeight || 80;
+        
+        let top = rect.top - popupHeight - 8;
+        if (top < 12) {
+          top = rect.bottom + 8;
+        }
+        if (top + popupHeight > window.innerHeight - 12) {
+          top = Math.max(12, window.innerHeight - popupHeight - 12);
+        }
+
+        let left = rect.left + (rect.width / 2) - (boxWidth / 2);
+        if (left < 12) left = 12;
+        if (left + boxWidth > window.innerWidth - 12) {
+          left = window.innerWidth - boxWidth - 12;
+        }
+
+        popup.style.top = `${Math.round(top)}px`;
+        popup.style.left = `${Math.round(left)}px`;
+        popup.style.right = 'auto';
+        popup.style.bottom = 'auto';
+        popup.style.transform = 'scale(1)';
+      } else {
+        // Center-top floating feedback notification
+        popup.style.top = '24px';
+        popup.style.left = '50%';
+        popup.style.right = 'auto';
+        popup.style.bottom = 'auto';
+        popup.style.transform = 'translateX(-50%) scale(1)';
+      }
+
+      if (feedbackTimer) clearTimeout(feedbackTimer);
+      feedbackTimer = setTimeout(() => {
+        window.hideFeedbackPopup();
+      }, duration);
+    };
+
+    function showToast(msg, options = {}) {
+      if (typeof options === 'string') {
+        options = { title: options };
+      }
+      window.showFeedbackPopup({
+        title: "บันทึก เสร็จแล้ว",
+        message: msg || "บันทึก เสร็จแล้ว",
+        duration: 3000,
+        ...options
+      });
     }
+
+    // Global UI Confirmation Dialog / Popover (Compact, positioned above/near clicked target, concise text)
+    window.showConfirmDialog = function(options = {}) {
+      return new Promise((resolve) => {
+        if (typeof options === 'string') {
+          options = { message: options };
+        }
+        const title = options.title || 'ยืนยันการดำเนินการ';
+        const message = options.message || options.text || 'คุณต้องการดำเนินการต่อใช่หรือไม่?';
+        const confirmText = options.confirmText || 'ยืนยัน';
+        const cancelText = options.cancelText || 'ยกเลิก';
+        const type = options.type || 'danger'; // 'danger', 'warning', 'primary', 'success', 'info'
+        const iconClass = options.icon || (type === 'warning' ? 'bi-exclamation-triangle-fill' : type === 'primary' ? 'bi-info-circle-fill' : type === 'success' ? 'bi-check-circle-fill' : 'bi-trash3-fill');
+        
+        let target = options.target;
+        if (!target && window.event) {
+          target = window.event.target || window.event.currentTarget;
+        }
+        if (!target) {
+          target = document.activeElement;
+        }
+        if (typeof target === 'string') {
+          target = document.querySelector(target);
+        }
+        if (target && !(target instanceof HTMLElement)) {
+          target = target.target || target.currentTarget || null;
+        }
+
+        const backdrop = document.getElementById('globalConfirmBackdrop');
+        const box = document.getElementById('globalConfirmBox');
+        const titleEl = document.getElementById('globalConfirmTitle');
+        const msgEl = document.getElementById('globalConfirmMessage');
+        const btnCancel = document.getElementById('globalConfirmBtnCancel');
+        const btnOk = document.getElementById('globalConfirmBtnOk');
+        const iconEl = document.getElementById('globalConfirmIcon');
+        const iconCont = document.getElementById('globalConfirmIconContainer');
+
+        if (!box || !backdrop) {
+          resolve(window.confirm ? window.confirm(message) : true);
+          return;
+        }
+
+        if (titleEl) titleEl.textContent = title;
+        if (msgEl) msgEl.innerHTML = message.replace(/\n/g, '<br>');
+        if (btnCancel) btnCancel.textContent = cancelText;
+        if (btnOk) {
+          const span = btnOk.querySelector('span');
+          if (span) span.textContent = confirmText;
+          else btnOk.textContent = confirmText;
+        }
+
+        const btnColorClass = type === 'warning' ? 'btn-warning text-dark' : type === 'primary' ? 'btn-primary' : type === 'success' ? 'btn-success' : type === 'info' ? 'btn-info text-white' : 'btn-danger';
+        if (btnOk) btnOk.className = `btn ${btnColorClass} btn-sm rounded-pill px-3.5 py-1 fw-bold fs-8 shadow-sm d-flex align-items-center gap-1`;
+        
+        const iconColor = type === 'warning' ? 'text-warning bg-warning' : type === 'primary' ? 'text-primary bg-primary' : type === 'success' ? 'text-success bg-success' : type === 'info' ? 'text-info bg-info' : 'text-danger bg-danger';
+        if (iconCont) iconCont.className = `p-2 rounded-circle ${iconColor} bg-opacity-10 d-flex align-items-center justify-content-center flex-shrink-0`;
+        if (iconEl) iconEl.className = `bi ${iconClass} fs-5`;
+
+        backdrop.classList.remove('d-none');
+        box.classList.remove('d-none');
+
+        const boxWidth = Math.min(330, window.innerWidth - 24);
+        box.style.width = `${boxWidth}px`;
+
+        if (target && target instanceof HTMLElement && typeof target.getBoundingClientRect === 'function' && target.tagName !== 'BODY') {
+          const rect = target.getBoundingClientRect();
+          const boxHeight = box.offsetHeight || 140;
+          
+          // Position right above the clicked button if possible
+          let top = rect.top - boxHeight - 8;
+          if (top < 12) {
+            top = rect.bottom + 8;
+          }
+          if (top + boxHeight > window.innerHeight - 12) {
+            top = Math.max(12, window.innerHeight - boxHeight - 12);
+          }
+
+          let left = rect.left + (rect.width / 2) - (boxWidth / 2);
+          if (left < 12) left = 12;
+          if (left + boxWidth > window.innerWidth - 12) {
+            left = window.innerWidth - boxWidth - 12;
+          }
+
+          box.style.top = `${Math.round(top)}px`;
+          box.style.left = `${Math.round(left)}px`;
+          box.style.transform = 'scale(1)';
+        } else {
+          box.style.top = '50%';
+          box.style.left = '50%';
+          box.style.transform = 'translate(-50%, -50%) scale(1)';
+        }
+
+        function cleanup(result) {
+          backdrop.classList.add('d-none');
+          box.classList.add('d-none');
+          document.removeEventListener('keydown', onKeyDown);
+          if (btnOk) btnOk.onclick = null;
+          if (btnCancel) btnCancel.onclick = null;
+          if (backdrop) backdrop.onclick = null;
+          resolve(result);
+        }
+
+        function onKeyDown(e) {
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            cleanup(false);
+          } else if (e.key === 'Enter') {
+            e.preventDefault();
+            cleanup(true);
+          }
+        }
+
+        if (btnOk) btnOk.onclick = () => cleanup(true);
+        if (btnCancel) btnCancel.onclick = () => cleanup(false);
+        if (backdrop) backdrop.onclick = () => cleanup(false);
+        document.addEventListener('keydown', onKeyDown);
+
+        setTimeout(() => {
+          if (btnOk) btnOk.focus();
+        }, 50);
+      });
+    };
+    window.customConfirm = window.showConfirmDialog;
+    window.showToast = showToast;
+    window.showSuccessFeedback = function(msg, options = {}) {
+      window.showFeedbackPopup({
+        title: "บันทึก เสร็จแล้ว",
+        message: msg || "บันทึก เสร็จแล้ว",
+        type: "success",
+        icon: "bi-check-circle-fill",
+        duration: 3000,
+        ...options
+      });
+    };
 
     function delay(ms) {
       return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    window.copyDataFromOldDatabases = async function(showFeedback = true) {
+    window.isThammaSrithongAdminStrict = function() {
+      const email = ((typeof currentAuthUser !== 'undefined' && currentAuthUser?.email) || (typeof currentUserProfile !== 'undefined' && currentUserProfile?.email) || '').trim().toLowerCase();
+      const displayName = ((typeof currentAuthUser !== 'undefined' && currentAuthUser?.displayName) || (typeof currentUserProfile !== 'undefined' && currentUserProfile?.displayName) || '').trim().toLowerCase();
+      
+      const isEmailMatch = email === 'jaru072@gmail.com';
+      const isNameMatch = displayName.includes('thamma') || displayName.includes('srithong') || displayName.includes('ธรรมะ') || displayName.includes('ศรีทอง');
+
+      return isEmailMatch || (isNameMatch && (typeof currentRole !== 'undefined' && currentRole === 'ADMIN'));
+    };
+
+    window.copyDataFromOldDatabases = async function(showFeedback = true, customSourceDbId = null) {
+      // STRICT PERMISSION CHECK: Only Thamma Srithong (jaru072@gmail.com) can execute
+      if (!window.isThammaSrithongAdminStrict()) {
+        const errorMsg = "⛔ สงวนสิทธิ์เฉพาะผู้ดูแลระบบหลัก คุณ Thamma Srithong (jaru072@gmail.com) เท่านั้น";
+        if (showFeedback) showToast(errorMsg);
+        alert(errorMsg);
+        return 0;
+      }
+
+      const primarySourceDbId = customSourceDbId ? customSourceDbId.trim() : "ai-studio-floragardennew-077d9b3a-d839-404a-986e-0ab7c5c9be6e";
+
       try {
         const app = getApp();
         if (!db) {
@@ -12638,66 +22007,597 @@
 
         const collectionsToMigrate = [
           "equipment",
+          "equipments",
           "employees",
+          "deleted_employees",
           "attendance",
           "categories",
           "transactions",
           "departments",
           "locations",
+          "positions",
           "users",
           "audit_logs",
-          "user_login_logs"
+          "user_login_logs",
+          "items",
+          "borrowings",
+          "system_settings",
+          "activity_logs",
+          "equipment_images",
+          "employee_photos",
+          "images",
+          "photos"
         ];
 
-        if (showFeedback) showToast("⏳ กำลังตรวจค้นและคัดลอกข้อมูลจากฐานข้อมูลเดิม...");
-        let totalDocsCopied = 0;
-
-        // List of candidate source databases to pull data from
-        const sourcesToTry = [
-          { name: "default", getDb: () => getFirestore(app) },
-          { name: "ai-studio-1c1eba69-e70f-482c-b553-e77fc7efbd4f", getDb: () => getFirestore(app, "ai-studio-1c1eba69-e70f-482c-b553-e77fc7efbd4f") }
-        ];
-
-        for (const source of sourcesToTry) {
-          let srcDb = null;
-          try {
-            srcDb = source.getDb();
-          } catch (e) {
-            console.warn(`[Migration] Cannot instantiate source db '${source.name}':`, e);
-            continue;
+        if (showFeedback) {
+          showToast(`⏳ กำลังตรวจสอบและเชื่อมต่อฐานข้อมูล...`);
+          if (typeof window.updateBackupProgress === 'function') {
+            window.updateBackupProgress(5, "กำลังเริ่มซิงก์ข้อมูล (5%)", `กำลังเชื่อมต่อกับฐานข้อมูล Flora Garden New (${primarySourceDbId})...`, true, 'bg-success');
+            const progressEl = document.getElementById('backupProgressContainer');
+            if (progressEl) progressEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
           }
+        }
 
-          if (!srcDb) continue;
-
-          for (const colName of collectionsToMigrate) {
-            try {
-              const snap = await getDocs(collection(srcDb, colName));
-              if (snap.docs.length > 0) {
-                console.log(`[Migration] Copying ${snap.docs.length} docs from '${colName}' in database '${source.name}'...`);
-                for (const docSnap of snap.docs) {
-                  await setDoc(doc(db, colName, docSnap.id), docSnap.data(), { merge: true });
-                  totalDocsCopied++;
-                }
-              }
-            } catch (colErr) {
-              console.warn(`[Migration] Error reading/writing collection '${colName}' from '${source.name}':`, colErr);
+        // Helper to convert Firestore REST Document to JS Object
+        const parseFirestoreRestDoc = (fields) => {
+          if (!fields) return {};
+          const result = {};
+          for (const [key, valueObj] of Object.entries(fields)) {
+            if (valueObj.stringValue !== undefined) result[key] = valueObj.stringValue;
+            else if (valueObj.integerValue !== undefined) result[key] = parseInt(valueObj.integerValue, 10);
+            else if (valueObj.doubleValue !== undefined) result[key] = parseFloat(valueObj.doubleValue);
+            else if (valueObj.booleanValue !== undefined) result[key] = valueObj.booleanValue;
+            else if (valueObj.timestampValue !== undefined) result[key] = valueObj.timestampValue;
+            else if (valueObj.nullValue !== undefined) result[key] = null;
+            else if (valueObj.arrayValue !== undefined) {
+              result[key] = (valueObj.arrayValue.values || []).map(v => {
+                if (v.stringValue !== undefined) return v.stringValue;
+                if (v.integerValue !== undefined) return parseInt(v.integerValue, 10);
+                if (v.doubleValue !== undefined) return parseFloat(v.doubleValue);
+                if (v.booleanValue !== undefined) return v.booleanValue;
+                if (v.mapValue !== undefined) return parseFirestoreRestDoc(v.mapValue.fields);
+                return Object.values(v)[0];
+              });
+            } else if (valueObj.mapValue !== undefined) {
+              result[key] = parseFirestoreRestDoc(valueObj.mapValue.fields);
+            } else {
+              result[key] = Object.values(valueObj)[0];
             }
           }
+          return result;
+        };
+
+        // Fallback: Read collection via Firebase REST API
+        const fetchCollectionViaRest = async (dbId, colName) => {
+          try {
+            let idToken = "";
+            try {
+              let currentUser = auth.currentUser;
+              if (!currentUser && window.auth && window.auth.currentUser) {
+                currentUser = window.auth.currentUser;
+              }
+              if (currentUser) {
+                idToken = await currentUser.getIdToken(true); // Force refresh token
+              }
+            } catch (tokErr) {
+              console.warn("Could not retrieve auth idToken:", tokErr);
+            }
+
+            const cleanDbId = (dbId === "(default)") ? "(default)" : dbId;
+            const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${cleanDbId}/documents/${colName}?pageSize=300&key=${firebaseConfig.apiKey}`;
+            const headers = {};
+            if (idToken) {
+              headers['Authorization'] = `Bearer ${idToken}`;
+            }
+            
+            const res = await fetch(url, { headers });
+            if (!res.ok) {
+              const errBody = await res.json().catch(() => ({}));
+              const errTxt = errBody.error?.message || res.statusText || `HTTP ${res.status}`;
+              console.warn(`REST fetch error for ${dbId}/${colName}:`, res.status, errBody);
+              return { error: `[${res.status}] ${errTxt}`, docs: [] };
+            }
+            const data = await res.json();
+            if (!data.documents || data.documents.length === 0) {
+              return { docs: [] };
+            }
+            const docs = data.documents.map(docItem => {
+              const parts = docItem.name.split('/');
+              const docId = parts[parts.length - 1];
+              return {
+                id: docId,
+                data: parseFirestoreRestDoc(docItem.fields)
+              };
+            });
+            return { docs };
+          } catch (e) {
+            return { error: e.message, docs: [] };
+          }
+        };
+
+        // Helper to get or create a Firestore instance for a given database ID
+        let migrationAppIndex = 1;
+        const getDbInstance = (dbId) => {
+          try {
+            const fsSettings = {
+              experimentalForceLongPolling: true,
+              useFetchStreams: false
+            };
+            if (!dbId || dbId === "(default)") {
+              try {
+                return getFirestore(app);
+              } catch (e) {
+                const subApp = initializeApp(firebaseConfig, `migrationApp_${migrationAppIndex++}`);
+                return initializeFirestore(subApp, fsSettings);
+              }
+            }
+            
+            try {
+              const subApp = initializeApp({ ...firebaseConfig, firestoreDatabaseId: dbId }, `migrationApp_${migrationAppIndex++}`);
+              return initializeFirestore(subApp, fsSettings, dbId);
+            } catch (initErr) {
+              try {
+                return getFirestore(app, dbId);
+              } catch (e2) {
+                console.warn(`[Migration] Failed to get db instance for ${dbId}:`, initErr, e2);
+                return null;
+              }
+            }
+          } catch (e) {
+            console.warn(`[Migration] Failed to get db instance for ${dbId}:`, e);
+            return null;
+          }
+        };
+
+        // 1. Try Primary Source: floragardentest
+        let totalDocsCopied = 0;
+        const detailedCounts = {};
+        const recordedErrors = [];
+
+        const testAndCopyFromDb = async (sourceDbId, label) => {
+          let copied = 0;
+          const errors = [];
+          const src = getDbInstance(sourceDbId);
+
+          for (let colIdx = 0; colIdx < collectionsToMigrate.length; colIdx++) {
+            const colName = collectionsToMigrate[colIdx];
+            const currentPct = Math.round(5 + (colIdx / collectionsToMigrate.length) * 80);
+            
+            if (showFeedback && typeof window.updateBackupProgress === 'function') {
+              window.updateBackupProgress(
+                currentPct,
+                `กำลังซิงก์ข้อมูลจาก Flora Garden New (${currentPct}%)`,
+                `กำลังอ่านตาราง "${colName}" (${colIdx + 1}/${collectionsToMigrate.length})...`,
+                true,
+                'bg-success'
+              );
+            }
+
+            let foundDocs = false;
+
+            // Strategy A: Direct REST API (Reliable in multi-db contexts)
+            const restResult = await fetchCollectionViaRest(sourceDbId, colName);
+            if (restResult.docs && restResult.docs.length > 0) {
+              foundDocs = true;
+              console.log(`[Migration-REST] Found ${restResult.docs.length} docs in '${colName}' (${label})`);
+              detailedCounts[colName] = (detailedCounts[colName] || 0) + restResult.docs.length;
+              for (const docObj of restResult.docs) {
+                const rawData = docObj.data || {};
+                const officialCode = (rawData.code || (colName === 'equipment' || colName === 'equipments' ? rawData.equipmentCode : '') || rawData.id || docObj.id || '').trim();
+                const cleanData = { ...rawData, id: officialCode || docObj.id, code: officialCode || docObj.id };
+                const targetId = officialCode || docObj.id;
+
+                // Normalize equipment image
+                if (colName === 'equipment' || colName === 'equipments' || colName === 'items') {
+                  const detectedImg = cleanData.imageUrl || 
+                                     cleanData.photoUrl || 
+                                     cleanData.image || 
+                                     cleanData.photo || 
+                                     cleanData.picture || 
+                                     cleanData.thumbnail || 
+                                     cleanData.imageBase64 || 
+                                     cleanData.photoBase64 || 
+                                     cleanData.imgUrl || 
+                                     cleanData.picUrl || 
+                                     (Array.isArray(cleanData.photos) && cleanData.photos[0]) || 
+                                     (Array.isArray(cleanData.images) && cleanData.images[0]) || 
+                                     '';
+                  if (detectedImg) {
+                    cleanData.imageUrl = detectedImg;
+                  }
+                }
+
+                // Normalize employee photo
+                if (colName === 'employees' || colName === 'deleted_employees') {
+                  const detectedPhoto = cleanData.photoUrl || 
+                                       cleanData.photoURL || 
+                                       cleanData.photo || 
+                                       cleanData.image || 
+                                       cleanData.imageUrl || 
+                                       cleanData.avatar || 
+                                       cleanData.photoBase64 || 
+                                       cleanData.imageBase64 || 
+                                       '';
+                  if (detectedPhoto) {
+                    cleanData.photoUrl = detectedPhoto;
+                  }
+                }
+
+                await setDoc(doc(db, colName, targetId), cleanData, { merge: true });
+                if (colName === 'equipments') {
+                  try { await setDoc(doc(db, 'equipment', targetId), cleanData, { merge: true }); } catch(e){}
+                } else if (colName === 'equipment') {
+                  try { await setDoc(doc(db, 'equipments', targetId), cleanData, { merge: true }); } catch(e){}
+                }
+
+                if (docObj.id !== targetId) {
+                  try { await deleteDoc(doc(db, colName, docObj.id)); } catch(e){}
+                }
+                copied++;
+              }
+              if (showFeedback && typeof window.updateBackupProgress === 'function') {
+                window.updateBackupProgress(
+                  currentPct,
+                  `กำลังซิงก์ข้อมูลจาก V.2 (${currentPct}%)`,
+                  `ตาราง "${colName}" คัดลอกสำเร็จ ${restResult.docs.length} รายการ (${colIdx + 1}/${collectionsToMigrate.length})`,
+                  true,
+                  'bg-success'
+                );
+              }
+            } else if (restResult.error && !restResult.error.includes("404")) {
+              errors.push(`REST [${colName}]: ${restResult.error}`);
+            }
+
+            // Strategy B: SDK getDocs if REST returned 0 docs or failed
+            if (!foundDocs && src) {
+              try {
+                const snap = await getDocs(collection(src, colName));
+                if (snap && snap.docs && snap.docs.length > 0) {
+                  foundDocs = true;
+                  console.log(`[Migration-SDK] Found ${snap.docs.length} docs in '${colName}' (${label})`);
+                  detailedCounts[colName] = (detailedCounts[colName] || 0) + snap.docs.length;
+                  for (const docSnap of snap.docs) {
+                    const rawData = docSnap.data() || {};
+                    const officialCode = (rawData.code || (colName === 'equipment' || colName === 'equipments' ? rawData.equipmentCode : '') || rawData.id || docSnap.id || '').trim();
+                    const cleanData = { ...rawData, id: officialCode || docSnap.id, code: officialCode || docSnap.id };
+                    const targetId = officialCode || docSnap.id;
+
+                    // Normalize equipment image
+                    if (colName === 'equipment' || colName === 'equipments' || colName === 'items') {
+                      const detectedImg = cleanData.imageUrl || 
+                                         cleanData.photoUrl || 
+                                         cleanData.image || 
+                                         cleanData.photo || 
+                                         cleanData.picture || 
+                                         cleanData.thumbnail || 
+                                         cleanData.imageBase64 || 
+                                         cleanData.photoBase64 || 
+                                         cleanData.imgUrl || 
+                                         cleanData.picUrl || 
+                                         (Array.isArray(cleanData.photos) && cleanData.photos[0]) || 
+                                         (Array.isArray(cleanData.images) && cleanData.images[0]) || 
+                                         '';
+                      if (detectedImg) {
+                        cleanData.imageUrl = detectedImg;
+                      }
+                    }
+
+                    // Normalize employee photo
+                    if (colName === 'employees' || colName === 'deleted_employees') {
+                      const detectedPhoto = cleanData.photoUrl || 
+                                           cleanData.photoURL || 
+                                           cleanData.photo || 
+                                           cleanData.image || 
+                                           cleanData.imageUrl || 
+                                           cleanData.avatar || 
+                                           cleanData.photoBase64 || 
+                                           cleanData.imageBase64 || 
+                                           '';
+                      if (detectedPhoto) {
+                        cleanData.photoUrl = detectedPhoto;
+                      }
+                    }
+
+                    await setDoc(doc(db, colName, targetId), cleanData, { merge: true });
+                    if (colName === 'equipments') {
+                      try { await setDoc(doc(db, 'equipment', targetId), cleanData, { merge: true }); } catch(e){}
+                    } else if (colName === 'equipment') {
+                      try { await setDoc(doc(db, 'equipments', targetId), cleanData, { merge: true }); } catch(e){}
+                    }
+
+                    if (docSnap.id !== targetId) {
+                      try { await deleteDoc(doc(db, colName, docSnap.id)); } catch(e){}
+                    }
+                    copied++;
+                  }
+                  if (showFeedback && typeof window.updateBackupProgress === 'function') {
+                    window.updateBackupProgress(
+                      currentPct,
+                      `กำลังซิงก์ข้อมูลจาก Flora Garden New (${currentPct}%)`,
+                      `ตาราง "${colName}" คัดลอกสำเร็จ ${snap.docs.length} รายการ (${colIdx + 1}/${collectionsToMigrate.length})`,
+                      true,
+                      'bg-success'
+                    );
+                  }
+                }
+              } catch (colErr) {
+                console.warn(`[Migration-SDK] Error reading '${colName}' from ${label}:`, colErr.message || colErr);
+                if (!errors.some(e => e.includes(colName))) {
+                  errors.push(`SDK [${colName}]: ${colErr.message || colErr}`);
+                }
+              }
+            }
+          }
+          return { count: copied, errors };
+        };
+
+        console.log(`[Migration] Scanning primary source: ${primarySourceDbId}`);
+        const primaryResult = await testAndCopyFromDb(primarySourceDbId, `Flora Garden New (${primarySourceDbId})`);
+        totalDocsCopied += primaryResult.count;
+        if (primaryResult.errors.length > 0) {
+          recordedErrors.push(...primaryResult.errors);
         }
 
-        console.log(`[Migration] Complete! Total documents copied: ${totalDocsCopied}`);
-        if (showFeedback) {
-          if (totalDocsCopied > 0) {
-            showToast(`🎉 คัดลอกข้อมูลจากฐานข้อมูลเดิมสำเร็จแล้ว (${totalDocsCopied} รายการ)`);
-          } else {
-            showToast(`ℹ️ ตรวจสอบแล้ว ไม่พบข้อมูลตกค้างในฐานข้อมูลเดิม หรือข้อมูลถูกคัดลอกสมบูรณ์แล้ว`);
+        console.log(`[Migration] Migration execution finished. Total docs copied: ${totalDocsCopied}`);
+
+        if (totalDocsCopied > 0) {
+          if (showFeedback && typeof window.updateBackupProgress === 'function') {
+            window.updateBackupProgress(88, "กำลังจัดระเบียบข้อมูล (88%)", "กำลังจัดระเบียบ Document ID และลบข้อมูลซ้ำซ้อน...", true, 'bg-primary');
+          }
+          await window.cleanAndDeduplicateAllCollections(false);
+
+          if (showFeedback && typeof window.updateBackupProgress === 'function') {
+            window.updateBackupProgress(
+              100,
+              "🎉 ซิงก์ข้อมูลจาก Flora Garden New เสร็จสมบูรณ์ 100%!",
+              `คัดลอกข้อมูลทั้งหมด ${totalDocsCopied} รายการ ลงฐานข้อมูล Test เรียบร้อยแล้ว`,
+              true,
+              'bg-success'
+            );
+          }
+        } else {
+          if (showFeedback && typeof window.updateBackupProgress === 'function') {
+            window.updateBackupProgress(100, "ℹ️ ตรวจสอบเสร็จสิ้น ไม่พบข้อมูลใหม่", "ไม่พบรายการข้อมูลในฐานข้อมูลต้นทาง (0 รายการ)", true, 'bg-secondary');
           }
         }
+
+        if (showFeedback) {
+          if (totalDocsCopied > 0) {
+            const summaryTxt = Object.entries(detailedCounts).map(([k, v]) => `• ${k}: ${v} รายการ`).join('\n');
+            const targetDbDisplay = firebaseConfig?.firestoreDatabaseId || "(default)";
+            alert(`🎉 ซิงค์และคัดลอกข้อมูลเรียบร้อยแล้ว!\n\nจำนวนข้อมูลที่นำเข้าทั้งหมด: ${totalDocsCopied} รายการ\n\n${summaryTxt}\n\nข้อมูลทั้งหมดถูกจัดเก็บลงสู่ฐานข้อมูล (${targetDbDisplay}) เรียบร้อยครับ`);
+            showToast(`🎉 ซิงค์ข้อมูลสำเร็จแล้ว ${totalDocsCopied} รายการ`);
+          } else {
+            let diagnosticMsg = `ℹ️ ระบบได้ทำการตรวจค้นฐานข้อมูลแล้ว ไม่พบข้อมูล (0 รายการ)`;
+            if (recordedErrors.length > 0) {
+              diagnosticMsg += `\n\nข้อความแจ้งเตือนจากระบบ:\n${recordedErrors.slice(0, 3).join('\n')}`;
+            }
+            alert(diagnosticMsg);
+            showToast(`ℹ️ ไม่พบข้อมูลในฐานข้อมูลต้นทาง`);
+          }
+        }
+
+        if (totalDocsCopied > 0) {
+          try {
+            const eqSnap = await getDocs(collection(db, "equipment"));
+            if (!eqSnap.empty) {
+              window.equipmentList = eqSnap.docs.map(d => ({ ...d.data(), id: d.id }));
+            }
+            const empSnap = await getDocs(collection(db, "employees"));
+            if (!empSnap.empty) {
+              window.employeeList = empSnap.docs.map(d => ({ ...d.data(), id: d.id }));
+            }
+          } catch(e) {
+            console.warn("Reloading data notice:", e);
+          }
+          if (typeof saveToLocalStorage === 'function') saveToLocalStorage();
+        }
+
+        if (typeof renderCatalogGrid === 'function') renderCatalogGrid();
+        if (typeof renderStaffTable === 'function') renderStaffTable();
+        if (typeof renderEmployeesList === 'function') renderEmployeesList();
+        if (typeof updateStatsCards === 'function') updateStatsCards();
+
         return totalDocsCopied;
       } catch (err) {
         console.error("[Migration] Fatal error:", err);
         if (showFeedback) showToast("❌ เกิดข้อผิดพลาดขณะคัดลอกข้อมูล: " + err.message);
+        alert("❌ เกิดข้อผิดพลาดขณะคัดลอกข้อมูล: " + err.message);
         return 0;
+      }
+    };
+
+    window.confirmAndSyncFromFloraGardenTest = async function() {
+      if (!window.isThammaSrithongAdminStrict()) {
+        const errorMsg = "⛔ สงวนสิทธิ์เฉพาะผู้ดูแลระบบหลัก คุณ Thamma Srithong (jaru072@gmail.com) เท่านั้น";
+        showToast(errorMsg);
+        alert(errorMsg);
+        return;
+      }
+
+      const defaultDb = "ai-studio-floragardennew-077d9b3a-d839-404a-986e-0ab7c5c9be6e";
+      const customDbInput = prompt(
+        "⚡ ซิงค์ข้อมูลจากฐานข้อมูล Flora Garden New มายัง Test\n\n" +
+        "กรุณาตรวจสอบหรือระบุ Database ID ต้นทางที่ต้องการดึงข้อมูล:\n(ค่าเริ่มต้นคือ Flora Garden New)",
+        defaultDb
+      );
+
+      if (customDbInput !== null) {
+        const chosenDb = customDbInput.trim() || defaultDb;
+        const total = await window.copyDataFromOldDatabases(true, chosenDb);
+        if (total > 0) {
+          // Automatically run deduplication and normalization after sync
+          await window.cleanAndDeduplicateAllCollections(false);
+        }
+      }
+    };
+
+    // Clean up duplicate documents across collections and normalize doc.id === code
+    window.cleanAndDeduplicateAllCollections = async function(showFeedback = true) {
+      if (!isFirebaseReady || !db) {
+        if (showFeedback) showToast("⚠️ Firebase Firestore ยังไม่พร้อมใช้งาน");
+        return;
+      }
+      if (!window.isThammaSrithongAdminStrict()) {
+        const errorMsg = "⛔ สงวนสิทธิ์เฉพาะผู้ดูแลระบบหลัก คุณ Thamma Srithong (jaru072@gmail.com) เท่านั้น";
+        if (showFeedback) { showToast(errorMsg); alert(errorMsg); }
+        return;
+      }
+
+      if (showFeedback) {
+        const ok = await window.showConfirmDialog({
+          title: "ล้างข้อมูลซ้ำซ้อนและจัดระเบียบ Document ID",
+          message: "ระบบจะสแกนเฉพาะข้อมูลคลัง (categories, locations, equipment) เพื่อรวมเอกสารที่ซ้ำกัน โดยไม่แก้ไขบุคลากรหรือโครงสร้าง ยืนยันดำเนินการหรือไม่?",
+          type: "primary",
+          icon: "bi-stars",
+          confirmText: "เริ่มจัดระเบียบและล้างตัวซ้ำ"
+        });
+        if (!ok) return;
+      }
+
+      if (showFeedback) {
+        showToast("⏳ กำลังเริ่มจัดระเบียบ Document ID และล้างข้อมูลซ้ำซ้อน...");
+        if (typeof window.updateBackupProgress === 'function') {
+          window.updateBackupProgress(10, "กำลังเริ่มจัดระเบียบข้อมูล (10%)", "กำลังเชื่อมต่อฐานข้อมูลและสแกนหาข้อมูลซ้ำซ้อน...", true, 'bg-primary');
+          const progressEl = document.getElementById('backupProgressContainer');
+          if (progressEl) progressEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }
+
+      const report = {};
+      let totalFixed = 0;
+      let totalDeletedDuplicates = 0;
+
+      const collectionsToCheck = [
+        { name: "categories", codePrefix: "CAT", nameField: "name" },
+        { name: "locations", codePrefix: "LOC", nameField: "name" },
+        { name: "equipment", codePrefix: "EQ", nameField: "name" }
+      ];
+
+      for (let cIdx = 0; cIdx < collectionsToCheck.length; cIdx++) {
+        const colInfo = collectionsToCheck[cIdx];
+        const colName = colInfo.name;
+        if (showFeedback && typeof window.updateBackupProgress === 'function') {
+          const cPct = Math.round(15 + (cIdx / collectionsToCheck.length) * 75);
+          window.updateBackupProgress(cPct, `กำลังจัดระเบียบตาราง ${colName} (${cPct}%)`, `สแกนหาข้อมูลซ้ำซ้อนและจัดระเบียบ Document ID (${cIdx + 1}/${collectionsToCheck.length})...`, true, 'bg-primary');
+        }
+        try {
+          const qSnap = await getDocs(collection(db, colName));
+          if (qSnap.empty) continue;
+
+          const seenByCode = new Map();
+          const seenByName = new Map();
+          const docsToDelete = [];
+
+          for (const dSnap of qSnap.docs) {
+            const data = dSnap.data() || {};
+            const codeVal = (data.code || (colName === 'equipment' ? data.equipmentCode : '') || data.id || dSnap.id || '').trim();
+            const nameVal = (data.name || (colName === 'employees' ? data.fullName : '') || '').trim();
+            const isStandardId = (dSnap.id === codeVal);
+
+            const record = {
+              dSnap,
+              data,
+              docId: dSnap.id,
+              codeVal,
+              nameVal,
+              isStandardId
+            };
+
+            const codeKey = codeVal.toLowerCase();
+            const nameKey = nameVal.toLowerCase();
+
+            // Check duplicates by Code
+            if (codeKey) {
+              if (!seenByCode.has(codeKey)) {
+                seenByCode.set(codeKey, record);
+              } else {
+                const existing = seenByCode.get(codeKey);
+                if (isStandardId && !existing.isStandardId) {
+                  docsToDelete.push(existing.dSnap);
+                  seenByCode.set(codeKey, record);
+                } else {
+                  docsToDelete.push(dSnap);
+                }
+              }
+            }
+
+            // Check duplicates by Name (for categories, departments, locations)
+            if (nameKey && (colName === 'categories' || colName === 'departments' || colName === 'locations')) {
+              if (!seenByName.has(nameKey)) {
+                seenByName.set(nameKey, record);
+              } else {
+                const existing = seenByName.get(nameKey);
+                if (isStandardId && !existing.isStandardId) {
+                  if (!docsToDelete.includes(existing.dSnap)) docsToDelete.push(existing.dSnap);
+                  seenByName.set(nameKey, record);
+                } else {
+                  if (!docsToDelete.includes(dSnap)) docsToDelete.push(dSnap);
+                }
+              }
+            }
+          }
+
+          // 1. Ensure all authoritative documents are written with doc.id === codeVal
+          for (const [codeKey, record] of seenByCode.entries()) {
+            const targetId = record.codeVal || record.docId;
+            const cleanData = { ...record.data, id: targetId, code: targetId };
+            if (colName === 'departments' || colName === 'locations') {
+              cleanData.name = record.nameVal || cleanData.name || targetId;
+            }
+
+            await setDoc(doc(db, colName, targetId), cleanData, { merge: true });
+            totalFixed++;
+
+            // If the original document had a different random ID, delete it
+            if (record.docId !== targetId) {
+              docsToDelete.push(record.dSnap);
+            }
+          }
+
+          // 2. Delete all duplicate or stray documents
+          const uniqueDocsToDelete = Array.from(new Set(docsToDelete));
+          for (const strayDoc of uniqueDocsToDelete) {
+            try {
+              await deleteDoc(strayDoc.ref);
+              totalDeletedDuplicates++;
+            } catch (delErr) {
+              console.warn(`Error deleting duplicate doc in ${colName}:`, delErr);
+            }
+          }
+
+          report[colName] = {
+            total: qSnap.size,
+            unique: seenByCode.size,
+            duplicatesRemoved: uniqueDocsToDelete.length
+          };
+
+        } catch (err) {
+          console.warn(`Error deduplicating ${colName}:`, err);
+        }
+      }
+
+      saveToLocalStorage();
+
+      if (typeof renderCategoryDropdowns === 'function') renderCategoryDropdowns();
+      if (typeof renderCategoryManagementList === 'function') renderCategoryManagementList();
+      if (typeof populateDepartmentDropdowns === 'function') populateDepartmentDropdowns();
+      if (typeof populateLocationDropdowns === 'function') populateLocationDropdowns();
+      if (typeof renderDepartmentsListModal === 'function') renderDepartmentsListModal();
+      if (typeof renderLocationsListModal === 'function') renderLocationsListModal();
+      if (typeof renderCatalogGrid === 'function') renderCatalogGrid();
+      if (typeof renderStaffTable === 'function') renderStaffTable();
+      if (typeof renderEmployeeDirectory === 'function') renderEmployeeDirectory();
+
+      const reportLines = Object.entries(report).map(([k, v]) => `• ${k}: ลบตัวซ้ำ ${v.duplicatesRemoved} รายการ (คงเหลือเอกสารหลัก ${v.unique} รายการ)`).join('\n');
+      const msg = `🎉 จัดระเบียบและล้างข้อมูลซ้ำซ้อนสำเร็จแล้ว!\n\n• รวมเอกสารที่ลบซ้ำซ้อนออก: ${totalDeletedDuplicates} รายการ\n• จัดโครงสร้าง Document ID ตรงตาม code: สำเร็จ\n\nรายละเอียดแยกแต่ละตาราง:\n${reportLines}`;
+      
+      if (showFeedback) {
+        if (typeof window.updateBackupProgress === 'function') {
+          window.updateBackupProgress(100, "🎉 จัดระเบียบข้อมูลสำเร็จ 100%!", `ลบตัวซ้ำ ${totalDeletedDuplicates} รายการ และจัดระเบียบ Document ID เรียบร้อย`, true, 'bg-success');
+        }
+        alert(msg);
+        showToast(`🎉 ล้างข้อมูลซ้ำซ้อนสำเร็จ (${totalDeletedDuplicates} รายการ)`);
       }
     };
 
@@ -12707,6 +22607,7 @@
     let parsedExcelEmployeesData = [];
 
     window.triggerImportEmployeeExcel = function() {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('นำเข้าข้อมูลบุคลากร');
       const fileInput = document.getElementById('excelEmpFileInput');
       if (fileInput) {
         fileInput.value = '';
@@ -12748,6 +22649,10 @@
     };
 
     window.handleImportEmployeeExcel = function(event) {
+      if (MAIN_PERSONNEL_READ_ONLY) {
+        if (event?.target) event.target.value = '';
+        return blockMainPersonnelMutation('นำเข้าข้อมูลบุคลากร');
+      }
       const file = event.target.files && event.target.files[0];
       if (!file) return;
 
@@ -12906,6 +22811,7 @@
     };
 
     window.saveImportedEmployeeExcelData = async function() {
+      if (MAIN_PERSONNEL_READ_ONLY) return blockMainPersonnelMutation('นำเข้าข้อมูลบุคลากร');
       if (!parsedExcelEmployeesData || parsedExcelEmployeesData.length === 0) {
         showToast("ไม่พบรายการพนักงานที่จะนำเข้า");
         return;
@@ -12922,9 +22828,25 @@
 
       let addedCount = 0;
       let updatedCount = 0;
+      const empsToSave = [];
 
-      for (const emp of parsedExcelEmployeesData) {
-        const normName = (emp.name || '').trim().toLowerCase();
+      for (const rawEmp of parsedExcelEmployeesData) {
+        const emp = {
+          id: String(rawEmp.id || '').trim(),
+          code: String(rawEmp.code || rawEmp.id || '').trim(),
+          name: String(rawEmp.name || '').trim(),
+          nickname: String(rawEmp.nickname || '').trim(),
+          department: String(rawEmp.department || 'ทั่วไป').trim(),
+          position: String(rawEmp.position || 'พนักงาน').trim(),
+          role: rawEmp.role || 'WORKER',
+          phone: String(rawEmp.phone || '').trim(),
+          details: String(rawEmp.details || rawEmp.note || '').trim(),
+          photoUrl: rawEmp.photoUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80',
+          reportsTo: String(rawEmp.reportsTo || '').trim(),
+          status: rawEmp.status || 'ปฏิบัติงาน'
+        };
+
+        const normName = emp.name.toLowerCase();
 
         // Check if existing employee found by ID or by Name
         let existingIdx = employeeList.findIndex(x => x.id === emp.id || (x.code && x.code === emp.id));
@@ -12948,18 +22870,30 @@
             }
             employeeList[existingIdx] = { ...existingEmp, ...emp };
             updatedCount++;
+            empsToSave.push(employeeList[existingIdx]);
           }
         } else {
           employeeList.unshift(emp);
           addedCount++;
+          empsToSave.push(emp);
         }
+      }
 
-        if (isFirebaseReady && db) {
-          try {
-            await setDoc(doc(db, "employees", emp.id), emp, { merge: true });
-          } catch (fErr) {
-            console.warn("Firestore import employee setDoc error:", fErr);
+      // Fast Atomic Batch Write to Firestore (Chunks of 450)
+      if (isFirebaseReady && db && empsToSave.length > 0) {
+        try {
+          const chunkSize = 450;
+          for (let i = 0; i < empsToSave.length; i += chunkSize) {
+            const chunk = empsToSave.slice(i, i + chunkSize);
+            const batch = writeBatch(db);
+            chunk.forEach(e => {
+              const docRef = doc(db, "employees", e.id);
+              batch.set(docRef, e, { merge: true });
+            });
+            await batch.commit();
           }
+        } catch (fErr) {
+          console.warn("Firestore import employee batch error:", fErr);
         }
       }
 
@@ -12988,27 +22922,150 @@
       parsedExcelEmployeesData = [];
     };
 
-    window.copyDataFromDefaultToNewDatabase = window.copyDataFromOldDatabases;
+    // ==================== FLOATING SCROLL NAVIGATION (BACK TO TOP & GO TO BOTTOM) ====================
+    window.scrollToPageTop = function() {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    };
 
-    async function runAutoMigration() {
-      if (!localStorage.getItem("firestore_migrated_v3")) {
-        console.log("[AutoMigration] Running data migration from old databases...");
-        const count = await window.copyDataFromOldDatabases(false);
-        if (typeof count === 'number') {
-          localStorage.setItem("firestore_migrated_v3", "true");
-          if (count > 0) {
-            showToast(`🎉 คัดลอกข้อมูลเก่าจากฐานข้อมูลเดิมเข้าสู่ฐานข้อมูลใหม่เรียบร้อยแล้ว (${count} รายการ)`);
+    window.scrollToPageBottom = function() {
+      const maxScroll = Math.max(
+        document.body.scrollHeight,
+        document.documentElement.scrollHeight,
+        document.body.offsetHeight,
+        document.documentElement.offsetHeight
+      );
+      window.scrollTo({ top: maxScroll, behavior: 'smooth' });
+    };
+
+    function initScrollNavWatcher() {
+      const scrollContainer = document.getElementById('scrollNavContainer');
+      const btnTop = document.getElementById('btnScrollToTop');
+      const btnBottom = document.getElementById('btnScrollToBottom');
+      if (!scrollContainer) return;
+
+      function updateScrollButtonsVisibility() {
+        // แสดงที่หน้าต่างหลักของคลังอุปกรณ์เท่านั้น (หากมี modal หรือหน้าต่างอื่นเปิดอยู่ ให้ซ่อนทันที)
+        const isAnyModalOpen = !!(
+          document.body.classList.contains('modal-open') ||
+          document.querySelector('.modal.show') ||
+          document.querySelector('.modal[style*="display: block"]') ||
+          document.querySelector('.offcanvas.show')
+        );
+
+        if (isAnyModalOpen) {
+          scrollContainer.classList.remove('show');
+          scrollContainer.style.setProperty('display', 'none', 'important');
+          return;
+        } else {
+          scrollContainer.style.removeProperty('display');
+        }
+
+        const scrollTop = window.scrollY || document.documentElement.scrollTop || 0;
+        const windowHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+        const docHeight = Math.max(
+          document.body.scrollHeight,
+          document.documentElement.scrollHeight,
+          document.body.offsetHeight,
+          document.documentElement.offsetHeight
+        );
+
+        const isPageScrollable = docHeight > (windowHeight + 100);
+
+        if (isPageScrollable) {
+          scrollContainer.classList.add('show');
+        } else {
+          scrollContainer.classList.remove('show');
+        }
+
+        if (btnTop) {
+          if (scrollTop > 100) {
+            btnTop.style.opacity = '1';
+            btnTop.style.pointerEvents = 'auto';
+            btnTop.removeAttribute('disabled');
+          } else {
+            btnTop.style.opacity = '0.35';
+            btnTop.style.pointerEvents = 'none';
+            btnTop.setAttribute('disabled', 'true');
+          }
+        }
+
+        if (btnBottom) {
+          const isNearBottom = (scrollTop + windowHeight) >= (docHeight - 100);
+          if (!isNearBottom) {
+            btnBottom.style.opacity = '1';
+            btnBottom.style.pointerEvents = 'auto';
+            btnBottom.removeAttribute('disabled');
+          } else {
+            btnBottom.style.opacity = '0.35';
+            btnBottom.style.pointerEvents = 'none';
+            btnBottom.setAttribute('disabled', 'true');
           }
         }
       }
+
+      try {
+        let isUpdating = false;
+        const safeUpdate = () => {
+          if (isUpdating) return;
+          isUpdating = true;
+          try {
+            updateScrollButtonsVisibility();
+          } finally {
+            isUpdating = false;
+          }
+        };
+
+        window.addEventListener('scroll', safeUpdate, { passive: true });
+        window.addEventListener('resize', safeUpdate, { passive: true });
+        document.addEventListener('show.bs.modal', safeUpdate, { passive: true });
+        document.addEventListener('shown.bs.modal', safeUpdate, { passive: true });
+        document.addEventListener('hide.bs.modal', safeUpdate, { passive: true });
+        document.addEventListener('hidden.bs.modal', safeUpdate, { passive: true });
+
+        const observer = new MutationObserver((mutations) => {
+          for (const m of mutations) {
+            if (m.type === 'attributes' && m.attributeName === 'class') {
+              safeUpdate();
+              break;
+            }
+          }
+        });
+        // สังเกตเฉพาะ document.body สำหรับคลาส modal-open เท่านั้น โดยไม่สังเกต subtree เพื่อป้องกันการลูปไม่รู้จบ
+        observer.observe(document.body, { attributes: true, attributeFilter: ['class'], subtree: false });
+      } catch(e) {}
+
+      updateScrollButtonsVisibility();
     }
+
+    function syncFromOrgTreeEvents() {
+      if (typeof window.getFloraOrgDepartments === 'function') {
+        departmentsList = window.getFloraOrgDepartments();
+      }
+      if (window.positionsList && Array.isArray(window.positionsList) && window.positionsList.length > 0) {
+        positionsList = [...window.positionsList];
+      }
+      if (typeof populateDepartmentDropdowns === 'function') {
+        populateDepartmentDropdowns();
+      }
+      if (typeof populatePositionDropdowns === 'function') {
+        populatePositionDropdowns();
+      }
+    }
+    window.addEventListener('flora-departments-changed', syncFromOrgTreeEvents);
+    window.addEventListener('flora-positions-changed', syncFromOrgTreeEvents);
+    window.addEventListener('flora-org-tree-changed', syncFromOrgTreeEvents);
+    window.addEventListener('storage', (e) => {
+      if (e.key === 'flora_departments' || e.key === 'flora_positions' || e.key === 'flora_org_tree_v1') {
+        syncFromOrgTreeEvents();
+      }
+    });
 
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', () => {
         initApp();
-        setTimeout(runAutoMigration, 2000);
+        initScrollNavWatcher();
       });
     } else {
       initApp();
-      setTimeout(runAutoMigration, 2000);
+      initScrollNavWatcher();
     }

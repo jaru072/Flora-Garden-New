@@ -1,9 +1,7 @@
 {
-  "name": "Flora Garden New",
-  "description": "Web App สำหรับบริหารจัดการพนักงาน 70 คน และสต๊อกอุปกรณ์การเกษตรในสวนไม้ดอกไม้ประดับ พร้อมระบบเบิก-คืน และอัปโหลดรูปภาพอัตโนมัติด้วย Firebase",
-  "requestFramePermissions": [
-    "camera"
-  ],
+  "name": "Flora Garden Test",
+  "description": "*** Flora Garden Test ***",
+  "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
   ]
